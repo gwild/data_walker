@@ -8,9 +8,9 @@ const puppeteer = require('puppeteer');
 const path = require('path');
 const fs = require('fs');
 
-const BASE_URL = 'http://localhost:8081/visualizations';
-const DATA_DIR = path.join(__dirname, '..', 'visualizations', 'data');
-const THUMB_DIR = path.join(__dirname, '..', 'visualizations', 'thumbnails');
+const BASE_URL = 'http://localhost:8081';
+const DATA_DIR = path.join(__dirname, '..', 'web', 'data');
+const THUMB_DIR = path.join(__dirname, '..', 'web', 'thumbnails');
 
 // Normalize points: support both [x,y,z] arrays and {x,y,z} objects
 function normalizePoints(points) {
