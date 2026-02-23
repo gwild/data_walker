@@ -1,19 +1,13 @@
-# Downloaded/generated data (local only, download as needed)
-web/data/
-web/thumbnails/
+# Rust
+target/
+data_walker_rs/target/
+
+# Python venv (if any)
+venv/
+.venv/
 
 # Claude local settings
 .claude/
-
-# Python
-__pycache__/
-*.pyc
-*.pyo
-.venv/
-venv/
-
-# Node
-node_modules/
 
 # OS
 .DS_Store
@@ -22,3 +16,8 @@ Thumbs.db
 # Temp
 *.tmp
 *.log
+debug.log
+
+# Generated data (download as needed)
+data_walker_rs/data/
+data_walker_rs/logs/

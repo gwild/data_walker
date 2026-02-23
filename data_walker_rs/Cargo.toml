@@ -1,0 +1,45 @@
+[package]
+name = "data_walker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+dotenvy = "0.15"
+
+# HTTP Server
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+
+# Converters
+rustfft = "6"
+num-complex = "0.4"
+hound = "3"          # WAV audio decoding
+symphonia = { version = "0.5", features = ["mp3"] }  # MP3 decoding
+
+# Downloads
+reqwest = { version = "0.12", features = ["json", "gzip"] }
+flate2 = "1"
+
+# Utilities
+thiserror = "1"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+chrono = "0.4"
+
+# GUI
+eframe = "0.29"
+egui = "0.29"
+egui_plot = "0.29"
+three-d = "0.18"

@@ -561,7 +561,22 @@
         }
     }
     </script>
-    <script src="walk_config.js"></script>
+    <!-- Rust API mode - no local config needed -->
+    <script>
+        // API base URL
+        const API_BASE = '/api';
+
+        // Stub walk_config.js globals for compatibility
+        window.FILE_LOADING = {};
+        window.FILE_INFO = {};
+        window.CAT_NAMES = {};
+        window.MAPPINGS = {};
+        window.getWalkCat = (file, name) => 'other';
+        window.getWalkSub = (file, name) => 'Other';
+        window.isBaseline = () => false;
+        window.BASE4_FILES = new Set();
+        window.HIDDEN_WALKS = new Set();
+    </script>
     <script src="https://unpkg.com/js-yaml@4.1.0/dist/js-yaml.min.js"></script>
     <script src="vendor/3dconnexion.min.js"></script>
     <script>
@@ -778,43 +793,47 @@
         }
 
         async function loadDatasetsFromManifest() {
-            // Load manifest.json (SSOT)
-            setStatus('Loading manifest...');
+            // Load walks from Rust API
+            setStatus('Loading walks from server...');
             try {
-                const resp = await fetch('thumbnails/manifest.json');
-                manifestWalks = await resp.json();
+                const resp = await fetch(API_BASE + '/walks');
+                if (!resp.ok) throw new Error(resp.statusText);
+                const walks = await resp.json();
+
+                // Convert API response to manifestWalks format
+                manifestWalks = walks.map(w => ({
+                    file: w.category + '_walk_data.js',
+                    walk: w.name,
+                    id: w.id,
+                    category: w.category,
+                    subcategory: w.subcategory,
+                    mapping: w.mapping,
+                    url: w.url
+                }));
+
+                // Populate FILE_LOADING and FILE_INFO for compatibility
+                for (const w of walks) {
+                    const filename = w.category + '_walk_data.js';
+                    const globalName = w.category.toUpperCase() + '_WALK_DATA';
+                    window.FILE_LOADING[filename] = { global: globalName, mode: 'points' };
+                    window.FILE_INFO[filename] = { mapping: w.mapping, cat: w.category, sub: w.subcategory };
+
+                    // Store walk data stub (points will be fetched on demand)
+                    if (!window[globalName]) window[globalName] = {};
+                    window[globalName][w.name] = { _apiId: w.id, path: [] };
+                }
+
+                // Update CAT_NAMES
+                const resp2 = await fetch(API_BASE + '/categories');
+                if (resp2.ok) {
+                    window.CAT_NAMES = await resp2.json();
+                }
+
+                console.log(`Loaded ${walks.length} walks from API`);
             } catch (err) {
-                setStatus('Failed to load manifest.json');
+                setStatus('Failed to connect to server. Run: cargo run -- serve');
                 console.error(err);
                 return;
-            }
-
-            // Group walks by file to know which data files to load
-            const fileSet = new Set(manifestWalks.map(w => w.file));
-            const files = Array.from(fileSet).filter(f => FILE_LOADING[f]);
-
-            let i = 0;
-            for (const filename of files) {
-                i += 1;
-                const loadInfo = FILE_LOADING[filename];
-                if (!loadInfo) continue;
-
-                const scriptUrl = 'data/' + filename;
-                try {
-                    if (!loadedSourceScripts.has(scriptUrl)) {
-                        setStatus(`Loading data files (${i}/${files.length})...`);
-                        await loadScriptByUrl(scriptUrl);
-                        loadedSourceScripts.add(scriptUrl);
-                    }
-                    const resolved = resolveGlobalBinding(loadInfo.global);
-                    if (typeof resolved !== 'undefined') {
-                        window[loadInfo.global] = resolved;
-                    } else {
-                        console.warn('Dataset global not found after load:', loadInfo.global, scriptUrl);
-                    }
-                } catch (err) {
-                    console.warn('Dataset source load failed:', scriptUrl, err);
-                }
             }
         }
 
@@ -909,39 +928,26 @@
         }
 
         function ingestFile(filename) {
-            const loadInfo = FILE_LOADING[filename];
-            if (!loadInfo) return;
+            // API mode: create entries from manifestWalks (already loaded from API)
+            const walksForFile = manifestWalks.filter(w => w.file === filename);
 
-            const root = window[loadInfo.global];
-            if (!root || typeof root !== 'object') return;
+            for (const w of walksForFile) {
+                const globalName = w.category.toUpperCase() + '_WALK_DATA';
+                const id = `${globalName}::${w.walk}`;
 
-            let entries = [];
-            if (loadInfo.mode === 'walks_path' && root.walks && typeof root.walks === 'object') {
-                entries = Object.entries(root.walks);
-            } else {
-                entries = Object.entries(root);
-            }
-
-            for (const [name, raw] of entries) {
-                if (!raw || typeof raw !== 'object') continue;
-                const path = Array.isArray(raw.path) ? raw.path : raw.points;
-                if (!Array.isArray(path) || path.length === 0) continue;
-
-                const id = `${loadInfo.global}::${name}`;
-                walkDataById[id] = { path };
+                // Store API id for later fetching
+                walkDataById[id] = { _apiId: w.id, path: [] };
                 WALK_COLORS[id] = colorForId(id);
 
-                // Use walk_config.js SSOT for per-walk category/subcategory overrides
-                const walkCat = window.getWalkCat ? window.getWalkCat(filename, name) : 'other';
-                const walkSub = window.getWalkSub ? window.getWalkSub(filename, name) : 'Other';
-                const group = window.CAT_NAMES && window.CAT_NAMES[walkCat] || walkCat;
+                const group = window.CAT_NAMES[w.category] || w.category;
 
                 walkEntries.push({
                     id,
-                    name,
+                    name: w.walk,
                     group: group,
-                    subgroup: walkSub,
+                    subgroup: w.subcategory,
                     file: filename,
+                    _apiId: w.id,
                 });
             }
         }
@@ -3636,7 +3642,7 @@
                 const checkbox = document.querySelector(`input[data-walk="${walkName}"]`);
                 const stillChecked = !!checkbox && checkbox.checked;
                 if (!stillPending || !stillChecked) return;
-                requestAnimationFrame(() => {
+                requestAnimationFrame(async () => {
                     const pending2 = pendingAddTokens.get(walkName) === token;
                     const checkbox2 = document.querySelector(`input[data-walk="${walkName}"]`);
                     const checked2 = !!checkbox2 && checkbox2.checked;
@@ -3644,19 +3650,32 @@
                         endPlottingStatus();
                         return;
                     }
-                    addWalkImmediate(walkName);
+                    await addWalkImmediate(walkName);
                     pendingAddTokens.delete(walkName);
                     endPlottingStatus();
                 });
             });
         }
 
-        function addWalkImmediate(walkName) {
+        async function addWalkImmediate(walkName) {
             if (activeWalks[walkName]) return;
 
             let data = walkDataCache[walkName];
             if (!data) {
                 const raw = walkDataById[walkName];
+                // Fetch from API if path is empty
+                if (raw && raw._apiId && (!raw.path || raw.path.length === 0)) {
+                    try {
+                        const mapping = currentMappingName === 'Original' ? 'Identity' : currentMappingName;
+                        const resp = await fetch(`${API_BASE}/walks/${raw._apiId}/points?mapping=${mapping}&max_points=${maxRemappedSteps}`);
+                        if (resp.ok) {
+                            const apiData = await resp.json();
+                            raw.path = apiData.points;
+                        }
+                    } catch (e) {
+                        console.error('Failed to fetch walk from API:', e);
+                    }
+                }
                 data = raw ? normalizePath(raw.path) : null;
                 if (data) walkDataCache[walkName] = data;
             }
@@ -3922,62 +3941,42 @@
             updateAllWalks();
         }
 
-        function onMappingChange() {
+        async function onMappingChange() {
             const sel = document.getElementById('mappingSelect');
             const newMapping = sel.value;
             if (newMapping === currentMappingName) return;
             currentMappingName = newMapping;
 
-            const activeCount = Object.keys(activeWalks).length;
+            const activeIds = Object.keys(activeWalks);
+            const activeCount = activeIds.length;
 
-            if (newMapping === 'Original') {
-                // Revert to original pre-computed points (matches thumbnails)
-                for (const key of Object.keys(walkDataCache)) delete walkDataCache[key];
-                for (const [id, orig] of Object.entries(originalWalkData)) {
-                    walkDataById[id] = { path: orig.path.slice() };
+            beginPlottingStatus(`Reloading walks with ${newMapping} mapping...`);
+
+            // Clear cache and path data to force re-fetch from API
+            for (const key of Object.keys(walkDataCache)) delete walkDataCache[key];
+            for (const id of Object.keys(walkDataById)) {
+                const data = walkDataById[id];
+                if (data._apiId) {
+                    data.path = []; // Clear to force re-fetch
                 }
-                reAddActiveWalks();
-                if (activeCount > 0) {
-                    setStatus(`Reverted ${activeCount} walk(s) to original mapping`, true);
-                } else {
-                    setStatus('Mapping set to Original. Select walks to see the effect.', true);
-                }
-                console.log(`Reverted to Original mapping (${activeCount} active walks)`);
-                return;
             }
 
-            if (!base12Index) {
-                setStatus('Base12 index not loaded — cannot change mapping. Try refreshing the page.', true);
-                sel.value = 'Original';
-                currentMappingName = 'Original';
-                return;
+            // Re-add active walks (will re-fetch with new mapping)
+            for (const id of activeIds) {
+                removeWalk(id);
+            }
+            for (const id of activeIds) {
+                await addWalkImmediate(id);
             }
 
-            const mapping = NAMED_MAPPINGS[newMapping];
-            if (!mapping) return;
+            endPlottingStatus();
 
-            beginPlottingStatus(`Recomputing walks with ${newMapping} mapping...`);
-
-            requestAnimationFrame(() => {
-                let recomputed = 0;
-                for (const id of Object.keys(walkDataById)) {
-                    const newPath = recomputeWalkPoints(id, mapping);
-                    if (newPath) {
-                        walkDataById[id] = { path: newPath };
-                        recomputed++;
-                    }
-                }
-                for (const key of Object.keys(walkDataCache)) delete walkDataCache[key];
-                reAddActiveWalks();
-                endPlottingStatus();
-
-                if (activeCount > 0) {
-                    setStatus(`Applied ${newMapping} mapping to ${activeCount} displayed walk(s)`, true);
-                } else {
-                    setStatus(`Mapping set to ${newMapping}. Select walks from the panel to see the effect.`, true);
-                }
-                console.log(`Recomputed ${recomputed}/${Object.keys(walkDataById).length} walks with ${newMapping} mapping (${activeCount} active)`);
-            });
+            if (activeCount > 0) {
+                setStatus(`Applied ${newMapping} mapping to ${activeCount} displayed walk(s)`, true);
+            } else {
+                setStatus(`Mapping set to ${newMapping}. Select walks to see the effect.`, true);
+            }
+            console.log(`Reloaded ${activeCount} walks with ${newMapping} mapping`);
         }
 
         // Store original walk data for reverting
@@ -3989,13 +3988,13 @@
             }
         }
 
-        function reAddActiveWalks() {
+        async function reAddActiveWalks() {
             const activeIds = Object.keys(activeWalks);
             for (const id of activeIds) {
                 removeWalk(id);
             }
             for (const id of activeIds) {
-                addWalkImmediate(id);
+                await addWalkImmediate(id);
             }
         }
 

@@ -1,0 +1,853 @@
+# Data Walker - Source Manifest (SSOT)
+# All data sources and their configurations
+
+mappings:
+  Identity: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+  Optimal: [0, 1, 2, 3, 4, 5, 6, 7, 10, 9, 8, 11]
+  Spiral: [0, 2, 4, 6, 8, 10, 1, 3, 5, 7, 9, 11]
+  Stock-opt: [1, 0, 2, 4, 10, 5, 6, 9, 8, 7, 3, 11]
+
+converters:
+  audio: "Spectrogram dominant frequency normalized to 0-11"
+  dna: "ACGT base-4 streaming to base-12"
+  math: "Direct base-12 digit expansion"
+  finance: "Price delta normalized to 0-11"
+  cosmos: "Strain amplitude normalized to 0-11"
+
+categories:
+  animals: Animals
+  audio: Audio
+  cosmos: Cosmos
+  dna: DNA
+  environment: Environment
+  finance: Finance
+  math: Math
+
+sources:
+  # ============================================
+  # MATH - Constants (computed)
+  # ============================================
+
+  - id: pi
+    name: Pi
+    category: math
+    subcategory: Constants
+    converter: math.constant.pi
+    mapping: Identity
+    url: "computed://mpmath"
+
+  - id: e
+    name: "Euler's Number (e)"
+    category: math
+    subcategory: Constants
+    converter: math.constant.e
+    mapping: Identity
+    url: "computed://mpmath"
+
+  - id: sqrt2
+    name: "Square Root of 2"
+    category: math
+    subcategory: Constants
+    converter: math.constant.sqrt2
+    mapping: Identity
+    url: "computed://mpmath"
+
+  - id: phi
+    name: "Golden Ratio (phi)"
+    category: math
+    subcategory: Constants
+    converter: math.constant.phi
+    mapping: Identity
+    url: "computed://mpmath"
+
+  - id: ln2
+    name: "Natural Log of 2"
+    category: math
+    subcategory: Constants
+    converter: math.constant.ln2
+    mapping: Identity
+    url: "computed://mpmath"
+
+  # ============================================
+  # MATH - Fractals (L-systems)
+  # ============================================
+
+  - id: dragon_curve
+    name: Dragon Curve
+    category: math
+    subcategory: Fractals
+    converter: math.fractal.dragon
+    mapping: Identity
+    url: "computed://lsystem"
+
+  - id: koch_snowflake
+    name: Koch Snowflake
+    category: math
+    subcategory: Fractals
+    converter: math.fractal.koch
+    mapping: Identity
+    url: "computed://lsystem"
+
+  - id: sierpinski
+    name: Sierpinski Arrowhead
+    category: math
+    subcategory: Fractals
+    converter: math.fractal.sierpinski
+    mapping: Identity
+    url: "computed://lsystem"
+
+  - id: hilbert
+    name: Hilbert Curve
+    category: math
+    subcategory: Fractals
+    converter: math.fractal.hilbert
+    mapping: Identity
+    url: "computed://lsystem"
+
+  - id: peano
+    name: Peano Curve
+    category: math
+    subcategory: Fractals
+    converter: math.fractal.peano
+    mapping: Identity
+    url: "computed://lsystem"
+
+  # ============================================
+  # MATH - Mandelbrot/Julia (complex iterations)
+  # ============================================
+
+  - id: mandelbrot_cardioid
+    name: Mandelbrot Cardioid
+    category: math
+    subcategory: Fractals
+    converter: math.mandelbrot.cardioid
+    mapping: Identity
+    url: "computed://mandelbrot"
+
+  - id: mandelbrot_spiral
+    name: Mandelbrot Spiral
+    category: math
+    subcategory: Fractals
+    converter: math.mandelbrot.spiral
+    mapping: Identity
+    url: "computed://mandelbrot"
+
+  - id: mandelbrot_antenna
+    name: Mandelbrot Antenna
+    category: math
+    subcategory: Fractals
+    converter: math.mandelbrot.antenna
+    mapping: Identity
+    url: "computed://mandelbrot"
+
+  - id: mandelbrot_period3
+    name: Mandelbrot Period-3
+    category: math
+    subcategory: Fractals
+    converter: math.mandelbrot.period3
+    mapping: Identity
+    url: "computed://mandelbrot"
+
+  - id: julia_rabbit
+    name: Julia Rabbit
+    category: math
+    subcategory: Fractals
+    converter: math.julia.rabbit
+    mapping: Identity
+    url: "computed://julia"
+
+  - id: julia_dragon
+    name: Julia Dragon
+    category: math
+    subcategory: Fractals
+    converter: math.julia.dragon
+    mapping: Identity
+    url: "computed://julia"
+
+  - id: julia_spiral
+    name: Julia Spiral
+    category: math
+    subcategory: Fractals
+    converter: math.julia.spiral
+    mapping: Identity
+    url: "computed://julia"
+
+  - id: julia_siegel
+    name: Julia Siegel
+    category: math
+    subcategory: Fractals
+    converter: math.julia.siegel
+    mapping: Identity
+    url: "computed://julia"
+
+  # ============================================
+  # MATH - Sequences
+  # ============================================
+
+  - id: fibonacci_word
+    name: Fibonacci Word
+    category: math
+    subcategory: Sequences
+    converter: math.sequence.fibonacci
+    mapping: Identity
+    url: "computed://sequence"
+
+  - id: thue_morse
+    name: Thue-Morse Sequence
+    category: math
+    subcategory: Sequences
+    converter: math.sequence.thue_morse
+    mapping: Identity
+    url: "computed://sequence"
+
+  - id: logistic_chaos
+    name: "Logistic Map (chaos)"
+    category: math
+    subcategory: Chaos
+    converter: math.sequence.logistic_chaos
+    mapping: Identity
+    url: "computed://sequence"
+
+  - id: logistic_periodic
+    name: "Logistic Map (periodic)"
+    category: math
+    subcategory: Chaos
+    converter: math.sequence.logistic_periodic
+    mapping: Identity
+    url: "computed://sequence"
+
+  - id: logistic_period3
+    name: "Logistic Map (period-3)"
+    category: math
+    subcategory: Chaos
+    converter: math.sequence.logistic_period3
+    mapping: Identity
+    url: "computed://sequence"
+
+  # ============================================
+  # DNA - Coronaviruses
+  # ============================================
+
+  - id: sars_cov_2
+    name: SARS-CoV-2 (Wuhan)
+    category: dna
+    subcategory: Coronaviruses
+    converter: dna
+    mapping: Optimal
+    url: "https://www.ncbi.nlm.nih.gov/nuccore/NC_045512.2"
+
+  - id: sars_cov_2_delta
+    name: SARS-CoV-2 (Delta)
+    category: dna
+    subcategory: Coronaviruses
+    converter: dna
+    mapping: Optimal
+    url: "https://www.ncbi.nlm.nih.gov/nuccore/OK091006.1"
+
+  - id: sars_cov_2_omicron
+    name: SARS-CoV-2 (Omicron)
+    category: dna
+    subcategory: Coronaviruses
+    converter: dna
+    mapping: Optimal
+    url: "https://www.ncbi.nlm.nih.gov/nuccore/OL672836.1"
+
+  - id: sars_cov_1
+    name: SARS-CoV-1
+    category: dna
+    subcategory: Coronaviruses
+    converter: dna
+    mapping: Optimal
+    url: "https://www.ncbi.nlm.nih.gov/nuccore/NC_004718.3"
+
+  - id: mers
+    name: MERS-CoV
+    category: dna
+    subcategory: Coronaviruses
+    converter: dna
+    mapping: Optimal
+    url: "https://www.ncbi.nlm.nih.gov/nuccore/NC_019843.3"
+
+  # ============================================
+  # DNA - Human
+  # ============================================
+
+  - id: human_mito
+    name: Human Mitochondria
+    category: dna
+    subcategory: Human
+    converter: dna
+    mapping: Optimal
+    url: "https://www.ncbi.nlm.nih.gov/nuccore/NC_012920.1"
+
+  # ============================================
+  # DNA - Bacteria
+  # ============================================
+
+  - id: ecoli_16s
+    name: "E. coli (16S rRNA)"
+    category: dna
+    subcategory: Bacteria
+    converter: dna
+    mapping: Optimal
+    url: "https://www.ncbi.nlm.nih.gov/nuccore/J01859.1"
+
+  # ============================================
+  # DNA - Plants (chloroplast genomes)
+  # ============================================
+
+  - id: arabidopsis
+    name: Arabidopsis
+    category: dna
+    subcategory: Plants
+    converter: dna
+    mapping: Optimal
+    url: "https://www.ncbi.nlm.nih.gov/nuccore/NC_000932.1"
+
+  - id: rice
+    name: Rice
+    category: dna
+    subcategory: Plants
+    converter: dna
+    mapping: Optimal
+    url: "https://www.ncbi.nlm.nih.gov/nuccore/NC_001320.1"
+
+  - id: corn
+    name: Corn
+    category: dna
+    subcategory: Plants
+    converter: dna
+    mapping: Optimal
+    url: "https://www.ncbi.nlm.nih.gov/nuccore/NC_001666.2"
+
+  - id: wheat
+    name: Wheat
+    category: dna
+    subcategory: Plants
+    converter: dna
+    mapping: Optimal
+    url: "https://www.ncbi.nlm.nih.gov/nuccore/NC_002762.1"
+
+  - id: tobacco
+    name: Tobacco
+    category: dna
+    subcategory: Plants
+    converter: dna
+    mapping: Optimal
+    url: "https://www.ncbi.nlm.nih.gov/nuccore/NC_001879.2"
+
+  - id: spinach
+    name: Spinach
+    category: dna
+    subcategory: Plants
+    converter: dna
+    mapping: Optimal
+    url: "https://www.ncbi.nlm.nih.gov/nuccore/NC_002202.1"
+
+  - id: pine
+    name: Pine
+    category: dna
+    subcategory: Plants
+    converter: dna
+    mapping: Optimal
+    url: "https://www.ncbi.nlm.nih.gov/nuccore/NC_021456.1"
+
+  - id: ginkgo
+    name: Ginkgo
+    category: dna
+    subcategory: Plants
+    converter: dna
+    mapping: Optimal
+    url: "https://www.ncbi.nlm.nih.gov/nuccore/NC_016986.1"
+
+  # ============================================
+  # FINANCE - Indices
+  # ============================================
+
+  - id: sp500
+    name: "S&P 500"
+    category: finance
+    subcategory: Indices
+    converter: finance
+    mapping: Stock-opt
+    url: "https://finance.yahoo.com/quote/%5EGSPC"
+
+  - id: nasdaq
+    name: NASDAQ
+    category: finance
+    subcategory: Indices
+    converter: finance
+    mapping: Stock-opt
+    url: "https://finance.yahoo.com/quote/%5EIXIC"
+
+  - id: dow
+    name: Dow Jones
+    category: finance
+    subcategory: Indices
+    converter: finance
+    mapping: Stock-opt
+    url: "https://finance.yahoo.com/quote/%5EDJI"
+
+  # ============================================
+  # FINANCE - Crypto
+  # ============================================
+
+  - id: btc
+    name: Bitcoin
+    category: finance
+    subcategory: Crypto
+    converter: finance
+    mapping: Stock-opt
+    url: "https://finance.yahoo.com/quote/BTC-USD"
+
+  # ============================================
+  # COSMOS - Gravitational Waves
+  # ============================================
+
+  - id: gw150914_h1
+    name: "GW150914 (Hanford)"
+    category: cosmos
+    subcategory: Gravitational Waves
+    converter: cosmos
+    mapping: Identity
+    url: "https://gwosc.org/eventapi/html/GWTC-1-confident/GW150914/v3/"
+
+  - id: gw150914_l1
+    name: "GW150914 (Livingston)"
+    category: cosmos
+    subcategory: Gravitational Waves
+    converter: cosmos
+    mapping: Identity
+    url: "https://gwosc.org/eventapi/html/GWTC-1-confident/GW150914/v3/"
+
+  # ============================================
+  # ANIMALS - Mammals
+  # ============================================
+
+  - id: dog
+    name: Dog
+    category: animals
+    subcategory: Mammals
+    converter: audio
+    mapping: Optimal
+    url: "https://github.com/karolpiczak/ESC-50"
+
+  - id: cat
+    name: Cat
+    category: animals
+    subcategory: Mammals
+    converter: audio
+    mapping: Optimal
+    url: "https://github.com/karolpiczak/ESC-50"
+
+  # ============================================
+  # ANIMALS - Amphibians (Frogs)
+  # ============================================
+
+  - id: tree_frog_1
+    name: Tree Frog
+    category: animals
+    subcategory: Amphibians
+    converter: audio
+    mapping: Optimal
+    url: "https://github.com/karolpiczak/ESC-50"
+
+  - id: tree_frog_2
+    name: "Tree Frog (2)"
+    category: animals
+    subcategory: Amphibians
+    converter: audio
+    mapping: Optimal
+    url: "https://github.com/karolpiczak/ESC-50"
+
+  - id: tree_frog_3
+    name: "Tree Frog (3)"
+    category: animals
+    subcategory: Amphibians
+    converter: audio
+    mapping: Optimal
+    url: "https://github.com/karolpiczak/ESC-50"
+
+  - id: water_frog
+    name: Water Frog
+    category: animals
+    subcategory: Amphibians
+    converter: audio
+    mapping: Optimal
+    url: "https://github.com/karolpiczak/ESC-50"
+
+  - id: pacific_chorus
+    name: Pacific Chorus Frog
+    category: animals
+    subcategory: Amphibians
+    converter: audio
+    mapping: Optimal
+    url: "https://github.com/karolpiczak/ESC-50"
+
+  - id: swamp_frog
+    name: Swamp Frog
+    category: animals
+    subcategory: Amphibians
+    converter: audio
+    mapping: Optimal
+    url: "https://github.com/karolpiczak/ESC-50"
+
+  - id: tropical_frog
+    name: Tropical Frog
+    category: animals
+    subcategory: Amphibians
+    converter: audio
+    mapping: Optimal
+    url: "https://github.com/karolpiczak/ESC-50"
+
+  - id: edible_frog
+    name: "Edible Frog (Pelophylax)"
+    category: animals
+    subcategory: Amphibians
+    converter: audio
+    mapping: Optimal
+    url: "https://github.com/karolpiczak/ESC-50"
+
+  - id: heavy_frogs
+    name: Heavy Frogs
+    category: animals
+    subcategory: Amphibians
+    converter: audio
+    mapping: Optimal
+    url: "https://github.com/karolpiczak/ESC-50"
+
+  # ============================================
+  # ANIMALS - Insects
+  # ============================================
+
+  - id: insects_buzzing
+    name: "Insects (Buzzing)"
+    category: animals
+    subcategory: Insects
+    converter: audio
+    mapping: Optimal
+    url: "https://github.com/karolpiczak/ESC-50"
+
+  - id: crickets
+    name: Crickets
+    category: animals
+    subcategory: Insects
+    converter: audio
+    mapping: Optimal
+    url: "https://github.com/karolpiczak/ESC-50"
+
+  # ============================================
+  # ANIMALS - Whales
+  # ============================================
+
+  - id: whale_humpback
+    name: "Whale (Humpback)"
+    category: animals
+    subcategory: Whales
+    converter: audio
+    mapping: Optimal
+    url: "https://www.pmel.noaa.gov/acoustics/whales/sounds/"
+
+  - id: whale_blue
+    name: "Whale (Blue)"
+    category: animals
+    subcategory: Whales
+    converter: audio
+    mapping: Optimal
+    url: "https://www.pmel.noaa.gov/acoustics/whales/sounds/"
+
+  - id: whale_orca
+    name: "Whale (Orca)"
+    category: animals
+    subcategory: Whales
+    converter: audio
+    mapping: Optimal
+    url: "https://www.pmel.noaa.gov/acoustics/whales/sounds/"
+
+  - id: whale_sperm
+    name: "Whale (Sperm)"
+    category: animals
+    subcategory: Whales
+    converter: audio
+    mapping: Optimal
+    url: "https://www.pmel.noaa.gov/acoustics/whales/sounds/"
+
+  - id: whale_beluga
+    name: "Whale (Beluga)"
+    category: animals
+    subcategory: Whales
+    converter: audio
+    mapping: Optimal
+    url: "https://www.pmel.noaa.gov/acoustics/whales/sounds/"
+
+  # ============================================
+  # AUDIO - Birdsong
+  # ============================================
+
+  - id: crow
+    name: Crow
+    category: audio
+    subcategory: Birdsong
+    converter: audio
+    mapping: Optimal
+    url: "https://github.com/karolpiczak/ESC-50"
+
+  - id: chirping_birds
+    name: Chirping Birds
+    category: audio
+    subcategory: Birdsong
+    converter: audio
+    mapping: Optimal
+    url: "https://github.com/karolpiczak/ESC-50"
+
+  - id: forest_birds
+    name: Forest Birds Ambience
+    category: audio
+    subcategory: Birdsong
+    converter: audio
+    mapping: Optimal
+    url: "https://archive.org/details/various-bird-sounds"
+
+  - id: sea_birds
+    name: Sea Birds
+    category: audio
+    subcategory: Birdsong
+    converter: audio
+    mapping: Optimal
+    url: "https://archive.org/details/various-bird-sounds"
+
+  - id: amazon_jungle
+    name: Amazon Jungle Morning
+    category: audio
+    subcategory: Birdsong
+    converter: audio
+    mapping: Optimal
+    url: "https://archive.org/details/various-bird-sounds"
+
+  - id: birds_forest_sunny
+    name: Birds in Forest Sunny Day
+    category: audio
+    subcategory: Birdsong
+    converter: audio
+    mapping: Optimal
+    url: "https://archive.org/details/various-bird-sounds"
+
+  - id: dawn_chorus
+    name: Dawn Chorus
+    category: audio
+    subcategory: Birdsong
+    converter: audio
+    mapping: Optimal
+    url: "https://archive.org/details/various-bird-sounds"
+
+  - id: florida_birds
+    name: Florida Birds
+    category: audio
+    subcategory: Birdsong
+    converter: audio
+    mapping: Optimal
+    url: "https://archive.org/details/various-bird-sounds"
+
+  - id: garden_birds
+    name: Back Garden Birds
+    category: audio
+    subcategory: Birdsong
+    converter: audio
+    mapping: Optimal
+    url: "https://archive.org/details/various-bird-sounds"
+
+  # ============================================
+  # AUDIO - Composers (Bach)
+  # ============================================
+
+  - id: bach_prelude_c
+    name: "Bach: Prelude C Major (BWV 846)"
+    category: audio
+    subcategory: Composers
+    converter: audio
+    mapping: Identity
+    url: "https://imslp.org/wiki/Category:Bach,_Johann_Sebastian"
+
+  - id: bach_fugue_c
+    name: "Bach: Fugue C Minor (BWV 847)"
+    category: audio
+    subcategory: Composers
+    converter: audio
+    mapping: Identity
+    url: "https://imslp.org/wiki/Category:Bach,_Johann_Sebastian"
+
+  - id: bach_invention
+    name: "Bach: Invention No.1 (BWV 772)"
+    category: audio
+    subcategory: Composers
+    converter: audio
+    mapping: Identity
+    url: "https://imslp.org/wiki/Category:Bach,_Johann_Sebastian"
+
+  - id: bach_toccata
+    name: "Bach: Toccata D Minor (BWV 565)"
+    category: audio
+    subcategory: Composers
+    converter: audio
+    mapping: Identity
+    url: "https://imslp.org/wiki/Category:Bach,_Johann_Sebastian"
+
+  # ============================================
+  # AUDIO - Composers (Beethoven)
+  # ============================================
+
+  - id: beethoven_elise
+    name: "Beethoven: Für Elise"
+    category: audio
+    subcategory: Composers
+    converter: audio
+    mapping: Identity
+    url: "https://imslp.org/wiki/Category:Beethoven,_Ludwig_van"
+
+  - id: beethoven_moonlight
+    name: "Beethoven: Moonlight Sonata"
+    category: audio
+    subcategory: Composers
+    converter: audio
+    mapping: Identity
+    url: "https://imslp.org/wiki/Category:Beethoven,_Ludwig_van"
+
+  - id: beethoven_ode
+    name: "Beethoven: Ode to Joy"
+    category: audio
+    subcategory: Composers
+    converter: audio
+    mapping: Identity
+    url: "https://imslp.org/wiki/Category:Beethoven,_Ludwig_van"
+
+  - id: beethoven_5th
+    name: "Beethoven: Symphony No.5"
+    category: audio
+    subcategory: Composers
+    converter: audio
+    mapping: Identity
+    url: "https://imslp.org/wiki/Category:Beethoven,_Ludwig_van"
+
+  - id: beethoven_pathetique
+    name: "Beethoven: Pathétique Sonata"
+    category: audio
+    subcategory: Composers
+    converter: audio
+    mapping: Identity
+    url: "https://imslp.org/wiki/Category:Beethoven,_Ludwig_van"
+
+  # ============================================
+  # AUDIO - Composers (Schoenberg)
+  # ============================================
+
+  - id: schoenberg_suite
+    name: "Schoenberg: Suite Op.25 (12-tone)"
+    category: audio
+    subcategory: Composers
+    converter: audio
+    mapping: Identity
+    url: "https://imslp.org/wiki/Category:Schoenberg,_Arnold"
+
+  - id: schoenberg_variations
+    name: "Schoenberg: Variations Op.31 (12-tone)"
+    category: audio
+    subcategory: Composers
+    converter: audio
+    mapping: Identity
+    url: "https://imslp.org/wiki/Category:Schoenberg,_Arnold"
+
+  - id: schoenberg_quartet
+    name: "Schoenberg: Quartet No.4 Op.37 (12-tone)"
+    category: audio
+    subcategory: Composers
+    converter: audio
+    mapping: Identity
+    url: "https://imslp.org/wiki/Category:Schoenberg,_Arnold"
+
+  - id: schoenberg_verklarte
+    name: "Schoenberg: Verklärte Nacht Op.4 (tonal)"
+    category: audio
+    subcategory: Composers
+    converter: audio
+    mapping: Identity
+    url: "https://imslp.org/wiki/Category:Schoenberg,_Arnold"
+
+  - id: schoenberg_pierrot
+    name: "Schoenberg: Pierrot Lunaire Op.21"
+    category: audio
+    subcategory: Composers
+    converter: audio
+    mapping: Identity
+    url: "https://imslp.org/wiki/Category:Schoenberg,_Arnold"
+
+  # ============================================
+  # AUDIO - Indigenous Music
+  # ============================================
+
+  - id: karaja_solo
+    name: "Karaja - Solo Song Man"
+    category: audio
+    subcategory: Indigenous Music
+    converter: audio
+    mapping: Optimal
+    url: "https://archive.org/details/lp_anthology-of-brazilian-indian-music_various-javahe-juruna-karaja-kraho-suya-tr"
+
+  - id: karaja_dance
+    name: "Karaja - Sacred Dance Aruana"
+    category: audio
+    subcategory: Indigenous Music
+    converter: audio
+    mapping: Optimal
+    url: "https://archive.org/details/lp_anthology-of-brazilian-indian-music_various-javahe-juruna-karaja-kraho-suya-tr"
+
+  - id: karaja_choir
+    name: "Karaja - Boys Girls Choir"
+    category: audio
+    subcategory: Indigenous Music
+    converter: audio
+    mapping: Optimal
+    url: "https://archive.org/details/lp_anthology-of-brazilian-indian-music_various-javahe-juruna-karaja-kraho-suya-tr"
+
+  # ============================================
+  # ENVIRONMENT - Weather & Nature
+  # ============================================
+
+  - id: rain
+    name: Rain
+    category: environment
+    subcategory: Weather
+    converter: audio
+    mapping: Optimal
+    url: "https://github.com/karolpiczak/ESC-50"
+
+  - id: wind
+    name: Wind
+    category: environment
+    subcategory: Weather
+    converter: audio
+    mapping: Optimal
+    url: "https://github.com/karolpiczak/ESC-50"
+
+  - id: thunder
+    name: Thunderstorm
+    category: environment
+    subcategory: Weather
+    converter: audio
+    mapping: Optimal
+    url: "https://github.com/karolpiczak/ESC-50"
+
+  - id: sea_waves
+    name: Sea Waves
+    category: environment
+    subcategory: Nature
+    converter: audio
+    mapping: Optimal
+    url: "https://github.com/karolpiczak/ESC-50"
+
+  - id: fire
+    name: Crackling Fire
+    category: environment
+    subcategory: Nature
+    converter: audio
+    mapping: Optimal
+    url: "https://github.com/karolpiczak/ESC-50"
