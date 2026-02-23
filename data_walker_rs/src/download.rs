@@ -410,11 +410,130 @@ fn decode_mp3_to_samples(mp3_data: &[u8]) -> Result<Vec<f32>> {
 }
 
 /// Download gravitational wave data from GWOSC
-pub async fn download_cosmos(event: &str, detector: &str, output_dir: &PathBuf) -> Result<Vec<u8>> {
-    tracing::info!("Downloading LIGO data: {} {}", event, detector);
+/// Uses the txt.gz format which is easier to parse than HDF5
+pub async fn download_cosmos(id: &str, output_dir: &PathBuf) -> Result<Vec<u8>> {
+    tracing::info!("Downloading LIGO data: {}", id);
 
-    // GWOSC provides HDF5 files - need to implement parsing
-    anyhow::bail!("LIGO download not yet implemented - requires HDF5 parsing")
+    // Map IDs to GWOSC download URLs
+    // GW150914 was the first detection (Sept 14, 2015)
+    // 32-second 4KHz data is sufficient for our visualization
+    let url = match id {
+        "gw150914_h1" => "https://gwosc.org/archive/data/S6/strain-L/H-H1_LOSC_4_V1-931069952-4096.txt.gz",
+        "gw150914_l1" => "https://gwosc.org/archive/data/S6/strain-L/L-L1_LOSC_4_V1-931069952-4096.txt.gz",
+        _ => anyhow::bail!("Unknown LIGO event: {}", id),
+    };
+
+    tracing::debug!("Fetching from: {}", url);
+
+    let client = reqwest::Client::new();
+    let response = client.get(url)
+        .header("User-Agent", "DataWalker/0.1 (github.com/data-walker)")
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        // Try alternative URL from event portal
+        let alt_url = match id {
+            "gw150914_h1" => "https://gwosc.org/eventapi/json/GWTC-1-confident/GW150914/v3/H-H1_GWOSC_4KHZ_R1-1126259447-32.txt.gz",
+            "gw150914_l1" => "https://gwosc.org/eventapi/json/GWTC-1-confident/GW150914/v3/L-L1_GWOSC_4KHZ_R1-1126259447-32.txt.gz",
+            _ => anyhow::bail!("Unknown LIGO event: {}", id),
+        };
+        tracing::debug!("Trying alternative URL: {}", alt_url);
+
+        let response = client.get(alt_url)
+            .header("User-Agent", "DataWalker/0.1 (github.com/data-walker)")
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("GWOSC returned status {} for {}", response.status(), id);
+        }
+
+        return process_gwosc_response(id, alt_url, response, output_dir).await;
+    }
+
+    process_gwosc_response(id, url, response, output_dir).await
+}
+
+async fn process_gwosc_response(
+    id: &str,
+    url: &str,
+    response: reqwest::Response,
+    output_dir: &PathBuf,
+) -> Result<Vec<u8>> {
+    let bytes = response.bytes().await?;
+    tracing::debug!("Downloaded {} bytes", bytes.len());
+
+    // Decompress gzip data
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    let mut decoder = GzDecoder::new(&bytes[..]);
+    let mut text = String::new();
+    decoder.read_to_string(&mut text)?;
+
+    tracing::debug!("Decompressed to {} characters", text.len());
+
+    // Parse strain values - one per line, floating point
+    let strain: Vec<f64> = text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                None
+            } else {
+                line.parse::<f64>().ok()
+            }
+        })
+        .collect();
+
+    if strain.is_empty() {
+        anyhow::bail!("No strain data found in response");
+    }
+
+    tracing::debug!("Parsed {} strain values", strain.len());
+
+    // Convert strain to base12
+    let base12 = strain_to_base12(&strain);
+    tracing::info!("Converted to {} base12 digits", base12.len());
+
+    // Save to file
+    std::fs::create_dir_all(output_dir)?;
+    let path = output_dir.join(format!("{}.json", id));
+    let data = serde_json::json!({
+        "id": id,
+        "base12": base12,
+        "source": url,
+        "strain_count": strain.len(),
+    });
+    std::fs::write(&path, serde_json::to_string_pretty(&data)?)?;
+    tracing::info!("Saved to {:?}", path);
+
+    Ok(base12)
+}
+
+/// Convert gravitational wave strain to base12
+/// Strain values are tiny (10^-21) and oscillating around zero
+fn strain_to_base12(strain: &[f64]) -> Vec<u8> {
+    if strain.is_empty() {
+        return vec![];
+    }
+
+    // Find min/max for normalization
+    let min_s = strain.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max_s = strain.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let range = max_s - min_s;
+
+    if range <= 0.0 {
+        return vec![6; strain.len()]; // All same value -> middle digit
+    }
+
+    // Normalize to 0-11
+    strain.iter()
+        .map(|&s| {
+            let normalized = (s - min_s) / range;
+            (normalized * 11.999).floor() as u8
+        })
+        .collect()
 }
 
 /// Download stock data from Yahoo Finance

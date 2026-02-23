@@ -32,6 +32,8 @@ struct WalkData {
     points: Vec<[f32; 3]>,
     color: [f32; 3],
     visible: bool,
+    is_math: bool,    // Track if this is a math source (needs regeneration on max_points change)
+    converter: String, // Store converter string for regeneration
 }
 
 struct WalkerApp {
@@ -44,6 +46,8 @@ struct WalkerApp {
     camera_angle_y: f32,
     show_grid: bool,
     point_size: f32,
+    dragging: bool,
+    last_mouse_pos: Option<egui::Pos2>,
 }
 
 impl WalkerApp {
@@ -61,6 +65,8 @@ impl WalkerApp {
             camera_angle_y: 0.3,
             show_grid: true,
             point_size: 2.0,
+            dragging: false,
+            last_mouse_pos: None,
         };
 
         // Auto-load pi on startup to verify loading works
@@ -138,6 +144,18 @@ impl WalkerApp {
                     return;
                 }
             }
+        } else if source.converter == "cosmos" {
+            // Load from cached file (cosmos data stored by id)
+            match self.load_cached_cosmos(id) {
+                Some(data) => {
+                    info!("Loaded {} base12 digits from cache for {}", data.len(), id);
+                    data
+                }
+                None => {
+                    warn!("Cosmos data not cached for {}, run 'download --all' first", id);
+                    return;
+                }
+            }
         } else {
             warn!("Converter not implemented: {}", source.converter);
             return;
@@ -153,12 +171,15 @@ impl WalkerApp {
         let hue = (hash % 360) as f32 / 360.0;
         let color = hsv_to_rgb(hue, 0.8, 0.9);
 
+        let is_math = source.converter.starts_with("math.");
         self.walks.insert(id.to_string(), WalkData {
             name: source.name.clone(),
             base12,
             points,
             color,
             visible: true,
+            is_math,
+            converter: source.converter.clone(),
         });
 
         info!("Walk {} loaded successfully, total walks: {}", id, self.walks.len());
@@ -224,6 +245,28 @@ impl WalkerApp {
         Some(base12)
     }
 
+    fn load_cached_cosmos(&self, id: &str) -> Option<Vec<u8>> {
+        // Cosmos files are stored by ID directly
+        let path = std::path::Path::new("data").join("cosmos").join(format!("{}.json", id));
+
+        debug!("Looking for cached cosmos at: {:?}", path);
+
+        if !path.exists() {
+            return None;
+        }
+
+        let content = std::fs::read_to_string(&path).ok()?;
+        let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+        let base12_array = json.get("base12")?.as_array()?;
+        let base12: Vec<u8> = base12_array
+            .iter()
+            .filter_map(|v| v.as_u64().map(|n| n as u8))
+            .collect();
+
+        Some(base12)
+    }
+
     /// Check if a source has data available (either computed or cached)
     fn has_data_available(&self, source: &crate::config::Source) -> bool {
         // Math sources are always available (computed on demand)
@@ -252,8 +295,8 @@ impl WalkerApp {
                 path.exists()
             }
             "cosmos" => {
-                // Not implemented yet
-                false
+                let path = std::path::Path::new("data").join("cosmos").join(format!("{}.json", source.id));
+                path.exists()
             }
             _ => false
         }
@@ -264,10 +307,22 @@ impl WalkerApp {
         info!("Recomputing {} walks with mapping '{}'", self.walks.len(), self.selected_mapping);
 
         for (id, walk) in self.walks.iter_mut() {
+            // For math sources, regenerate base12 data with new max_points
+            if walk.is_math {
+                if let Some(gen) = MathGenerator::from_converter_string(&walk.converter) {
+                    walk.base12 = gen.generate(self.max_points);
+                    debug!("Regenerated {} base12 digits for math source {}", walk.base12.len(), id);
+                }
+            }
             let points = walk_base12(&walk.base12, &mapping, self.max_points);
             debug!("Recomputed {} points for {}", points.len(), id);
             walk.points = points;
         }
+    }
+
+    fn clear_all_walks(&mut self) {
+        self.walks.clear();
+        info!("Cleared all walks");
     }
 }
 
@@ -312,6 +367,14 @@ impl eframe::App for WalkerApp {
                 if self.max_points != old_max_points {
                     self.recompute_all_walks();
                 }
+
+                ui.horizontal(|ui| {
+                    if ui.button("Deselect All").clicked() {
+                        self.clear_all_walks();
+                    }
+                    ui.label(format!("{} loaded", self.walks.len()));
+                });
+
                 ui.separator();
 
                 // Group sources by category (BTreeMap for stable order)
@@ -397,14 +460,36 @@ impl eframe::App for WalkerApp {
 
         // Central panel - 3D view
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Show walk count for debugging
-            ui.label(format!("Loaded walks: {}", self.walks.len()));
+            // Instructions
+            ui.horizontal(|ui| {
+                ui.label(format!("Loaded walks: {}", self.walks.len()));
+                ui.separator();
+                ui.label("Right-drag to rotate 3D view");
+            });
+
+            // Handle mouse input for 3D rotation
+            let response = ui.allocate_rect(ui.available_rect_before_wrap(), egui::Sense::drag());
+
+            if response.dragged_by(egui::PointerButton::Secondary) {
+                let delta = response.drag_delta();
+                self.camera_angle_y += delta.x * 0.01;
+                self.camera_angle_x += delta.y * 0.01;
+                // Clamp vertical angle
+                self.camera_angle_x = self.camera_angle_x.clamp(-1.5, 1.5);
+            }
+
+            // Mouse wheel for zoom
+            let scroll = ui.input(|i| i.raw_scroll_delta.y);
+            if scroll != 0.0 {
+                self.camera_distance *= 1.0 - scroll * 0.001;
+                self.camera_distance = self.camera_distance.clamp(10.0, 1000.0);
+            }
 
             let plot = egui_plot::Plot::new("walk_plot")
                 .data_aspect(1.0)
                 .allow_drag(true)
                 .allow_zoom(true)
-                .allow_scroll(true)
+                .allow_scroll(false) // We handle scroll for 3D zoom
                 .show_axes(true)
                 .show_grid(self.show_grid);
 
@@ -414,16 +499,24 @@ impl eframe::App for WalkerApp {
                         continue;
                     }
 
-                    // Project 3D to 2D (simple orthographic for now)
+                    // Project 3D to 2D with proper rotation matrix
+                    let cos_x = self.camera_angle_x.cos();
+                    let sin_x = self.camera_angle_x.sin();
+                    let cos_y = self.camera_angle_y.cos();
+                    let sin_y = self.camera_angle_y.sin();
+
                     let points_2d: Vec<[f64; 2]> = walk.points.iter()
                         .map(|p| {
                             let x = p[0] as f64;
                             let y = p[1] as f64;
                             let z = p[2] as f64;
-                            // Simple rotation
-                            let rx = x * self.camera_angle_y.cos() as f64 - z * self.camera_angle_y.sin() as f64;
-                            let ry = y * self.camera_angle_x.cos() as f64 - z * self.camera_angle_x.sin() as f64;
-                            [rx, ry]
+
+                            // Rotate around Y axis first, then X axis
+                            let x1 = x * cos_y as f64 + z * sin_y as f64;
+                            let z1 = -x * sin_y as f64 + z * cos_y as f64;
+                            let y1 = y * cos_x as f64 - z1 * sin_x as f64;
+
+                            [x1, y1]
                         })
                         .collect();
 
