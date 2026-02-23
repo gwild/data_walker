@@ -460,30 +460,14 @@ impl eframe::App for WalkerApp {
 
         // Central panel - 3D view
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Instructions
+            // Instructions and rotation controls
             ui.horizontal(|ui| {
                 ui.label(format!("Loaded walks: {}", self.walks.len()));
                 ui.separator();
-                ui.label("Right-drag to rotate 3D view");
+                ui.label("Rotation:");
+                ui.add(egui::DragValue::new(&mut self.camera_angle_x).speed(0.01).prefix("X: "));
+                ui.add(egui::DragValue::new(&mut self.camera_angle_y).speed(0.01).prefix("Y: "));
             });
-
-            // Handle mouse input for 3D rotation
-            let response = ui.allocate_rect(ui.available_rect_before_wrap(), egui::Sense::drag());
-
-            if response.dragged_by(egui::PointerButton::Secondary) {
-                let delta = response.drag_delta();
-                self.camera_angle_y += delta.x * 0.01;
-                self.camera_angle_x += delta.y * 0.01;
-                // Clamp vertical angle
-                self.camera_angle_x = self.camera_angle_x.clamp(-1.5, 1.5);
-            }
-
-            // Mouse wheel for zoom
-            let scroll = ui.input(|i| i.raw_scroll_delta.y);
-            if scroll != 0.0 {
-                self.camera_distance *= 1.0 - scroll * 0.001;
-                self.camera_distance = self.camera_distance.clamp(10.0, 1000.0);
-            }
 
             let plot = egui_plot::Plot::new("walk_plot")
                 .data_aspect(1.0)
