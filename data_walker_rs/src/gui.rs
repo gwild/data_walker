@@ -454,7 +454,14 @@ impl eframe::App for WalkerApp {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.show_grid, "Grid");
                 ui.add(egui::Slider::new(&mut self.point_size, 0.5..=10.0).text("Point size"));
-                ui.add(egui::Slider::new(&mut self.camera_distance, 10.0..=1000.0).text("Distance"));
+                ui.add(egui::Slider::new(&mut self.camera_distance, 10.0..=1000.0).text("Zoom"));
+                ui.separator();
+                // Center view button
+                if ui.button("Center View").clicked() {
+                    self.camera_angle_x = 0.3;
+                    self.camera_angle_y = 0.3;
+                    self.camera_distance = 200.0;
+                }
             });
         });
 
@@ -462,18 +469,43 @@ impl eframe::App for WalkerApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             // Instructions and rotation controls
             ui.horizontal(|ui| {
-                ui.label(format!("Loaded walks: {}", self.walks.len()));
+                ui.label(format!("{} walks", self.walks.len()));
                 ui.separator();
-                ui.label("Rotation:");
-                ui.add(egui::DragValue::new(&mut self.camera_angle_x).speed(0.01).prefix("X: "));
-                ui.add(egui::DragValue::new(&mut self.camera_angle_y).speed(0.01).prefix("Y: "));
+                ui.label("Drag plot to pan, scroll to zoom. Rotation:");
+                ui.add(egui::DragValue::new(&mut self.camera_angle_x).speed(0.01).prefix("X: ").suffix("°"));
+                ui.add(egui::DragValue::new(&mut self.camera_angle_y).speed(0.01).prefix("Y: ").suffix("°"));
             });
+
+            // Handle keyboard rotation (arrow keys)
+            let rotation_speed = 0.05;
+            ctx.input(|i| {
+                if i.key_down(egui::Key::ArrowLeft) {
+                    self.camera_angle_y -= rotation_speed;
+                }
+                if i.key_down(egui::Key::ArrowRight) {
+                    self.camera_angle_y += rotation_speed;
+                }
+                if i.key_down(egui::Key::ArrowUp) {
+                    self.camera_angle_x -= rotation_speed;
+                }
+                if i.key_down(egui::Key::ArrowDown) {
+                    self.camera_angle_x += rotation_speed;
+                }
+                // Home key to center
+                if i.key_pressed(egui::Key::Home) {
+                    self.camera_angle_x = 0.3;
+                    self.camera_angle_y = 0.3;
+                }
+            });
+
+            // Clamp angles
+            self.camera_angle_x = self.camera_angle_x.clamp(-1.57, 1.57);
 
             let plot = egui_plot::Plot::new("walk_plot")
                 .data_aspect(1.0)
                 .allow_drag(true)
                 .allow_zoom(true)
-                .allow_scroll(false) // We handle scroll for 3D zoom
+                .allow_scroll(true)
                 .show_axes(true)
                 .show_grid(self.show_grid);
 

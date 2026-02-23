@@ -242,12 +242,17 @@ pub async fn download_audio(id: &str, url: &str, output_dir: &PathBuf) -> Result
         ("beethoven_ode", "https://archive.org/download/LudwigVanBeethovenSymphonyNo.5Full/Ludwig%20van%20Beethoven%20-%20Symphony%20No.%205%20%5BFull%5D.mp3"),
         ("beethoven_5th", "https://archive.org/download/LudwigVanBeethovenSymphonyNo.5Full/Ludwig%20van%20Beethoven%20-%20Symphony%20No.%205%20%5BFull%5D.mp3"),
         ("beethoven_pathetique", "https://archive.org/download/MoonlightSonata_845/Sonata_no_14_in_c_sharp_minor_moonlight_op_27_no_2_Iii.Presto.mp3"),
-        // Schoenberg - use Moonlight sonata as placeholder (real Schoenberg recordings are hard to find in public domain)
-        ("schoenberg_suite", "https://archive.org/download/MoonlightSonata_845/Sonata_no_14_in_c_sharp_minor_moonlight_op_27_no_2_Iii.Presto.mp3"),
-        ("schoenberg_variations", "https://archive.org/download/MoonlightSonata_845/Sonata_no_14_in_c_sharp_minor_moonlight_op_27_no_2_Iii.Presto.mp3"),
-        ("schoenberg_quartet", "https://archive.org/download/MoonlightSonata_845/Sonata_no_14_in_c_sharp_minor_moonlight_op_27_no_2_Iii.Presto.mp3"),
-        ("schoenberg_verklarte", "https://archive.org/download/MoonlightSonata_845/Sonata_no_14_in_c_sharp_minor_moonlight_op_27_no_2_Iii.Presto.mp3"),
-        ("schoenberg_pierrot", "https://archive.org/download/MoonlightSonata_845/Sonata_no_14_in_c_sharp_minor_moonlight_op_27_no_2_Iii.Presto.mp3"),
+        // Schoenberg - real recordings from Archive.org
+        // Source: https://archive.org/details/lp_piano-music_arnold-schoenberg-jurg-von-vintschger
+        ("schoenberg_suite", "https://archive.org/download/lp_piano-music_arnold-schoenberg-jurg-von-vintschger/disc1/02.01.%20Side%202%3A%205%20Piano%20Pieces%2C%20Op.%2023%3A%20No.%201%3B%20No.%202%3B%20No.%203%3B%20No.%204%3B%20No.%205%3B%20Suite%20For%20Piano%2C%20Op.%2025%3A%20Praeludium%3B%20Gavotte%20-%20Musette%20-%20Gavotte%3B%20Intermezzo%3B%20Menuett%3B%20Gigue.mp3"),
+        // Source: https://archive.org/details/musicofarnoldsch00scho (Three little orchestra pieces - Variations Op.31 not available separately)
+        ("schoenberg_variations", "https://archive.org/download/musicofarnoldsch00scho/03_Three_little_orchestra_pieces__1910.mp3"),
+        // Source: https://archive.org/details/lp_quintet-for-wind-instruments-op-26_arnold-schoenberg-philadelphia-woodwind-qu
+        ("schoenberg_quartet", "https://archive.org/download/lp_quintet-for-wind-instruments-op-26_arnold-schoenberg-philadelphia-woodwind-qu/disc1/01.01.%20Quintet%20For%20Wind%20Instruments%2C%20Op.%2026%3A%20I%20-%20Schwungvoll.mp3"),
+        // Source: https://archive.org/details/lp_schoenberg-transfigured-night-verklarte-na_arnold-schoenberg-charles-martin-loeffler
+        ("schoenberg_verklarte", "https://archive.org/download/lp_schoenberg-transfigured-night-verklarte-na_arnold-schoenberg-charles-martin-loeffler/disc1/01.01.%20Transfigured%20Night%20%28Verklarte%20Nacht%2C%20Op.%204%29.mp3"),
+        // Source: https://archive.org/details/musicofarnoldsch00scho (Pelleas - Pierrot Lunaire not available separately)
+        ("schoenberg_pierrot", "https://archive.org/download/musicofarnoldsch00scho/01_Pelleas_and_Melisande.mp3"),
     ].into_iter().collect();
 
     if let Some(&mp3_url) = classical_composers.get(id) {
