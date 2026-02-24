@@ -109,15 +109,10 @@ struct WalkerApp {
     camera_angle_x: f32,  // Pitch (up/down)
     camera_angle_y: f32,  // Yaw (left/right)
     camera_target: [f32; 2],  // Pan offset
-    // Mouse drag state
-    last_mouse_pos: Option<egui::Pos2>,
-    is_rotating: bool,  // Right-click drag = rotate
-    is_panning: bool,   // Middle-click drag = pan
     // UI state
     show_grid: bool,
     point_size: f32,
     auto_rotate: bool,
-    reset_view: bool,  // Flag to reset plot bounds on next frame
     // SpaceMouse
     spacemouse: Option<Arc<Mutex<SpaceMouseState>>>,
     spacemouse_config: SpaceMouseConfig,
@@ -142,13 +137,9 @@ impl WalkerApp {
             camera_angle_x: 0.0,
             camera_angle_y: 0.0,
             camera_target: [0.0, 0.0],
-            last_mouse_pos: None,
-            is_rotating: false,
-            is_panning: false,
             show_grid: true,
             point_size: 2.0,
             auto_rotate: false,
-            reset_view: false,
             spacemouse: spacemouse_state,
             spacemouse_config: SpaceMouseConfig::load(),
             spacemouse_config_open: false,
@@ -618,53 +609,7 @@ impl eframe::App for WalkerApp {
                 ui.label("Right-drag: rotate | Middle-drag: pan | Scroll: zoom");
             });
 
-            // Handle mouse input for 3D rotation (CAD-style)
-            let response = ui.allocate_rect(ui.available_rect_before_wrap(), egui::Sense::click_and_drag());
-
-            // Track mouse button states
-            if response.drag_started_by(egui::PointerButton::Secondary) {
-                self.is_rotating = true;
-                self.last_mouse_pos = response.interact_pointer_pos();
-            }
-            if response.drag_started_by(egui::PointerButton::Middle) {
-                self.is_panning = true;
-                self.last_mouse_pos = response.interact_pointer_pos();
-            }
-
-            if response.drag_stopped() {
-                self.is_rotating = false;
-                self.is_panning = false;
-                self.last_mouse_pos = None;
-            }
-
-            // Handle mouse drag
-            if let Some(current_pos) = response.interact_pointer_pos() {
-                if let Some(last_pos) = self.last_mouse_pos {
-                    let delta = current_pos - last_pos;
-
-                    if self.is_rotating {
-                        // Right-drag rotates view (CAD-style orbit)
-                        self.camera_angle_y += delta.x * 0.005;
-                        self.camera_angle_x += delta.y * 0.005;
-                    }
-
-                    if self.is_panning {
-                        // Middle-drag pans view
-                        self.camera_target[0] -= delta.x * 0.5;
-                        self.camera_target[1] += delta.y * 0.5;
-                    }
-                }
-                self.last_mouse_pos = Some(current_pos);
-            }
-
-            // Handle scroll for zoom
-            let scroll_delta = ctx.input(|i| i.raw_scroll_delta);
-            if scroll_delta.y != 0.0 {
-                self.camera_distance *= 1.0 - scroll_delta.y * 0.002;
-                self.camera_distance = self.camera_distance.clamp(0.1, 10.0);
-            }
-
-            // Handle keyboard input
+            // Handle keyboard and scroll input
             ctx.input(|i| {
                 // Arrow keys for rotation
                 if i.key_down(egui::Key::ArrowLeft) { self.camera_angle_y -= 0.03; }
@@ -680,6 +625,21 @@ impl eframe::App for WalkerApp {
                 }
                 // Home to center
                 if i.key_pressed(egui::Key::Home) { self.center_view(); }
+                // Scroll for zoom
+                if i.raw_scroll_delta.y != 0.0 {
+                    self.camera_distance *= 1.0 - i.raw_scroll_delta.y * 0.002;
+                }
+                // Mouse drag rotation (right button) and pan (middle button)
+                if i.pointer.secondary_down() {
+                    let delta = i.pointer.delta();
+                    self.camera_angle_y += delta.x * 0.005;
+                    self.camera_angle_x += delta.y * 0.005;
+                }
+                if i.pointer.middle_down() {
+                    let delta = i.pointer.delta();
+                    self.camera_target[0] -= delta.x * 0.5;
+                    self.camera_target[1] += delta.y * 0.5;
+                }
             });
 
             // Clamp values
