@@ -71,7 +71,7 @@ impl WalkerApp {
         let spacemouse = init_spacemouse();
         let spacemouse_state = spacemouse.as_ref().map(|s| s.clone());
 
-        let mut app = Self {
+        Self {
             config,
             walks: BTreeMap::new(),
             selected_mapping: "Identity".to_string(),
@@ -86,13 +86,7 @@ impl WalkerApp {
             reset_view: false,
             spacemouse: spacemouse_state,
             spacemouse_thread: None,
-        };
-
-        info!("Auto-loading pi walk on startup");
-        app.load_walk("pi");
-        info!("Auto-load complete, walks count: {}", app.walks.len());
-
-        app
+        }
     }
 
     fn load_walk(&mut self, id: &str) {

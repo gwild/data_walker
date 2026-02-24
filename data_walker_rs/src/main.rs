@@ -498,29 +498,31 @@ fn kill_existing_instances() {
     // Get current process ID to avoid killing ourselves
     let current_pid = std::process::id();
 
-    // On Windows, use taskkill to kill other instances
+    // On Windows, use PowerShell for reliable process killing
     #[cfg(windows)]
     {
-        // First, find all data_walker processes
-        let output = Command::new("tasklist")
-            .args(["/FI", "IMAGENAME eq data_walker.exe", "/FO", "CSV", "/NH"])
+        // Use PowerShell to get and kill data_walker processes
+        let script = format!(
+            "Get-Process -Name 'data_walker' -ErrorAction SilentlyContinue | Where-Object {{ $_.Id -ne {} }} | Stop-Process -Force",
+            current_pid
+        );
+
+        let result = Command::new("powershell")
+            .args(["-Command", &script])
             .output();
 
-        if let Ok(output) = output {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                // Parse CSV: "data_walker.exe","1234",...
-                let parts: Vec<&str> = line.split(',').collect();
-                if parts.len() >= 2 {
-                    if let Ok(pid) = parts[1].trim_matches('"').parse::<u32>() {
-                        if pid != current_pid {
-                            tracing::info!("Killing existing instance PID {}", pid);
-                            let _ = Command::new("taskkill")
-                                .args(["/F", "/PID", &pid.to_string()])
-                                .output();
-                        }
+        match result {
+            Ok(output) => {
+                if !output.stderr.is_empty() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    if !stderr.contains("Cannot find a process") {
+                        tracing::debug!("PowerShell stderr: {}", stderr);
                     }
                 }
+                tracing::info!("Killed any existing data_walker instances");
+            }
+            Err(e) => {
+                tracing::warn!("Failed to kill existing instances: {}", e);
             }
         }
     }
@@ -534,5 +536,5 @@ fn kill_existing_instances() {
     }
 
     // Small delay to let old process fully exit
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    std::thread::sleep(std::time::Duration::from_millis(200));
 }
