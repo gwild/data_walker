@@ -57,6 +57,7 @@ struct WalkerApp {
     show_grid: bool,
     point_size: f32,
     auto_rotate: bool,
+    reset_view: bool,  // Flag to reset plot bounds on next frame
     // SpaceMouse
     spacemouse: Option<Arc<Mutex<SpaceMouseState>>>,
     spacemouse_thread: Option<std::thread::JoinHandle<()>>,
@@ -82,6 +83,7 @@ impl WalkerApp {
             show_grid: true,
             point_size: 2.0,
             auto_rotate: false,
+            reset_view: false,
             spacemouse: spacemouse_state,
             spacemouse_thread: None,
         };
@@ -269,10 +271,11 @@ impl WalkerApp {
     }
 
     fn center_view(&mut self) {
-        self.camera_angle_x = 0.5;
-        self.camera_angle_y = 0.5;
+        self.camera_angle_x = 0.0;
+        self.camera_angle_y = 0.0;
         self.camera_distance = 1.0;
         self.camera_target = [0.0, 0.0];
+        self.reset_view = true;  // Flag to reset plot bounds
     }
 
     fn project_point(&self, p: [f32; 3]) -> [f64; 2] {
@@ -474,13 +477,20 @@ impl eframe::App for WalkerApp {
             self.camera_angle_x = self.camera_angle_x.clamp(-1.5, 1.5);
             self.camera_distance = self.camera_distance.clamp(0.1, 10.0);
 
-            let plot = egui_plot::Plot::new("walk_plot")
+            // Build plot with optional auto-bounds reset
+            let mut plot = egui_plot::Plot::new("walk_plot")
                 .data_aspect(1.0)
                 .allow_drag(true)   // Pan with mouse drag
                 .allow_zoom(false)  // We handle zoom ourselves
                 .allow_scroll(false)
                 .show_axes(true)
                 .show_grid(self.show_grid);
+
+            // Reset bounds if requested
+            if self.reset_view {
+                plot = plot.auto_bounds([true, true].into());
+                self.reset_view = false;
+            }
 
             plot.show(ui, |plot_ui| {
                 for (_id, walk) in &self.walks {
@@ -502,6 +512,7 @@ impl eframe::App for WalkerApp {
                         points_2d.iter().map(|p| [p[0], p[1]])
                     ))
                     .color(color)
+                    .width(self.point_size)
                     .name(&walk.name);
 
                     plot_ui.line(line);
@@ -513,12 +524,15 @@ impl eframe::App for WalkerApp {
 
 /// Initialize SpaceMouse using hidapi
 fn init_spacemouse() -> Option<Arc<Mutex<SpaceMouseState>>> {
-    // 3Dconnexion vendor ID
-    const VENDOR_3DCONNEXION: u16 = 0x046d;
+    // 3Dconnexion vendor IDs (newer devices use 0x256f, older use 0x046d via Logitech)
+    const VENDOR_3DCONNEXION_NEW: u16 = 0x256f;
+    const VENDOR_3DCONNEXION_OLD: u16 = 0x046d;
     // Common SpaceMouse product IDs
-    const SPACEMOUSE_WIRELESS: u16 = 0xc62f;
+    const SPACEMOUSE_WIRELESS_NEW: u16 = 0xc62e;  // Current SpaceMouse Wireless
+    const SPACEMOUSE_WIRELESS_OLD: u16 = 0xc62f;
     const SPACEMOUSE_COMPACT: u16 = 0xc635;
     const SPACEMOUSE_PRO: u16 = 0xc62b;
+    const SPACEMOUSE_PRO_WIRELESS: u16 = 0xc632;
 
     let state = Arc::new(Mutex::new(SpaceMouseState {
         tx: 0.0, ty: 0.0, tz: 0.0,
@@ -537,10 +551,14 @@ fn init_spacemouse() -> Option<Arc<Mutex<SpaceMouseState>>> {
             }
         };
 
-        // Try different product IDs
-        let device = api.open(VENDOR_3DCONNEXION, SPACEMOUSE_WIRELESS)
-            .or_else(|_| api.open(VENDOR_3DCONNEXION, SPACEMOUSE_COMPACT))
-            .or_else(|_| api.open(VENDOR_3DCONNEXION, SPACEMOUSE_PRO));
+        // Try different vendor/product ID combinations
+        let device = api.open(VENDOR_3DCONNEXION_NEW, SPACEMOUSE_WIRELESS_NEW)  // Current SpaceMouse Wireless
+            .or_else(|_| api.open(VENDOR_3DCONNEXION_NEW, SPACEMOUSE_COMPACT))
+            .or_else(|_| api.open(VENDOR_3DCONNEXION_NEW, SPACEMOUSE_PRO))
+            .or_else(|_| api.open(VENDOR_3DCONNEXION_NEW, SPACEMOUSE_PRO_WIRELESS))
+            .or_else(|_| api.open(VENDOR_3DCONNEXION_OLD, SPACEMOUSE_WIRELESS_OLD))
+            .or_else(|_| api.open(VENDOR_3DCONNEXION_OLD, SPACEMOUSE_COMPACT))
+            .or_else(|_| api.open(VENDOR_3DCONNEXION_OLD, SPACEMOUSE_PRO));
 
         let device = match device {
             Ok(d) => {

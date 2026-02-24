@@ -581,77 +581,77 @@ sources:
     url: "https://www.pmel.noaa.gov/acoustics/whales/sounds/"
 
   # ============================================
-  # AUDIO - Birdsong
+  # ANIMALS - Birds
   # ============================================
 
   - id: crow
     name: Crow
-    category: audio
-    subcategory: Birdsong
+    category: animals
+    subcategory: Birds
     converter: audio
     mapping: Optimal
     url: "https://github.com/karolpiczak/ESC-50"
 
   - id: chirping_birds
     name: Chirping Birds
-    category: audio
-    subcategory: Birdsong
+    category: animals
+    subcategory: Birds
     converter: audio
     mapping: Optimal
     url: "https://github.com/karolpiczak/ESC-50"
 
   - id: forest_birds
     name: Forest Birds Ambience
-    category: audio
-    subcategory: Birdsong
+    category: animals
+    subcategory: Birds
     converter: audio
     mapping: Optimal
     url: "https://archive.org/details/various-bird-sounds"
 
   - id: sea_birds
     name: Sea Birds
-    category: audio
-    subcategory: Birdsong
+    category: animals
+    subcategory: Birds
     converter: audio
     mapping: Optimal
     url: "https://archive.org/details/various-bird-sounds"
 
   - id: amazon_jungle
     name: Amazon Jungle Morning
-    category: audio
-    subcategory: Birdsong
+    category: animals
+    subcategory: Birds
     converter: audio
     mapping: Optimal
     url: "https://archive.org/details/various-bird-sounds"
 
   - id: birds_forest_sunny
     name: Birds in Forest Sunny Day
-    category: audio
-    subcategory: Birdsong
+    category: animals
+    subcategory: Birds
     converter: audio
     mapping: Optimal
     url: "https://archive.org/details/various-bird-sounds"
 
   - id: dawn_chorus
     name: Dawn Chorus
-    category: audio
-    subcategory: Birdsong
+    category: animals
+    subcategory: Birds
     converter: audio
     mapping: Optimal
     url: "https://archive.org/details/various-bird-sounds"
 
   - id: florida_birds
     name: Florida Birds
-    category: audio
-    subcategory: Birdsong
+    category: animals
+    subcategory: Birds
     converter: audio
     mapping: Optimal
     url: "https://archive.org/details/various-bird-sounds"
 
   - id: garden_birds
     name: Back Garden Birds
-    category: audio
-    subcategory: Birdsong
+    category: animals
+    subcategory: Birds
     converter: audio
     mapping: Optimal
     url: "https://archive.org/details/various-bird-sounds"
