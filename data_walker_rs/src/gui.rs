@@ -180,17 +180,13 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
         orbit_control.handle_events(&mut camera, &mut frame_input.events);
         camera.set_viewport(frame_input.viewport);
 
-        // Build geometry for visible walks
-        let mut objects: Vec<Gm<Mesh, ColorMaterial>> = Vec::new();
+        // Build line geometry for visible walks
+        let mut walk_lines: Vec<Gm<InstancedMesh, ColorMaterial>> = Vec::new();
 
-        for (id, walk) in &walks {
+        for (_id, walk) in &walks {
             if !walk.visible || walk.points.len() < 2 {
                 continue;
             }
-
-            // Create line segments as thin cylinders or use Lines
-            let mut positions: Vec<Vec3> = Vec::new();
-            let mut colors: Vec<Srgba> = Vec::new();
 
             let color = Srgba::new(
                 (walk.color[0] * 255.0) as u8,
@@ -199,47 +195,91 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                 255,
             );
 
-            for p in &walk.points {
-                positions.push(vec3(p[0], p[1], p[2]));
-                colors.push(color);
+            // Create line segments using thin cylinders
+            let mut instances = Instances::default();
+            instances.transformations = Vec::new();
+            instances.colors = Some(Vec::new());
+
+            for i in 0..walk.points.len() - 1 {
+                let p1 = vec3(walk.points[i][0], walk.points[i][1], walk.points[i][2]);
+                let p2 = vec3(walk.points[i + 1][0], walk.points[i + 1][1], walk.points[i + 1][2]);
+
+                let center = (p1 + p2) * 0.5;
+                let dir = p2 - p1;
+                let length = dir.magnitude();
+
+                if length > 0.001 {
+                    // Create transform for cylinder
+                    let up = vec3(0.0, 1.0, 0.0);
+                    let rotation = if dir.normalize().dot(up).abs() > 0.999 {
+                        Mat4::identity()
+                    } else {
+                        let axis = up.cross(dir.normalize()).normalize();
+                        let angle = up.dot(dir.normalize()).acos();
+                        Mat4::from_axis_angle(axis, radians(angle.to_degrees()))
+                    };
+
+                    let transform = Mat4::from_translation(center)
+                        * rotation
+                        * Mat4::from_nonuniform_scale(0.5, length * 0.5, 0.5);
+
+                    instances.transformations.push(transform);
+                    if let Some(ref mut colors) = instances.colors {
+                        colors.push(color);
+                    }
+                }
             }
 
-            // Create line strip mesh
-            let mut cpu_mesh = CpuMesh {
-                positions: Positions::F32(positions.clone()),
-                colors: Some(colors),
-                ..Default::default()
-            };
-
-            // Create indices for line strip
-            let indices: Vec<u32> = (0..positions.len() as u32).collect();
-            cpu_mesh.indices = Indices::U32(indices);
-
-            let mesh = Gm::new(
-                Mesh::new(&context, &cpu_mesh),
-                ColorMaterial::default(),
-            );
-            objects.push(mesh);
+            if !instances.transformations.is_empty() {
+                let cylinder = CpuMesh::cylinder(8);
+                let instanced = Gm::new(
+                    InstancedMesh::new(&context, &instances, &cylinder),
+                    ColorMaterial::default(),
+                );
+                walk_lines.push(instanced);
+            }
         }
 
-        // Grid
-        let grid_lines = if show_grid {
-            let mut grid_positions: Vec<Vec3> = Vec::new();
-            let grid_size = 500.0;
-            let grid_step = 50.0;
+        // Grid using thin cylinders
+        let grid_objects: Vec<Gm<InstancedMesh, ColorMaterial>> = if show_grid {
+            let grid_size = 200.0;
+            let grid_step = 20.0;
+            let grid_color = Srgba::new(60, 60, 80, 255);
+
+            let mut instances = Instances::default();
+            instances.transformations = Vec::new();
+            instances.colors = Some(Vec::new());
+
             let mut i = -grid_size;
             while i <= grid_size {
-                // X lines
-                grid_positions.push(vec3(i, 0.0, -grid_size));
-                grid_positions.push(vec3(i, 0.0, grid_size));
-                // Z lines
-                grid_positions.push(vec3(-grid_size, 0.0, i));
-                grid_positions.push(vec3(grid_size, 0.0, i));
+                // X direction line
+                let transform_x = Mat4::from_translation(vec3(0.0, 0.0, i))
+                    * Mat4::from_angle_z(degrees(90.0))
+                    * Mat4::from_nonuniform_scale(0.2, grid_size, 0.2);
+                instances.transformations.push(transform_x);
+                if let Some(ref mut colors) = instances.colors {
+                    colors.push(grid_color);
+                }
+
+                // Z direction line
+                let transform_z = Mat4::from_translation(vec3(i, 0.0, 0.0))
+                    * Mat4::from_nonuniform_scale(0.2, grid_size, 0.2)
+                    * Mat4::from_angle_x(degrees(90.0));
+                instances.transformations.push(transform_z);
+                if let Some(ref mut colors) = instances.colors {
+                    colors.push(grid_color);
+                }
+
                 i += grid_step;
             }
-            Some(grid_positions)
+
+            let cylinder = CpuMesh::cylinder(4);
+            vec![Gm::new(
+                InstancedMesh::new(&context, &instances, &cylinder),
+                ColorMaterial::default(),
+            )]
         } else {
-            None
+            vec![]
         };
 
         // GUI panel
@@ -336,28 +376,17 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
         frame_input.screen().clear(ClearState::color_and_depth(0.1, 0.1, 0.15, 1.0, 1.0));
 
         // Render grid
-        if let Some(grid_pos) = &grid_lines {
-            let mut cpu_mesh = CpuMesh {
-                positions: Positions::F32(grid_pos.clone()),
-                ..Default::default()
-            };
-            let indices: Vec<u32> = (0..grid_pos.len() as u32).collect();
-            cpu_mesh.indices = Indices::U32(indices);
-
-            let grid = Gm::new(
-                Mesh::new(&context, &cpu_mesh),
-                ColorMaterial { color: Srgba::new(60, 60, 80, 255), ..Default::default() },
-            );
-            grid.render(&camera, &[]);
+        for grid_obj in &grid_objects {
+            grid_obj.render(&camera, &[]);
         }
 
         // Render walks
-        for obj in &objects {
-            obj.render(&camera, &[]);
+        for walk_obj in &walk_lines {
+            walk_obj.render(&camera, &[]);
         }
 
         // Render GUI
-        frame_input.screen().write(|| gui.render());
+        let _ = frame_input.screen().write(|| gui.render());
 
         FrameOutput::default()
     });
