@@ -1,12 +1,13 @@
-//! Native GUI viewer using egui
+//! Native GUI viewer using three-d for real 3D rendering
 //!
-//! 3D visualization with mouse orbit controls and SpaceMouse support
+//! Proper 3D visualization with orbit camera and SpaceMouse support
 
-use eframe::egui;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
-use tracing::{debug, info, warn};
+use tracing::info;
+use three_d::*;
+use three_d::egui;
 
 use crate::config::Config;
 use crate::walk::walk_base12;
@@ -14,30 +15,26 @@ use crate::converters::math::MathGenerator;
 
 /// SpaceMouse axis configuration
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct SpaceMouseConfig {
-    // Axis mapping: which physical axis controls which function
-    // 0=tx, 1=ty, 2=tz, 3=rx, 4=ry, 5=rz
-    pan_x_axis: usize,
-    pan_y_axis: usize,
-    zoom_axis: usize,
-    rot_x_axis: usize,
-    rot_y_axis: usize,
-    rot_z_axis: usize,
-    // Invert flags
-    invert: [bool; 6],
-    // Sensitivity
-    sensitivity: f32,
+pub struct SpaceMouseConfig {
+    pub pan_x_axis: usize,
+    pub pan_y_axis: usize,
+    pub zoom_axis: usize,
+    pub rot_x_axis: usize,
+    pub rot_y_axis: usize,
+    pub rot_z_axis: usize,
+    pub invert: [bool; 6],
+    pub sensitivity: f32,
 }
 
 impl Default for SpaceMouseConfig {
     fn default() -> Self {
         Self {
-            pan_x_axis: 0,   // tx -> pan X
-            pan_y_axis: 1,   // ty -> pan Y
-            zoom_axis: 2,    // tz -> zoom
-            rot_x_axis: 4,   // ry -> rotate X (pitch)
-            rot_y_axis: 3,   // rx -> rotate Y (yaw)
-            rot_z_axis: 5,   // rz -> rotate Z (roll, unused)
+            pan_x_axis: 0,
+            pan_y_axis: 1,
+            zoom_axis: 2,
+            rot_x_axis: 4,
+            rot_y_axis: 3,
+            rot_z_axis: 5,
             invert: [false; 6],
             sensitivity: 1.0,
         }
@@ -45,7 +42,7 @@ impl Default for SpaceMouseConfig {
 }
 
 impl SpaceMouseConfig {
-    fn load() -> Self {
+    pub fn load() -> Self {
         let path = PathBuf::from("spacemouse.yaml");
         if path.exists() {
             if let Ok(contents) = std::fs::read_to_string(&path) {
@@ -58,7 +55,7 @@ impl SpaceMouseConfig {
         Self::default()
     }
 
-    fn save(&self) {
+    pub fn save(&self) {
         let path = PathBuf::from("spacemouse.yaml");
         if let Ok(yaml) = serde_yaml::to_string(self) {
             if std::fs::write(&path, yaml).is_ok() {
@@ -68,670 +65,395 @@ impl SpaceMouseConfig {
     }
 }
 
-/// Run the native GUI viewer
-pub fn run_viewer(config: Config) -> anyhow::Result<()> {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 800.0])
-            .with_title("Data Walker"),
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "Data Walker",
-        options,
-        Box::new(|cc| Ok(Box::new(WalkerApp::new(cc, config)))),
-    ).map_err(|e| anyhow::anyhow!("GUI error: {}", e))
-}
-
-struct WalkData {
-    name: String,
-    base12: Vec<u8>,
-    points: Vec<[f32; 3]>,
-    color: [f32; 3],
-    visible: bool,
-    is_math: bool,
-    converter: String,
-}
-
 /// SpaceMouse input state (raw values from device)
 struct SpaceMouseState {
     axes: [f32; 6],  // tx, ty, tz, rx, ry, rz
 }
 
-struct WalkerApp {
-    config: Config,
-    walks: BTreeMap<String, WalkData>,
-    selected_mapping: String,
-    max_points: usize,
-    // Camera state
-    camera_distance: f32,
-    camera_angle_x: f32,  // Pitch (up/down)
-    camera_angle_y: f32,  // Yaw (left/right)
-    camera_target: [f32; 2],  // Pan offset
-    // UI state
-    show_grid: bool,
-    point_size: f32,
-    auto_rotate: bool,
+struct WalkData {
+    name: String,
+    points: Vec<[f32; 3]>,
+    color: [f32; 3],
+    visible: bool,
+}
+
+/// Run the native 3D GUI viewer using three-d
+pub fn run_viewer(config: Config) -> anyhow::Result<()> {
+    // Create window
+    let window = Window::new(WindowSettings {
+        title: "Data Walker - 3D".to_string(),
+        max_size: Some((1920, 1080)),
+        ..Default::default()
+    })?;
+
+    let context = window.gl();
+
+    // Camera setup - orbit control
+    let target = vec3(0.0, 0.0, 0.0);
+    let mut camera = Camera::new_perspective(
+        window.viewport(),
+        vec3(0.0, 50.0, 200.0),  // position
+        target,                   // target
+        vec3(0.0, 1.0, 0.0),     // up
+        degrees(45.0),           // fov
+        0.1,                     // near
+        10000.0,                 // far
+    );
+
+    let mut orbit_control = OrbitControl::new(target, 1.0, 10000.0);
+
     // SpaceMouse
-    spacemouse: Option<Arc<Mutex<SpaceMouseState>>>,
-    spacemouse_config: SpaceMouseConfig,
-    spacemouse_config_open: bool,
-    spacemouse_thread: Option<std::thread::JoinHandle<()>>,
-}
+    let spacemouse = init_spacemouse();
+    let spacemouse_config = SpaceMouseConfig::load();
 
-impl WalkerApp {
-    fn new(cc: &eframe::CreationContext<'_>, config: Config) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+    // State
+    let mut walks: BTreeMap<String, WalkData> = BTreeMap::new();
+    let mut selected_sources: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut selected_mapping = "Identity".to_string();
+    let mut max_points: usize = 5000;
+    let mut show_grid = true;
+    let mut auto_rotate = false;
+    let mut rotation_angle: f32 = 0.0;
 
-        // Try to initialize SpaceMouse
-        let spacemouse = init_spacemouse();
-        let spacemouse_state = spacemouse.as_ref().map(|s| s.clone());
+    // GUI state
+    let mut gui = GUI::new(&context);
 
-        Self {
-            config,
-            walks: BTreeMap::new(),
-            selected_mapping: "Identity".to_string(),
-            max_points: 5000,
-            camera_distance: 1.0,
-            camera_angle_x: 0.0,
-            camera_angle_y: 0.0,
-            camera_target: [0.0, 0.0],
-            show_grid: true,
-            point_size: 2.0,
-            auto_rotate: false,
-            spacemouse: spacemouse_state,
-            spacemouse_config: SpaceMouseConfig::load(),
-            spacemouse_config_open: false,
-            spacemouse_thread: None,
-        }
+    // Pre-build category list
+    let mut by_category: BTreeMap<String, Vec<crate::config::Source>> = BTreeMap::new();
+    for source in &config.sources {
+        by_category.entry(source.category.clone()).or_default().push(source.clone());
     }
 
-    fn load_walk(&mut self, id: &str) {
-        info!("load_walk called for: {}", id);
-
-        if self.walks.contains_key(id) {
-            debug!("Walk {} already loaded, skipping", id);
-            return;
-        }
-
-        let source = match self.config.get_source(id) {
-            Some(s) => s.clone(),
-            None => {
-                warn!("Source not found for id: {}", id);
-                return;
-            }
-        };
-
-        debug!("Found source: {} with converter: {}", source.name, source.converter);
-
-        let base12 = if source.converter.starts_with("math.") {
-            match MathGenerator::from_converter_string(&source.converter) {
-                Some(gen) => {
-                    let data = gen.generate(self.max_points);
-                    info!("Generated {} base12 digits for {}", data.len(), id);
-                    data
-                }
-                None => {
-                    warn!("Failed to parse math converter: {}", source.converter);
-                    return;
-                }
-            }
-        } else if source.converter == "dna" {
-            match self.load_cached_base12("dna", id, &source.url) {
-                Some(data) => {
-                    info!("Loaded {} base12 digits from cache for {}", data.len(), id);
-                    data
-                }
-                None => {
-                    warn!("DNA data not cached for {}", id);
-                    return;
-                }
-            }
-        } else if source.converter == "finance" {
-            match self.load_cached_base12("finance", id, &source.url) {
-                Some(data) => {
-                    info!("Loaded {} base12 digits from cache for {}", data.len(), id);
-                    data
-                }
-                None => {
-                    warn!("Finance data not cached for {}", id);
-                    return;
-                }
-            }
-        } else if source.converter == "audio" {
-            match self.load_cached_audio(id) {
-                Some(data) => {
-                    info!("Loaded {} base12 digits from cache for {}", data.len(), id);
-                    data
-                }
-                None => {
-                    warn!("Audio data not cached for {}", id);
-                    return;
-                }
-            }
-        } else if source.converter == "cosmos" {
-            match self.load_cached_cosmos(id) {
-                Some(data) => {
-                    info!("Loaded {} base12 digits from cache for {}", data.len(), id);
-                    data
-                }
-                None => {
-                    warn!("Cosmos data not cached for {}", id);
-                    return;
-                }
-            }
-        } else {
-            warn!("Converter not implemented: {}", source.converter);
-            return;
-        };
-
-        let mapping = self.config.get_mapping(&self.selected_mapping);
-        let points = walk_base12(&base12, &mapping, self.max_points);
-        info!("Generated {} walk points for {}", points.len(), id);
-
-        let hash = id.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
-        let hue = (hash % 360) as f32 / 360.0;
-        let color = hsv_to_rgb(hue, 0.8, 0.9);
-
-        let is_math = source.converter.starts_with("math.");
-        self.walks.insert(id.to_string(), WalkData {
-            name: source.name.clone(),
-            base12,
-            points,
-            color,
-            visible: true,
-            is_math,
-            converter: source.converter.clone(),
-        });
-
-        info!("Walk {} loaded successfully", id);
-    }
-
-    fn remove_walk(&mut self, id: &str) {
-        self.walks.remove(id);
-    }
-
-    fn load_cached_base12(&self, category: &str, id: &str, url: &str) -> Option<Vec<u8>> {
-        let file_id = url.split('/').last().unwrap_or(id);
-        let decoded = file_id.replace("%5E", "^");
-        let filename = format!("{}.json",
-            decoded.replace("^", "").replace(".", "_").replace("-", "_"));
-        let path = std::path::Path::new("data").join(category).join(&filename);
-
-        if !path.exists() { return None; }
-
-        let content = std::fs::read_to_string(&path).ok()?;
-        let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-        let base12_array = json.get("base12")?.as_array()?;
-        Some(base12_array.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
-    }
-
-    fn load_cached_audio(&self, id: &str) -> Option<Vec<u8>> {
-        let path = std::path::Path::new("data").join("audio").join(format!("{}.json", id));
-        if !path.exists() { return None; }
-        let content = std::fs::read_to_string(&path).ok()?;
-        let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-        let base12_array = json.get("base12")?.as_array()?;
-        Some(base12_array.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
-    }
-
-    fn load_cached_cosmos(&self, id: &str) -> Option<Vec<u8>> {
-        let path = std::path::Path::new("data").join("cosmos").join(format!("{}.json", id));
-        if !path.exists() { return None; }
-        let content = std::fs::read_to_string(&path).ok()?;
-        let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-        let base12_array = json.get("base12")?.as_array()?;
-        Some(base12_array.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
-    }
-
-    fn has_data_available(&self, source: &crate::config::Source) -> bool {
-        if source.converter.starts_with("math.") { return true; }
-        match source.converter.as_str() {
-            "dna" => {
-                let file_id = source.url.split('/').last().unwrap_or(&source.id);
-                let filename = format!("{}.json", file_id.replace(".", "_"));
-                std::path::Path::new("data").join("dna").join(&filename).exists()
-            }
-            "finance" => {
-                let file_id = source.url.split('/').last().unwrap_or(&source.id);
-                let decoded = file_id.replace("%5E", "^");
-                let filename = format!("{}.json", decoded.replace("^", "").replace(".", "_").replace("-", "_"));
-                std::path::Path::new("data").join("finance").join(&filename).exists()
-            }
-            "audio" => std::path::Path::new("data").join("audio").join(format!("{}.json", source.id)).exists(),
-            "cosmos" => std::path::Path::new("data").join("cosmos").join(format!("{}.json", source.id)).exists(),
-            _ => false
-        }
-    }
-
-    fn recompute_all_walks(&mut self) {
-        let mapping = self.config.get_mapping(&self.selected_mapping);
-        for (id, walk) in self.walks.iter_mut() {
-            if walk.is_math {
-                if let Some(gen) = MathGenerator::from_converter_string(&walk.converter) {
-                    walk.base12 = gen.generate(self.max_points);
-                }
-            }
-            walk.points = walk_base12(&walk.base12, &mapping, self.max_points);
-            debug!("Recomputed {} points for {}", walk.points.len(), id);
-        }
-    }
-
-    fn clear_all_walks(&mut self) {
-        self.walks.clear();
-    }
-
-    fn center_view(&mut self) {
-        self.camera_angle_x = 0.0;
-        self.camera_angle_y = 0.0;
-        self.camera_distance = 1.0;
-        self.camera_target = [0.0, 0.0];
-        self.reset_view = true;  // Flag to reset plot bounds
-    }
-
-    fn project_point(&self, p: [f32; 3]) -> [f64; 2] {
-        let cos_x = self.camera_angle_x.cos();
-        let sin_x = self.camera_angle_x.sin();
-        let cos_y = self.camera_angle_y.cos();
-        let sin_y = self.camera_angle_y.sin();
-
-        // Rotate around Y axis (yaw)
-        let x1 = p[0] * cos_y + p[2] * sin_y;
-        let z1 = -p[0] * sin_y + p[2] * cos_y;
-
-        // Rotate around X axis (pitch)
-        let y1 = p[1] * cos_x - z1 * sin_x;
-
-        // Apply pan only (zoom handled by plot bounds)
-        [
-            (x1 + self.camera_target[0]) as f64,
-            (y1 + self.camera_target[1]) as f64,
-        ]
-    }
-}
-
-impl eframe::App for WalkerApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.set_visuals(egui::Visuals::dark());
-
-        // Request continuous repaint for smooth interaction
-        ctx.request_repaint();
-
-        // Handle SpaceMouse input with configurable axis mapping
-        if let Some(ref sm) = self.spacemouse {
+    // Main loop
+    window.render_loop(move |mut frame_input| {
+        // Handle SpaceMouse
+        if let Some(ref sm) = spacemouse {
             if let Ok(state) = sm.lock() {
-                let cfg = &self.spacemouse_config;
-                let sens = cfg.sensitivity;
+                let cfg = &spacemouse_config;
+                let sens = cfg.sensitivity * 0.5;
 
-                // Get axis values with invert applied
                 let get_axis = |idx: usize| -> f32 {
                     let val = state.axes[idx];
                     if cfg.invert[idx] { -val } else { val }
                 };
 
-                // Apply rotation
-                self.camera_angle_y += get_axis(cfg.rot_y_axis) * 0.001 * sens;
-                self.camera_angle_x += get_axis(cfg.rot_x_axis) * 0.001 * sens;
-                // Apply zoom
-                self.camera_distance += get_axis(cfg.zoom_axis) * 0.0001 * sens;
-                self.camera_distance = self.camera_distance.clamp(0.1, 10.0);
-                // Apply pan
-                self.camera_target[0] += get_axis(cfg.pan_x_axis) * 0.01 * sens;
-                self.camera_target[1] += get_axis(cfg.pan_y_axis) * 0.01 * sens;
+                // Apply to camera position
+                let rot_y = get_axis(cfg.rot_y_axis) * 0.001 * sens;
+                let rot_x = get_axis(cfg.rot_x_axis) * 0.001 * sens;
+                let zoom = get_axis(cfg.zoom_axis) * 0.01 * sens;
+
+                if rot_y.abs() > 0.0001 || rot_x.abs() > 0.0001 || zoom.abs() > 0.0001 {
+                    let pos = camera.position();
+                    let target = camera.target();
+                    let mut dir = pos - target;
+                    let dist = dir.magnitude();
+
+                    // Rotate around target
+                    let yaw = Mat4::from_angle_y(radians(rot_y));
+                    let right = camera.right_direction();
+                    let pitch = Mat4::from_axis_angle(right, radians(rot_x));
+
+                    dir = (yaw * pitch * vec4(dir.x, dir.y, dir.z, 0.0)).truncate();
+
+                    // Apply zoom
+                    let new_dist = (dist + zoom).max(1.0).min(5000.0);
+                    dir = dir.normalize() * new_dist;
+
+                    camera.set_view(target + dir, target, vec3(0.0, 1.0, 0.0));
+                }
             }
         }
 
         // Auto-rotate
-        if self.auto_rotate {
-            self.camera_angle_y += 0.005;
+        if auto_rotate {
+            rotation_angle += 0.01;
+            let pos = camera.position();
+            let target = camera.target();
+            let dir = pos - target;
+            let dist = dir.magnitude();
+            let new_x = rotation_angle.cos() * dist;
+            let new_z = rotation_angle.sin() * dist;
+            camera.set_view(vec3(new_x, pos.y, new_z), target, vec3(0.0, 1.0, 0.0));
         }
 
-        // Left panel - walk selection
-        egui::SidePanel::left("walks_panel").min_width(250.0).show(ctx, |ui| {
-            ui.heading("Data Walks");
-            ui.separator();
+        // Handle orbit control
+        orbit_control.handle_events(&mut camera, &mut frame_input.events);
+        camera.set_viewport(frame_input.viewport);
 
-            // Mapping selector
-            let old_mapping = self.selected_mapping.clone();
-            ui.horizontal(|ui| {
-                ui.label("Mapping:");
-                egui::ComboBox::from_id_salt("mapping")
-                    .selected_text(&self.selected_mapping)
-                    .show_ui(ui, |ui| {
-                        for name in self.config.mappings.keys() {
-                            ui.selectable_value(&mut self.selected_mapping, name.clone(), name);
+        // Build geometry for visible walks
+        let mut objects: Vec<Gm<Mesh, ColorMaterial>> = Vec::new();
+
+        for (id, walk) in &walks {
+            if !walk.visible || walk.points.len() < 2 {
+                continue;
+            }
+
+            // Create line segments as thin cylinders or use Lines
+            let mut positions: Vec<Vec3> = Vec::new();
+            let mut colors: Vec<Srgba> = Vec::new();
+
+            let color = Srgba::new(
+                (walk.color[0] * 255.0) as u8,
+                (walk.color[1] * 255.0) as u8,
+                (walk.color[2] * 255.0) as u8,
+                255,
+            );
+
+            for p in &walk.points {
+                positions.push(vec3(p[0], p[1], p[2]));
+                colors.push(color);
+            }
+
+            // Create line strip mesh
+            let mut cpu_mesh = CpuMesh {
+                positions: Positions::F32(positions.clone()),
+                colors: Some(colors),
+                ..Default::default()
+            };
+
+            // Create indices for line strip
+            let indices: Vec<u32> = (0..positions.len() as u32).collect();
+            cpu_mesh.indices = Indices::U32(indices);
+
+            let mesh = Gm::new(
+                Mesh::new(&context, &cpu_mesh),
+                ColorMaterial::default(),
+            );
+            objects.push(mesh);
+        }
+
+        // Grid
+        let grid_lines = if show_grid {
+            let mut grid_positions: Vec<Vec3> = Vec::new();
+            let grid_size = 500.0;
+            let grid_step = 50.0;
+            let mut i = -grid_size;
+            while i <= grid_size {
+                // X lines
+                grid_positions.push(vec3(i, 0.0, -grid_size));
+                grid_positions.push(vec3(i, 0.0, grid_size));
+                // Z lines
+                grid_positions.push(vec3(-grid_size, 0.0, i));
+                grid_positions.push(vec3(grid_size, 0.0, i));
+                i += grid_step;
+            }
+            Some(grid_positions)
+        } else {
+            None
+        };
+
+        // GUI panel
+        gui.update(
+            &mut frame_input.events,
+            frame_input.accumulated_time,
+            frame_input.viewport,
+            frame_input.device_pixel_ratio,
+            |egui_ctx| {
+                egui::SidePanel::left("walks_panel").min_width(250.0).show(egui_ctx, |ui| {
+                    ui.heading("Data Walks");
+                    ui.separator();
+
+                    // Mapping selector
+                    ui.horizontal(|ui| {
+                        ui.label("Mapping:");
+                        egui::ComboBox::from_id_salt("mapping")
+                            .selected_text(&selected_mapping)
+                            .show_ui(ui, |ui| {
+                                for name in config.mappings.keys() {
+                                    ui.selectable_value(&mut selected_mapping, name.clone(), name);
+                                }
+                            });
+                    });
+
+                    ui.add(egui::Slider::new(&mut max_points, 100..=10000).text("Max points"));
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Deselect All").clicked() {
+                            selected_sources.clear();
+                            walks.clear();
+                        }
+                        if ui.button("Center View").clicked() {
+                            camera.set_view(
+                                vec3(0.0, 50.0, 200.0),
+                                vec3(0.0, 0.0, 0.0),
+                                vec3(0.0, 1.0, 0.0),
+                            );
                         }
                     });
-            });
-            if self.selected_mapping != old_mapping {
-                self.recompute_all_walks();
-            }
 
-            let old_max_points = self.max_points;
-            ui.add(egui::Slider::new(&mut self.max_points, 100..=10000).text("Max points"));
-            if self.max_points != old_max_points {
-                self.recompute_all_walks();
-            }
+                    ui.checkbox(&mut show_grid, "Show Grid");
+                    ui.checkbox(&mut auto_rotate, "Auto-rotate");
 
-            ui.horizontal(|ui| {
-                if ui.button("Deselect All").clicked() {
-                    self.clear_all_walks();
-                }
-                ui.label(format!("{} loaded", self.walks.len()));
-            });
+                    ui.separator();
 
-            ui.separator();
+                    // Source list
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for (category, sources) in &by_category {
+                            let cat_name = config.categories.get(category).unwrap_or(category);
+                            egui::CollapsingHeader::new(cat_name).show(ui, |ui| {
+                                for source in sources {
+                                    let mut checked = selected_sources.contains(&source.id);
 
-            // Source list
-            let mut by_category: BTreeMap<String, Vec<_>> = BTreeMap::new();
-            for source in &self.config.sources {
-                by_category.entry(source.category.clone()).or_default().push(source.clone());
-            }
+                                    // Check if data is available
+                                    let is_available = source.converter.starts_with("math.") ||
+                                        check_data_exists(&source.id, &source.converter);
 
-            let mut to_load: Vec<String> = Vec::new();
-            let mut to_remove: Vec<String> = Vec::new();
-
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for (category, sources) in by_category.iter() {
-                    let cat_name = self.config.categories.get(category).map(|s| s.as_str()).unwrap_or(category.as_str());
-                    ui.collapsing(cat_name, |ui| {
-                        for source in sources {
-                            let is_loaded = self.walks.contains_key(&source.id);
-                            let is_available = self.has_data_available(source);
-                            let mut checked = is_loaded;
-
-                            let color = if let Some(walk) = self.walks.get(&source.id) {
-                                egui::Color32::from_rgb(
-                                    (walk.color[0] * 255.0) as u8,
-                                    (walk.color[1] * 255.0) as u8,
-                                    (walk.color[2] * 255.0) as u8,
-                                )
-                            } else if is_available {
-                                egui::Color32::GRAY
-                            } else {
-                                egui::Color32::DARK_GRAY
-                            };
-
-                            ui.horizontal(|ui| {
-                                ui.colored_label(color, "●");
-                                if is_available {
-                                    if ui.checkbox(&mut checked, &source.name).changed() {
-                                        if checked { to_load.push(source.id.clone()); }
-                                        else { to_remove.push(source.id.clone()); }
+                                    if is_available {
+                                        if ui.checkbox(&mut checked, &source.name).changed() {
+                                            if checked {
+                                                selected_sources.insert(source.id.clone());
+                                                // Load walk
+                                                if let Some(walk_data) = load_walk_data(&source, &config, max_points, &selected_mapping) {
+                                                    walks.insert(source.id.clone(), walk_data);
+                                                }
+                                            } else {
+                                                selected_sources.remove(&source.id);
+                                                walks.remove(&source.id);
+                                            }
+                                        }
+                                    } else {
+                                        ui.add_enabled(false, egui::Checkbox::new(&mut checked, &source.name))
+                                            .on_disabled_hover_text("Not downloaded yet");
                                     }
-                                } else {
-                                    ui.add_enabled(false, egui::Checkbox::new(&mut checked, &source.name))
-                                        .on_disabled_hover_text("Not downloaded yet");
                                 }
                             });
                         }
                     });
-                }
-            });
-
-            for id in to_load { self.load_walk(&id); }
-            for id in to_remove { self.remove_walk(&id); }
-        });
-
-        // Bottom panel - controls
-        egui::TopBottomPanel::bottom("controls_panel").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.show_grid, "Grid");
-                ui.checkbox(&mut self.auto_rotate, "Auto-rotate");
-
-                ui.separator();
-                ui.label("Rotate:");
-                ui.add(egui::DragValue::new(&mut self.camera_angle_x).speed(0.02).prefix("X:"));
-                ui.add(egui::DragValue::new(&mut self.camera_angle_y).speed(0.02).prefix("Y:"));
-
-                ui.separator();
-                if ui.button("Center").clicked() {
-                    self.center_view();
-                }
-
-                if self.spacemouse.is_some() {
-                    ui.separator();
-                    if ui.button("SpaceMouse Config").clicked() {
-                        self.spacemouse_config_open = !self.spacemouse_config_open;
-                    }
-                }
-            });
-
-            // SpaceMouse config panel (expandable)
-            if self.spacemouse_config_open && self.spacemouse.is_some() {
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("Sensitivity:");
-                    ui.add(egui::Slider::new(&mut self.spacemouse_config.sensitivity, 0.1..=3.0));
                 });
 
-                ui.horizontal(|ui| {
-                    ui.label("Axis mapping:");
+                // Bottom panel
+                egui::TopBottomPanel::bottom("status").show(egui_ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{} walks loaded", walks.len()));
+                        ui.separator();
+                        ui.label("Right-drag: orbit | Scroll: zoom | Middle-drag: pan");
+                    });
                 });
+            },
+        );
 
-                let axis_names = ["TX", "TY", "TZ", "RX", "RY", "RZ"];
-                let function_names = ["Pan X", "Pan Y", "Zoom", "Rot X", "Rot Y", "Rot Z"];
+        // Clear and render
+        frame_input.screen().clear(ClearState::color_and_depth(0.1, 0.1, 0.15, 1.0, 1.0));
 
-                ui.horizontal(|ui| {
-                    // Pan X axis
-                    ui.label("Pan X:");
-                    egui::ComboBox::from_id_salt("pan_x")
-                        .selected_text(axis_names[self.spacemouse_config.pan_x_axis])
-                        .width(50.0)
-                        .show_ui(ui, |ui| {
-                            for (i, name) in axis_names.iter().enumerate() {
-                                ui.selectable_value(&mut self.spacemouse_config.pan_x_axis, i, *name);
-                            }
-                        });
+        // Render grid
+        if let Some(grid_pos) = &grid_lines {
+            let mut cpu_mesh = CpuMesh {
+                positions: Positions::F32(grid_pos.clone()),
+                ..Default::default()
+            };
+            let indices: Vec<u32> = (0..grid_pos.len() as u32).collect();
+            cpu_mesh.indices = Indices::U32(indices);
 
-                    // Pan Y axis
-                    ui.label("Pan Y:");
-                    egui::ComboBox::from_id_salt("pan_y")
-                        .selected_text(axis_names[self.spacemouse_config.pan_y_axis])
-                        .width(50.0)
-                        .show_ui(ui, |ui| {
-                            for (i, name) in axis_names.iter().enumerate() {
-                                ui.selectable_value(&mut self.spacemouse_config.pan_y_axis, i, *name);
-                            }
-                        });
+            let grid = Gm::new(
+                Mesh::new(&context, &cpu_mesh),
+                ColorMaterial { color: Srgba::new(60, 60, 80, 255), ..Default::default() },
+            );
+            grid.render(&camera, &[]);
+        }
 
-                    // Zoom axis
-                    ui.label("Zoom:");
-                    egui::ComboBox::from_id_salt("zoom")
-                        .selected_text(axis_names[self.spacemouse_config.zoom_axis])
-                        .width(50.0)
-                        .show_ui(ui, |ui| {
-                            for (i, name) in axis_names.iter().enumerate() {
-                                ui.selectable_value(&mut self.spacemouse_config.zoom_axis, i, *name);
-                            }
-                        });
-                });
+        // Render walks
+        for obj in &objects {
+            obj.render(&camera, &[]);
+        }
 
-                ui.horizontal(|ui| {
-                    // Rot X axis
-                    ui.label("Rot X:");
-                    egui::ComboBox::from_id_salt("rot_x")
-                        .selected_text(axis_names[self.spacemouse_config.rot_x_axis])
-                        .width(50.0)
-                        .show_ui(ui, |ui| {
-                            for (i, name) in axis_names.iter().enumerate() {
-                                ui.selectable_value(&mut self.spacemouse_config.rot_x_axis, i, *name);
-                            }
-                        });
+        // Render GUI
+        frame_input.screen().write(|| gui.render());
 
-                    // Rot Y axis
-                    ui.label("Rot Y:");
-                    egui::ComboBox::from_id_salt("rot_y")
-                        .selected_text(axis_names[self.spacemouse_config.rot_y_axis])
-                        .width(50.0)
-                        .show_ui(ui, |ui| {
-                            for (i, name) in axis_names.iter().enumerate() {
-                                ui.selectable_value(&mut self.spacemouse_config.rot_y_axis, i, *name);
-                            }
-                        });
+        FrameOutput::default()
+    });
 
-                    // Rot Z axis (unused but configurable)
-                    ui.label("Rot Z:");
-                    egui::ComboBox::from_id_salt("rot_z")
-                        .selected_text(axis_names[self.spacemouse_config.rot_z_axis])
-                        .width(50.0)
-                        .show_ui(ui, |ui| {
-                            for (i, name) in axis_names.iter().enumerate() {
-                                ui.selectable_value(&mut self.spacemouse_config.rot_z_axis, i, *name);
-                            }
-                        });
-                });
+    Ok(())
+}
 
-                ui.horizontal(|ui| {
-                    ui.label("Invert:");
-                    for (i, name) in axis_names.iter().enumerate() {
-                        ui.checkbox(&mut self.spacemouse_config.invert[i], *name);
-                    }
-                });
+fn check_data_exists(id: &str, converter: &str) -> bool {
+    let path = match converter {
+        "audio" => format!("data/audio/{}.json", id),
+        "dna" => format!("data/dna/{}.json", id),
+        "cosmos" => format!("data/cosmos/{}.json", id),
+        "finance" => format!("data/finance/{}.json", id),
+        _ => return false,
+    };
+    std::path::Path::new(&path).exists()
+}
 
-                ui.horizontal(|ui| {
-                    if ui.button("Save Config").clicked() {
-                        self.spacemouse_config.save();
-                    }
-                    if ui.button("Reset Defaults").clicked() {
-                        self.spacemouse_config = SpaceMouseConfig::default();
-                    }
-                });
+fn load_walk_data(
+    source: &crate::config::Source,
+    config: &Config,
+    max_points: usize,
+    mapping_name: &str,
+) -> Option<WalkData> {
+    let base12 = if source.converter.starts_with("math.") {
+        MathGenerator::from_converter_string(&source.converter)?.generate(max_points)
+    } else {
+        // Load from cache
+        let path = match source.converter.as_str() {
+            "audio" => format!("data/audio/{}.json", source.id),
+            "dna" => format!("data/dna/{}.json", source.id),
+            "cosmos" => format!("data/cosmos/{}.json", source.id),
+            "finance" => format!("data/finance/{}.json", source.id),
+            _ => return None,
+        };
+
+        let contents = std::fs::read_to_string(&path).ok()?;
+        let json: serde_json::Value = serde_json::from_str(&contents).ok()?;
+        let arr = json.get("base12")?.as_array()?;
+        arr.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect()
+    };
+
+    info!("Loaded {} base12 digits for {}", base12.len(), source.id);
+
+    let mapping = config.mappings.get(mapping_name)
+        .map(|v| {
+            let mut arr = [0u8; 12];
+            for (i, &val) in v.iter().enumerate().take(12) {
+                arr[i] = val;
             }
-        });
+            arr
+        })
+        .unwrap_or([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
 
-        // Central panel - 3D view
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // Mouse controls help
-            ui.horizontal(|ui| {
-                ui.label(format!("{} walks | ", self.walks.len()));
-                ui.label("Right-drag: rotate | Middle-drag: pan | Scroll: zoom");
-            });
+    let points = walk_base12(&base12, &mapping, max_points);
+    info!("Generated {} walk points for {}", points.len(), source.id);
 
-            // Handle keyboard and scroll input
-            ctx.input(|i| {
-                // Arrow keys for rotation
-                if i.key_down(egui::Key::ArrowLeft) { self.camera_angle_y -= 0.03; }
-                if i.key_down(egui::Key::ArrowRight) { self.camera_angle_y += 0.03; }
-                if i.key_down(egui::Key::ArrowUp) { self.camera_angle_x -= 0.03; }
-                if i.key_down(egui::Key::ArrowDown) { self.camera_angle_x += 0.03; }
-                // +/- for zoom
-                if i.key_down(egui::Key::Minus) {
-                    self.camera_distance *= 1.02;
-                }
-                if i.key_down(egui::Key::Plus) {
-                    self.camera_distance *= 0.98;
-                }
-                // Home to center
-                if i.key_pressed(egui::Key::Home) { self.center_view(); }
-                // Scroll for zoom
-                if i.raw_scroll_delta.y != 0.0 {
-                    self.camera_distance *= 1.0 - i.raw_scroll_delta.y * 0.002;
-                }
-                // Mouse drag rotation (right button) and pan (middle button)
-                if i.pointer.secondary_down() {
-                    let delta = i.pointer.delta();
-                    self.camera_angle_y += delta.x * 0.005;
-                    self.camera_angle_x += delta.y * 0.005;
-                }
-                if i.pointer.middle_down() {
-                    let delta = i.pointer.delta();
-                    self.camera_target[0] -= delta.x * 0.5;
-                    self.camera_target[1] += delta.y * 0.5;
-                }
-            });
+    // Color based on hash of id
+    let hash = source.id.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
+    let hue = (hash % 360) as f32 / 360.0;
+    let color = hsv_to_rgb(hue, 0.7, 0.9);
 
-            // Clamp values
-            self.camera_angle_x = self.camera_angle_x.clamp(-1.5, 1.5);
-            self.camera_distance = self.camera_distance.clamp(0.1, 10.0);
-
-            // Calculate plot bounds based on zoom level
-            let view_range = 100.0 * self.camera_distance as f64;
-
-            // Create axis hints for consistent tick spacing (every 10 units)
-            let x_axis = egui_plot::AxisHints::new_x()
-                .label("X")
-                .formatter(|val, _range| format!("{:.0}", val.value));
-            let y_axis = egui_plot::AxisHints::new_y()
-                .label("Y")
-                .formatter(|val, _range| format!("{:.0}", val.value));
-
-            // Build plot with explicit bounds for zoom control
-            let plot = egui_plot::Plot::new("walk_plot")
-                .data_aspect(1.0)
-                .allow_drag(true)   // Pan with mouse drag
-                .allow_zoom(true)   // Allow scroll zoom too
-                .allow_scroll(true)
-                .show_axes(true)
-                .show_grid(self.show_grid)
-                .custom_x_axes(vec![x_axis])
-                .custom_y_axes(vec![y_axis])
-                .include_x(-view_range)
-                .include_x(view_range)
-                .include_y(-view_range)
-                .include_y(view_range);
-
-            plot.show(ui, |plot_ui| {
-                for (_id, walk) in &self.walks {
-                    if !walk.visible || walk.points.is_empty() {
-                        continue;
-                    }
-
-                    let points_2d: Vec<[f64; 2]> = walk.points.iter()
-                        .map(|&p| self.project_point(p))
-                        .collect();
-
-                    let color = egui::Color32::from_rgb(
-                        (walk.color[0] * 255.0) as u8,
-                        (walk.color[1] * 255.0) as u8,
-                        (walk.color[2] * 255.0) as u8,
-                    );
-
-                    let line = egui_plot::Line::new(egui_plot::PlotPoints::from_iter(
-                        points_2d.iter().map(|p| [p[0], p[1]])
-                    ))
-                    .color(color)
-                    .width(self.point_size)
-                    .name(&walk.name);
-
-                    plot_ui.line(line);
-                }
-            });
-        });
-    }
+    Some(WalkData {
+        name: source.name.clone(),
+        points,
+        color,
+        visible: true,
+    })
 }
 
 /// Initialize SpaceMouse using hidapi
 fn init_spacemouse() -> Option<Arc<Mutex<SpaceMouseState>>> {
-    // 3Dconnexion vendor IDs (newer devices use 0x256f, older use 0x046d via Logitech)
     const VENDOR_3DCONNEXION_NEW: u16 = 0x256f;
     const VENDOR_3DCONNEXION_OLD: u16 = 0x046d;
-    // Common SpaceMouse product IDs
-    const SPACEMOUSE_WIRELESS_NEW: u16 = 0xc62e;  // Current SpaceMouse Wireless
+    const SPACEMOUSE_WIRELESS_NEW: u16 = 0xc62e;
     const SPACEMOUSE_WIRELESS_OLD: u16 = 0xc62f;
     const SPACEMOUSE_COMPACT: u16 = 0xc635;
     const SPACEMOUSE_PRO: u16 = 0xc62b;
     const SPACEMOUSE_PRO_WIRELESS: u16 = 0xc632;
 
     let state = Arc::new(Mutex::new(SpaceMouseState {
-        axes: [0.0; 6],  // tx, ty, tz, rx, ry, rz
+        axes: [0.0; 6],
     }));
 
     let state_clone = state.clone();
 
-    // Try to open SpaceMouse in a background thread
     std::thread::spawn(move || {
         let api = match hidapi::HidApi::new() {
             Ok(api) => api,
             Err(e) => {
-                info!("HID API init failed (no SpaceMouse support): {}", e);
+                info!("HID API init failed: {}", e);
                 return;
             }
         };
 
-        // Try different vendor/product ID combinations
-        let device = api.open(VENDOR_3DCONNEXION_NEW, SPACEMOUSE_WIRELESS_NEW)  // Current SpaceMouse Wireless
+        let device = api.open(VENDOR_3DCONNEXION_NEW, SPACEMOUSE_WIRELESS_NEW)
             .or_else(|_| api.open(VENDOR_3DCONNEXION_NEW, SPACEMOUSE_COMPACT))
             .or_else(|_| api.open(VENDOR_3DCONNEXION_NEW, SPACEMOUSE_PRO))
             .or_else(|_| api.open(VENDOR_3DCONNEXION_NEW, SPACEMOUSE_PRO_WIRELESS))
@@ -755,9 +477,6 @@ fn init_spacemouse() -> Option<Arc<Mutex<SpaceMouseState>>> {
             match device.read_timeout(&mut buf, 100) {
                 Ok(len) if len > 0 => {
                     if let Ok(mut state) = state_clone.lock() {
-                        // Parse SpaceMouse packet
-                        // Report ID 1: Translation (X, Y, Z) -> axes[0,1,2]
-                        // Report ID 2: Rotation (Rx, Ry, Rz) -> axes[3,4,5]
                         match buf[0] {
                             1 if len >= 7 => {
                                 state.axes[0] = i16::from_le_bytes([buf[1], buf[2]]) as f32;
@@ -774,12 +493,11 @@ fn init_spacemouse() -> Option<Arc<Mutex<SpaceMouseState>>> {
                     }
                 }
                 Ok(_) => {
-                    // Timeout or no data, reset values
                     if let Ok(mut state) = state_clone.lock() {
                         state.axes = [0.0; 6];
                     }
                 }
-                Err(_) => break, // Device disconnected
+                Err(_) => break,
             }
         }
     });

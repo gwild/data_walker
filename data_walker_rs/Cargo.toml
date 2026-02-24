@@ -42,7 +42,7 @@ chrono = "0.4"
 eframe = "0.29"
 egui = "0.29"
 egui_plot = "0.29"
-three-d = "0.18"
+three-d = { version = "0.18", features = ["egui-gui"] }
 
 # SpaceMouse support
 hidapi = "2"
