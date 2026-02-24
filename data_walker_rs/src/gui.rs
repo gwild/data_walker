@@ -1,9 +1,10 @@
-//! Native GUI viewer using egui + three-d
+//! Native GUI viewer using egui
 //!
-//! Pure Rust 3D visualization - no JavaScript
+//! 3D visualization with mouse orbit controls and SpaceMouse support
 
 use eframe::egui;
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
@@ -28,12 +29,18 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
 
 struct WalkData {
     name: String,
-    base12: Vec<u8>,  // Store base12 for recomputing with different mappings
+    base12: Vec<u8>,
     points: Vec<[f32; 3]>,
     color: [f32; 3],
     visible: bool,
-    is_math: bool,    // Track if this is a math source (needs regeneration on max_points change)
-    converter: String, // Store converter string for regeneration
+    is_math: bool,
+    converter: String,
+}
+
+/// SpaceMouse input state
+struct SpaceMouseState {
+    tx: f32, ty: f32, tz: f32,  // Translation
+    rx: f32, ry: f32, rz: f32,  // Rotation
 }
 
 struct WalkerApp {
@@ -41,35 +48,44 @@ struct WalkerApp {
     walks: BTreeMap<String, WalkData>,
     selected_mapping: String,
     max_points: usize,
+    // Camera state
     camera_distance: f32,
-    camera_angle_x: f32,
-    camera_angle_y: f32,
+    camera_angle_x: f32,  // Pitch (up/down)
+    camera_angle_y: f32,  // Yaw (left/right)
+    camera_target: [f32; 2],  // Pan offset
+    // UI state
     show_grid: bool,
     point_size: f32,
-    dragging: bool,
-    last_mouse_pos: Option<egui::Pos2>,
+    auto_rotate: bool,
+    // SpaceMouse
+    spacemouse: Option<Arc<Mutex<SpaceMouseState>>>,
+    spacemouse_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl WalkerApp {
     fn new(cc: &eframe::CreationContext<'_>, config: Config) -> Self {
-        // Dark mode
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
+
+        // Try to initialize SpaceMouse
+        let spacemouse = init_spacemouse();
+        let spacemouse_state = spacemouse.as_ref().map(|s| s.clone());
 
         let mut app = Self {
             config,
             walks: BTreeMap::new(),
             selected_mapping: "Identity".to_string(),
             max_points: 5000,
-            camera_distance: 200.0,
-            camera_angle_x: 0.3,
-            camera_angle_y: 0.3,
+            camera_distance: 1.0,
+            camera_angle_x: 0.5,
+            camera_angle_y: 0.5,
+            camera_target: [0.0, 0.0],
             show_grid: true,
             point_size: 2.0,
-            dragging: false,
-            last_mouse_pos: None,
+            auto_rotate: false,
+            spacemouse: spacemouse_state,
+            spacemouse_thread: None,
         };
 
-        // Auto-load pi on startup to verify loading works
         info!("Auto-loading pi walk on startup");
         app.load_walk("pi");
         info!("Auto-load complete, walks count: {}", app.walks.len());
@@ -95,7 +111,6 @@ impl WalkerApp {
 
         debug!("Found source: {} with converter: {}", source.name, source.converter);
 
-        // Generate or load base12 data
         let base12 = if source.converter.starts_with("math.") {
             match MathGenerator::from_converter_string(&source.converter) {
                 Some(gen) => {
@@ -109,50 +124,46 @@ impl WalkerApp {
                 }
             }
         } else if source.converter == "dna" {
-            // Load from cached file
             match self.load_cached_base12("dna", id, &source.url) {
                 Some(data) => {
                     info!("Loaded {} base12 digits from cache for {}", data.len(), id);
                     data
                 }
                 None => {
-                    warn!("DNA data not cached for {}, run 'download --all' first", id);
+                    warn!("DNA data not cached for {}", id);
                     return;
                 }
             }
         } else if source.converter == "finance" {
-            // Load from cached file
             match self.load_cached_base12("finance", id, &source.url) {
                 Some(data) => {
                     info!("Loaded {} base12 digits from cache for {}", data.len(), id);
                     data
                 }
                 None => {
-                    warn!("Finance data not cached for {}, run 'download --all' first", id);
+                    warn!("Finance data not cached for {}", id);
                     return;
                 }
             }
         } else if source.converter == "audio" {
-            // Load from cached file (audio data stored by id)
             match self.load_cached_audio(id) {
                 Some(data) => {
                     info!("Loaded {} base12 digits from cache for {}", data.len(), id);
                     data
                 }
                 None => {
-                    warn!("Audio data not cached for {}, run 'download --all' first", id);
+                    warn!("Audio data not cached for {}", id);
                     return;
                 }
             }
         } else if source.converter == "cosmos" {
-            // Load from cached file (cosmos data stored by id)
             match self.load_cached_cosmos(id) {
                 Some(data) => {
                     info!("Loaded {} base12 digits from cache for {}", data.len(), id);
                     data
                 }
                 None => {
-                    warn!("Cosmos data not cached for {}, run 'download --all' first", id);
+                    warn!("Cosmos data not cached for {}", id);
                     return;
                 }
             }
@@ -161,12 +172,10 @@ impl WalkerApp {
             return;
         };
 
-        // Compute walk points
         let mapping = self.config.get_mapping(&self.selected_mapping);
         let points = walk_base12(&base12, &mapping, self.max_points);
         info!("Generated {} walk points for {}", points.len(), id);
 
-        // Generate color from hash
         let hash = id.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
         let hue = (hash % 360) as f32 / 360.0;
         let color = hsv_to_rgb(hue, 0.8, 0.9);
@@ -182,7 +191,7 @@ impl WalkerApp {
             converter: source.converter.clone(),
         });
 
-        info!("Walk {} loaded successfully, total walks: {}", id, self.walks.len());
+        info!("Walk {} loaded successfully", id);
     }
 
     fn remove_walk(&mut self, id: &str) {
@@ -190,322 +199,286 @@ impl WalkerApp {
     }
 
     fn load_cached_base12(&self, category: &str, id: &str, url: &str) -> Option<Vec<u8>> {
-        // Extract identifier from URL
         let file_id = url.split('/').last().unwrap_or(id);
-
-        // Decode and clean up the filename:
-        // - %5E -> ^ (URL encoding for caret)
-        // - ^ -> "" (remove caret for indices like ^GSPC)
-        // - . -> _ (version numbers like NC_045512.2)
-        // - - -> _ (symbols like BTC-USD)
         let decoded = file_id.replace("%5E", "^");
         let filename = format!("{}.json",
             decoded.replace("^", "").replace(".", "_").replace("-", "_"));
         let path = std::path::Path::new("data").join(category).join(&filename);
 
-        debug!("Looking for cached data at: {:?}", path);
+        if !path.exists() { return None; }
 
-        if !path.exists() {
-            return None;
-        }
-
-        // Read and parse JSON
         let content = std::fs::read_to_string(&path).ok()?;
         let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-
-        // Extract base12 array
         let base12_array = json.get("base12")?.as_array()?;
-        let base12: Vec<u8> = base12_array
-            .iter()
-            .filter_map(|v| v.as_u64().map(|n| n as u8))
-            .collect();
-
-        Some(base12)
+        Some(base12_array.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
     }
 
     fn load_cached_audio(&self, id: &str) -> Option<Vec<u8>> {
-        // Audio files are stored by ID directly
         let path = std::path::Path::new("data").join("audio").join(format!("{}.json", id));
-
-        debug!("Looking for cached audio at: {:?}", path);
-
-        if !path.exists() {
-            return None;
-        }
-
+        if !path.exists() { return None; }
         let content = std::fs::read_to_string(&path).ok()?;
         let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-
         let base12_array = json.get("base12")?.as_array()?;
-        let base12: Vec<u8> = base12_array
-            .iter()
-            .filter_map(|v| v.as_u64().map(|n| n as u8))
-            .collect();
-
-        Some(base12)
+        Some(base12_array.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
     }
 
     fn load_cached_cosmos(&self, id: &str) -> Option<Vec<u8>> {
-        // Cosmos files are stored by ID directly
         let path = std::path::Path::new("data").join("cosmos").join(format!("{}.json", id));
-
-        debug!("Looking for cached cosmos at: {:?}", path);
-
-        if !path.exists() {
-            return None;
-        }
-
+        if !path.exists() { return None; }
         let content = std::fs::read_to_string(&path).ok()?;
         let json: serde_json::Value = serde_json::from_str(&content).ok()?;
-
         let base12_array = json.get("base12")?.as_array()?;
-        let base12: Vec<u8> = base12_array
-            .iter()
-            .filter_map(|v| v.as_u64().map(|n| n as u8))
-            .collect();
-
-        Some(base12)
+        Some(base12_array.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect())
     }
 
-    /// Check if a source has data available (either computed or cached)
     fn has_data_available(&self, source: &crate::config::Source) -> bool {
-        // Math sources are always available (computed on demand)
-        if source.converter.starts_with("math.") {
-            return true;
-        }
-
-        // For downloaded sources, check if cache file exists
+        if source.converter.starts_with("math.") { return true; }
         match source.converter.as_str() {
             "dna" => {
                 let file_id = source.url.split('/').last().unwrap_or(&source.id);
                 let filename = format!("{}.json", file_id.replace(".", "_"));
-                let path = std::path::Path::new("data").join("dna").join(&filename);
-                path.exists()
+                std::path::Path::new("data").join("dna").join(&filename).exists()
             }
             "finance" => {
                 let file_id = source.url.split('/').last().unwrap_or(&source.id);
                 let decoded = file_id.replace("%5E", "^");
-                let filename = format!("{}.json",
-                    decoded.replace("^", "").replace(".", "_").replace("-", "_"));
-                let path = std::path::Path::new("data").join("finance").join(&filename);
-                path.exists()
+                let filename = format!("{}.json", decoded.replace("^", "").replace(".", "_").replace("-", "_"));
+                std::path::Path::new("data").join("finance").join(&filename).exists()
             }
-            "audio" => {
-                let path = std::path::Path::new("data").join("audio").join(format!("{}.json", source.id));
-                path.exists()
-            }
-            "cosmos" => {
-                let path = std::path::Path::new("data").join("cosmos").join(format!("{}.json", source.id));
-                path.exists()
-            }
+            "audio" => std::path::Path::new("data").join("audio").join(format!("{}.json", source.id)).exists(),
+            "cosmos" => std::path::Path::new("data").join("cosmos").join(format!("{}.json", source.id)).exists(),
             _ => false
         }
     }
 
     fn recompute_all_walks(&mut self) {
         let mapping = self.config.get_mapping(&self.selected_mapping);
-        info!("Recomputing {} walks with mapping '{}'", self.walks.len(), self.selected_mapping);
-
         for (id, walk) in self.walks.iter_mut() {
-            // For math sources, regenerate base12 data with new max_points
             if walk.is_math {
                 if let Some(gen) = MathGenerator::from_converter_string(&walk.converter) {
                     walk.base12 = gen.generate(self.max_points);
-                    debug!("Regenerated {} base12 digits for math source {}", walk.base12.len(), id);
                 }
             }
-            let points = walk_base12(&walk.base12, &mapping, self.max_points);
-            debug!("Recomputed {} points for {}", points.len(), id);
-            walk.points = points;
+            walk.points = walk_base12(&walk.base12, &mapping, self.max_points);
+            debug!("Recomputed {} points for {}", walk.points.len(), id);
         }
     }
 
     fn clear_all_walks(&mut self) {
         self.walks.clear();
-        info!("Cleared all walks");
+    }
+
+    fn center_view(&mut self) {
+        self.camera_angle_x = 0.5;
+        self.camera_angle_y = 0.5;
+        self.camera_distance = 1.0;
+        self.camera_target = [0.0, 0.0];
+    }
+
+    fn project_point(&self, p: [f32; 3]) -> [f64; 2] {
+        let cos_x = self.camera_angle_x.cos();
+        let sin_x = self.camera_angle_x.sin();
+        let cos_y = self.camera_angle_y.cos();
+        let sin_y = self.camera_angle_y.sin();
+
+        // Rotate around Y axis (yaw)
+        let x1 = p[0] * cos_y + p[2] * sin_y;
+        let z1 = -p[0] * sin_y + p[2] * cos_y;
+
+        // Rotate around X axis (pitch)
+        let y1 = p[1] * cos_x - z1 * sin_x;
+
+        // Apply zoom and pan
+        let scale = 1.0 / self.camera_distance;
+        [
+            (x1 * scale + self.camera_target[0]) as f64,
+            (y1 * scale + self.camera_target[1]) as f64,
+        ]
     }
 }
 
 impl eframe::App for WalkerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Force dark mode every frame (persistence doesn't work reliably)
         ctx.set_visuals(egui::Visuals::dark());
 
-        // Log first update (use static to only log once)
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static FIRST_UPDATE: AtomicBool = AtomicBool::new(true);
-        if FIRST_UPDATE.swap(false, Ordering::SeqCst) {
-            info!("GUI update() called - first frame");
+        // Request continuous repaint for smooth interaction
+        ctx.request_repaint();
+
+        // Handle SpaceMouse input
+        if let Some(ref sm) = self.spacemouse {
+            if let Ok(state) = sm.lock() {
+                // Apply spacemouse rotation
+                self.camera_angle_y += state.rx * 0.001;
+                self.camera_angle_x += state.ry * 0.001;
+                // Apply spacemouse zoom
+                self.camera_distance += state.tz * 0.0001;
+                self.camera_distance = self.camera_distance.clamp(0.1, 10.0);
+                // Apply spacemouse pan
+                self.camera_target[0] += state.tx * 0.01;
+                self.camera_target[1] += state.ty * 0.01;
+            }
+        }
+
+        // Auto-rotate
+        if self.auto_rotate {
+            self.camera_angle_y += 0.005;
         }
 
         // Left panel - walk selection
-        egui::SidePanel::left("walks_panel")
-            .min_width(250.0)
-            .show(ctx, |ui| {
-                ui.heading("Data Walks");
-                ui.separator();
+        egui::SidePanel::left("walks_panel").min_width(250.0).show(ctx, |ui| {
+            ui.heading("Data Walks");
+            ui.separator();
 
-                // Mapping selector
-                let old_mapping = self.selected_mapping.clone();
-                ui.horizontal(|ui| {
-                    ui.label("Mapping:");
-                    egui::ComboBox::from_id_salt("mapping")
-                        .selected_text(&self.selected_mapping)
-                        .show_ui(ui, |ui| {
-                            for name in self.config.mappings.keys() {
-                                ui.selectable_value(&mut self.selected_mapping, name.clone(), name);
-                            }
-                        });
-                });
-                // Recompute walks if mapping changed
-                if self.selected_mapping != old_mapping {
-                    self.recompute_all_walks();
+            // Mapping selector
+            let old_mapping = self.selected_mapping.clone();
+            ui.horizontal(|ui| {
+                ui.label("Mapping:");
+                egui::ComboBox::from_id_salt("mapping")
+                    .selected_text(&self.selected_mapping)
+                    .show_ui(ui, |ui| {
+                        for name in self.config.mappings.keys() {
+                            ui.selectable_value(&mut self.selected_mapping, name.clone(), name);
+                        }
+                    });
+            });
+            if self.selected_mapping != old_mapping {
+                self.recompute_all_walks();
+            }
+
+            let old_max_points = self.max_points;
+            ui.add(egui::Slider::new(&mut self.max_points, 100..=10000).text("Max points"));
+            if self.max_points != old_max_points {
+                self.recompute_all_walks();
+            }
+
+            ui.horizontal(|ui| {
+                if ui.button("Deselect All").clicked() {
+                    self.clear_all_walks();
                 }
+                ui.label(format!("{} loaded", self.walks.len()));
+            });
 
-                let old_max_points = self.max_points;
-                ui.add(egui::Slider::new(&mut self.max_points, 100..=10000).text("Max points"));
-                if self.max_points != old_max_points {
-                    self.recompute_all_walks();
-                }
+            ui.separator();
 
-                ui.horizontal(|ui| {
-                    if ui.button("Deselect All").clicked() {
-                        self.clear_all_walks();
-                    }
-                    ui.label(format!("{} loaded", self.walks.len()));
-                });
+            // Source list
+            let mut by_category: BTreeMap<String, Vec<_>> = BTreeMap::new();
+            for source in &self.config.sources {
+                by_category.entry(source.category.clone()).or_default().push(source.clone());
+            }
 
-                ui.separator();
+            let mut to_load: Vec<String> = Vec::new();
+            let mut to_remove: Vec<String> = Vec::new();
 
-                // Group sources by category (BTreeMap for stable order)
-                let mut by_category: BTreeMap<String, Vec<_>> = BTreeMap::new();
-                for source in &self.config.sources {
-                    by_category
-                        .entry(source.category.clone())
-                        .or_default()
-                        .push(source.clone());
-                }
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for (category, sources) in by_category.iter() {
+                    let cat_name = self.config.categories.get(category).map(|s| s.as_str()).unwrap_or(category.as_str());
+                    ui.collapsing(cat_name, |ui| {
+                        for source in sources {
+                            let is_loaded = self.walks.contains_key(&source.id);
+                            let is_available = self.has_data_available(source);
+                            let mut checked = is_loaded;
 
-                // Collect actions to perform after UI rendering
-                let mut to_load: Vec<String> = Vec::new();
-                let mut to_remove: Vec<String> = Vec::new();
+                            let color = if let Some(walk) = self.walks.get(&source.id) {
+                                egui::Color32::from_rgb(
+                                    (walk.color[0] * 255.0) as u8,
+                                    (walk.color[1] * 255.0) as u8,
+                                    (walk.color[2] * 255.0) as u8,
+                                )
+                            } else if is_available {
+                                egui::Color32::GRAY
+                            } else {
+                                egui::Color32::DARK_GRAY
+                            };
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (category, sources) in by_category.iter() {
-                        let cat_name = self.config.categories.get(category)
-                            .map(|s| s.as_str())
-                            .unwrap_or(category.as_str());
-                        ui.collapsing(cat_name, |ui| {
-                            for source in sources {
-                                let is_loaded = self.walks.contains_key(&source.id);
-                                let is_available = self.has_data_available(source);
-                                let mut checked = is_loaded;
-
-                                // Color indicator
-                                let color = if let Some(walk) = self.walks.get(&source.id) {
-                                    egui::Color32::from_rgb(
-                                        (walk.color[0] * 255.0) as u8,
-                                        (walk.color[1] * 255.0) as u8,
-                                        (walk.color[2] * 255.0) as u8,
-                                    )
-                                } else if is_available {
-                                    egui::Color32::GRAY
-                                } else {
-                                    egui::Color32::DARK_GRAY // Disabled items
-                                };
-
-                                ui.horizontal(|ui| {
-                                    ui.colored_label(color, "●");
-                                    if is_available {
-                                        // Math and DNA sources are enabled
-                                        if ui.checkbox(&mut checked, &source.name).changed() {
-                                            debug!("Checkbox changed for {}: checked={}", source.id, checked);
-                                            if checked {
-                                                to_load.push(source.id.clone());
-                                            } else {
-                                                to_remove.push(source.id.clone());
-                                            }
-                                        }
-                                    } else {
-                                        // Other sources show as disabled with tooltip
-                                        ui.add_enabled(false, egui::Checkbox::new(&mut checked, &source.name))
-                                            .on_disabled_hover_text("Download not implemented yet");
+                            ui.horizontal(|ui| {
+                                ui.colored_label(color, "●");
+                                if is_available {
+                                    if ui.checkbox(&mut checked, &source.name).changed() {
+                                        if checked { to_load.push(source.id.clone()); }
+                                        else { to_remove.push(source.id.clone()); }
                                     }
-                                });
-                            }
-                        });
-                    }
-                });
-
-                // Apply deferred actions
-                if !to_load.is_empty() {
-                    info!("Loading {} walks: {:?}", to_load.len(), to_load);
-                }
-                for id in to_load {
-                    self.load_walk(&id);
-                }
-                for id in to_remove {
-                    self.remove_walk(&id);
+                                } else {
+                                    ui.add_enabled(false, egui::Checkbox::new(&mut checked, &source.name))
+                                        .on_disabled_hover_text("Not downloaded yet");
+                                }
+                            });
+                        }
+                    });
                 }
             });
+
+            for id in to_load { self.load_walk(&id); }
+            for id in to_remove { self.remove_walk(&id); }
+        });
 
         // Bottom panel - controls
         egui::TopBottomPanel::bottom("controls_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.show_grid, "Grid");
-                ui.add(egui::Slider::new(&mut self.point_size, 0.5..=10.0).text("Point size"));
-                ui.add(egui::Slider::new(&mut self.camera_distance, 10.0..=1000.0).text("Zoom"));
+                ui.checkbox(&mut self.auto_rotate, "Auto-rotate");
+
                 ui.separator();
-                // Center view button
-                if ui.button("Center View").clicked() {
-                    self.camera_angle_x = 0.3;
-                    self.camera_angle_y = 0.3;
-                    self.camera_distance = 200.0;
+                ui.label("Zoom:");
+                if ui.add(egui::Slider::new(&mut self.camera_distance, 0.1..=5.0).show_value(false)).changed() {
+                    // Zoom changed
+                }
+
+                ui.separator();
+                ui.label("Rotate:");
+                ui.add(egui::DragValue::new(&mut self.camera_angle_x).speed(0.02).prefix("X:"));
+                ui.add(egui::DragValue::new(&mut self.camera_angle_y).speed(0.02).prefix("Y:"));
+
+                ui.separator();
+                if ui.button("⟲ Center").clicked() {
+                    self.center_view();
+                }
+
+                if self.spacemouse.is_some() {
+                    ui.label("🎮 SpaceMouse");
                 }
             });
         });
 
         // Central panel - 3D view
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Instructions and rotation controls
+            // Mouse controls help
             ui.horizontal(|ui| {
-                ui.label(format!("{} walks", self.walks.len()));
-                ui.separator();
-                ui.label("Drag plot to pan, scroll to zoom. Rotation:");
-                ui.add(egui::DragValue::new(&mut self.camera_angle_x).speed(0.01).prefix("X: ").suffix("°"));
-                ui.add(egui::DragValue::new(&mut self.camera_angle_y).speed(0.01).prefix("Y: ").suffix("°"));
+                ui.label(format!("{} walks | ", self.walks.len()));
+                ui.label("Arrow keys: rotate | Scroll: zoom | Drag: pan");
             });
 
-            // Handle keyboard rotation (arrow keys)
-            let rotation_speed = 0.05;
+            // Handle keyboard input
             ctx.input(|i| {
-                if i.key_down(egui::Key::ArrowLeft) {
-                    self.camera_angle_y -= rotation_speed;
+                // Arrow keys for rotation
+                if i.key_down(egui::Key::ArrowLeft) { self.camera_angle_y -= 0.03; }
+                if i.key_down(egui::Key::ArrowRight) { self.camera_angle_y += 0.03; }
+                if i.key_down(egui::Key::ArrowUp) { self.camera_angle_x -= 0.03; }
+                if i.key_down(egui::Key::ArrowDown) { self.camera_angle_x += 0.03; }
+                // +/- for zoom
+                if i.key_down(egui::Key::Minus) {
+                    self.camera_distance *= 1.02;
                 }
-                if i.key_down(egui::Key::ArrowRight) {
-                    self.camera_angle_y += rotation_speed;
+                if i.key_down(egui::Key::Plus) {
+                    self.camera_distance *= 0.98;
                 }
-                if i.key_down(egui::Key::ArrowUp) {
-                    self.camera_angle_x -= rotation_speed;
-                }
-                if i.key_down(egui::Key::ArrowDown) {
-                    self.camera_angle_x += rotation_speed;
-                }
-                // Home key to center
-                if i.key_pressed(egui::Key::Home) {
-                    self.camera_angle_x = 0.3;
-                    self.camera_angle_y = 0.3;
+                // Home to center
+                if i.key_pressed(egui::Key::Home) { self.center_view(); }
+                // Scroll for zoom
+                if i.raw_scroll_delta.y != 0.0 {
+                    self.camera_distance *= 1.0 - i.raw_scroll_delta.y * 0.002;
+                    self.camera_distance = self.camera_distance.clamp(0.1, 10.0);
                 }
             });
 
-            // Clamp angles
-            self.camera_angle_x = self.camera_angle_x.clamp(-1.57, 1.57);
+            // Clamp values
+            self.camera_angle_x = self.camera_angle_x.clamp(-1.5, 1.5);
+            self.camera_distance = self.camera_distance.clamp(0.1, 10.0);
 
             let plot = egui_plot::Plot::new("walk_plot")
                 .data_aspect(1.0)
-                .allow_drag(true)
-                .allow_zoom(true)
-                .allow_scroll(true)
+                .allow_drag(true)   // Pan with mouse drag
+                .allow_zoom(false)  // We handle zoom ourselves
+                .allow_scroll(false)
                 .show_axes(true)
                 .show_grid(self.show_grid);
 
@@ -515,25 +488,8 @@ impl eframe::App for WalkerApp {
                         continue;
                     }
 
-                    // Project 3D to 2D with proper rotation matrix
-                    let cos_x = self.camera_angle_x.cos();
-                    let sin_x = self.camera_angle_x.sin();
-                    let cos_y = self.camera_angle_y.cos();
-                    let sin_y = self.camera_angle_y.sin();
-
                     let points_2d: Vec<[f64; 2]> = walk.points.iter()
-                        .map(|p| {
-                            let x = p[0] as f64;
-                            let y = p[1] as f64;
-                            let z = p[2] as f64;
-
-                            // Rotate around Y axis first, then X axis
-                            let x1 = x * cos_y as f64 + z * sin_y as f64;
-                            let z1 = -x * sin_y as f64 + z * cos_y as f64;
-                            let y1 = y * cos_x as f64 - z1 * sin_x as f64;
-
-                            [x1, y1]
-                        })
+                        .map(|&p| self.project_point(p))
                         .collect();
 
                     let color = egui::Color32::from_rgb(
@@ -542,7 +498,6 @@ impl eframe::App for WalkerApp {
                         (walk.color[2] * 255.0) as u8,
                     );
 
-                    // Draw as line
                     let line = egui_plot::Line::new(egui_plot::PlotPoints::from_iter(
                         points_2d.iter().map(|p| [p[0], p[1]])
                     ))
@@ -553,12 +508,89 @@ impl eframe::App for WalkerApp {
                 }
             });
         });
-
-        // Only repaint when UI changes (not continuously)
     }
 }
 
-/// Convert HSV to RGB
+/// Initialize SpaceMouse using hidapi
+fn init_spacemouse() -> Option<Arc<Mutex<SpaceMouseState>>> {
+    // 3Dconnexion vendor ID
+    const VENDOR_3DCONNEXION: u16 = 0x046d;
+    // Common SpaceMouse product IDs
+    const SPACEMOUSE_WIRELESS: u16 = 0xc62f;
+    const SPACEMOUSE_COMPACT: u16 = 0xc635;
+    const SPACEMOUSE_PRO: u16 = 0xc62b;
+
+    let state = Arc::new(Mutex::new(SpaceMouseState {
+        tx: 0.0, ty: 0.0, tz: 0.0,
+        rx: 0.0, ry: 0.0, rz: 0.0,
+    }));
+
+    let state_clone = state.clone();
+
+    // Try to open SpaceMouse in a background thread
+    std::thread::spawn(move || {
+        let api = match hidapi::HidApi::new() {
+            Ok(api) => api,
+            Err(e) => {
+                info!("HID API init failed (no SpaceMouse support): {}", e);
+                return;
+            }
+        };
+
+        // Try different product IDs
+        let device = api.open(VENDOR_3DCONNEXION, SPACEMOUSE_WIRELESS)
+            .or_else(|_| api.open(VENDOR_3DCONNEXION, SPACEMOUSE_COMPACT))
+            .or_else(|_| api.open(VENDOR_3DCONNEXION, SPACEMOUSE_PRO));
+
+        let device = match device {
+            Ok(d) => {
+                info!("SpaceMouse connected!");
+                d
+            }
+            Err(_) => {
+                info!("No SpaceMouse found");
+                return;
+            }
+        };
+
+        let mut buf = [0u8; 13];
+        loop {
+            match device.read_timeout(&mut buf, 100) {
+                Ok(len) if len > 0 => {
+                    if let Ok(mut state) = state_clone.lock() {
+                        // Parse SpaceMouse packet
+                        // Report ID 1: Translation (X, Y, Z)
+                        // Report ID 2: Rotation (Rx, Ry, Rz)
+                        match buf[0] {
+                            1 if len >= 7 => {
+                                state.tx = i16::from_le_bytes([buf[1], buf[2]]) as f32;
+                                state.ty = i16::from_le_bytes([buf[3], buf[4]]) as f32;
+                                state.tz = i16::from_le_bytes([buf[5], buf[6]]) as f32;
+                            }
+                            2 if len >= 7 => {
+                                state.rx = i16::from_le_bytes([buf[1], buf[2]]) as f32;
+                                state.ry = i16::from_le_bytes([buf[3], buf[4]]) as f32;
+                                state.rz = i16::from_le_bytes([buf[5], buf[6]]) as f32;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Ok(_) => {
+                    // Timeout or no data, reset values
+                    if let Ok(mut state) = state_clone.lock() {
+                        state.tx = 0.0; state.ty = 0.0; state.tz = 0.0;
+                        state.rx = 0.0; state.ry = 0.0; state.rz = 0.0;
+                    }
+                }
+                Err(_) => break, // Device disconnected
+            }
+        }
+    });
+
+    Some(state)
+}
+
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
     let c = v * s;
     let x = c * (1.0 - ((h * 6.0) % 2.0 - 1.0).abs());
