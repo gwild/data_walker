@@ -5,11 +5,68 @@
 use eframe::egui;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::walk::walk_base12;
 use crate::converters::math::MathGenerator;
+
+/// SpaceMouse axis configuration
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct SpaceMouseConfig {
+    // Axis mapping: which physical axis controls which function
+    // 0=tx, 1=ty, 2=tz, 3=rx, 4=ry, 5=rz
+    pan_x_axis: usize,
+    pan_y_axis: usize,
+    zoom_axis: usize,
+    rot_x_axis: usize,
+    rot_y_axis: usize,
+    rot_z_axis: usize,
+    // Invert flags
+    invert: [bool; 6],
+    // Sensitivity
+    sensitivity: f32,
+}
+
+impl Default for SpaceMouseConfig {
+    fn default() -> Self {
+        Self {
+            pan_x_axis: 0,   // tx -> pan X
+            pan_y_axis: 1,   // ty -> pan Y
+            zoom_axis: 2,    // tz -> zoom
+            rot_x_axis: 4,   // ry -> rotate X (pitch)
+            rot_y_axis: 3,   // rx -> rotate Y (yaw)
+            rot_z_axis: 5,   // rz -> rotate Z (roll, unused)
+            invert: [false; 6],
+            sensitivity: 1.0,
+        }
+    }
+}
+
+impl SpaceMouseConfig {
+    fn load() -> Self {
+        let path = PathBuf::from("spacemouse.yaml");
+        if path.exists() {
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                if let Ok(config) = serde_yaml::from_str(&contents) {
+                    info!("Loaded SpaceMouse config from spacemouse.yaml");
+                    return config;
+                }
+            }
+        }
+        Self::default()
+    }
+
+    fn save(&self) {
+        let path = PathBuf::from("spacemouse.yaml");
+        if let Ok(yaml) = serde_yaml::to_string(self) {
+            if std::fs::write(&path, yaml).is_ok() {
+                info!("Saved SpaceMouse config to spacemouse.yaml");
+            }
+        }
+    }
+}
 
 /// Run the native GUI viewer
 pub fn run_viewer(config: Config) -> anyhow::Result<()> {
@@ -37,10 +94,9 @@ struct WalkData {
     converter: String,
 }
 
-/// SpaceMouse input state
+/// SpaceMouse input state (raw values from device)
 struct SpaceMouseState {
-    tx: f32, ty: f32, tz: f32,  // Translation
-    rx: f32, ry: f32, rz: f32,  // Rotation
+    axes: [f32; 6],  // tx, ty, tz, rx, ry, rz
 }
 
 struct WalkerApp {
@@ -53,6 +109,10 @@ struct WalkerApp {
     camera_angle_x: f32,  // Pitch (up/down)
     camera_angle_y: f32,  // Yaw (left/right)
     camera_target: [f32; 2],  // Pan offset
+    // Mouse drag state
+    last_mouse_pos: Option<egui::Pos2>,
+    is_rotating: bool,  // Right-click drag = rotate
+    is_panning: bool,   // Middle-click drag = pan
     // UI state
     show_grid: bool,
     point_size: f32,
@@ -60,6 +120,8 @@ struct WalkerApp {
     reset_view: bool,  // Flag to reset plot bounds on next frame
     // SpaceMouse
     spacemouse: Option<Arc<Mutex<SpaceMouseState>>>,
+    spacemouse_config: SpaceMouseConfig,
+    spacemouse_config_open: bool,
     spacemouse_thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -77,14 +139,19 @@ impl WalkerApp {
             selected_mapping: "Identity".to_string(),
             max_points: 5000,
             camera_distance: 1.0,
-            camera_angle_x: 0.5,
-            camera_angle_y: 0.5,
+            camera_angle_x: 0.0,
+            camera_angle_y: 0.0,
             camera_target: [0.0, 0.0],
+            last_mouse_pos: None,
+            is_rotating: false,
+            is_panning: false,
             show_grid: true,
             point_size: 2.0,
             auto_rotate: false,
             reset_view: false,
             spacemouse: spacemouse_state,
+            spacemouse_config: SpaceMouseConfig::load(),
+            spacemouse_config_open: false,
             spacemouse_thread: None,
         }
     }
@@ -285,11 +352,10 @@ impl WalkerApp {
         // Rotate around X axis (pitch)
         let y1 = p[1] * cos_x - z1 * sin_x;
 
-        // Apply zoom and pan
-        let scale = 1.0 / self.camera_distance;
+        // Apply pan only (zoom handled by plot bounds)
         [
-            (x1 * scale + self.camera_target[0]) as f64,
-            (y1 * scale + self.camera_target[1]) as f64,
+            (x1 + self.camera_target[0]) as f64,
+            (y1 + self.camera_target[1]) as f64,
         ]
     }
 }
@@ -301,18 +367,27 @@ impl eframe::App for WalkerApp {
         // Request continuous repaint for smooth interaction
         ctx.request_repaint();
 
-        // Handle SpaceMouse input
+        // Handle SpaceMouse input with configurable axis mapping
         if let Some(ref sm) = self.spacemouse {
             if let Ok(state) = sm.lock() {
-                // Apply spacemouse rotation
-                self.camera_angle_y += state.rx * 0.001;
-                self.camera_angle_x += state.ry * 0.001;
-                // Apply spacemouse zoom
-                self.camera_distance += state.tz * 0.0001;
+                let cfg = &self.spacemouse_config;
+                let sens = cfg.sensitivity;
+
+                // Get axis values with invert applied
+                let get_axis = |idx: usize| -> f32 {
+                    let val = state.axes[idx];
+                    if cfg.invert[idx] { -val } else { val }
+                };
+
+                // Apply rotation
+                self.camera_angle_y += get_axis(cfg.rot_y_axis) * 0.001 * sens;
+                self.camera_angle_x += get_axis(cfg.rot_x_axis) * 0.001 * sens;
+                // Apply zoom
+                self.camera_distance += get_axis(cfg.zoom_axis) * 0.0001 * sens;
                 self.camera_distance = self.camera_distance.clamp(0.1, 10.0);
-                // Apply spacemouse pan
-                self.camera_target[0] += state.tx * 0.01;
-                self.camera_target[1] += state.ty * 0.01;
+                // Apply pan
+                self.camera_target[0] += get_axis(cfg.pan_x_axis) * 0.01 * sens;
+                self.camera_target[1] += get_axis(cfg.pan_y_axis) * 0.01 * sens;
             }
         }
 
@@ -415,25 +490,124 @@ impl eframe::App for WalkerApp {
                 ui.checkbox(&mut self.auto_rotate, "Auto-rotate");
 
                 ui.separator();
-                ui.label("Zoom:");
-                if ui.add(egui::Slider::new(&mut self.camera_distance, 0.1..=5.0).show_value(false)).changed() {
-                    // Zoom changed
-                }
-
-                ui.separator();
                 ui.label("Rotate:");
                 ui.add(egui::DragValue::new(&mut self.camera_angle_x).speed(0.02).prefix("X:"));
                 ui.add(egui::DragValue::new(&mut self.camera_angle_y).speed(0.02).prefix("Y:"));
 
                 ui.separator();
-                if ui.button("⟲ Center").clicked() {
+                if ui.button("Center").clicked() {
                     self.center_view();
                 }
 
                 if self.spacemouse.is_some() {
-                    ui.label("🎮 SpaceMouse");
+                    ui.separator();
+                    if ui.button("SpaceMouse Config").clicked() {
+                        self.spacemouse_config_open = !self.spacemouse_config_open;
+                    }
                 }
             });
+
+            // SpaceMouse config panel (expandable)
+            if self.spacemouse_config_open && self.spacemouse.is_some() {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Sensitivity:");
+                    ui.add(egui::Slider::new(&mut self.spacemouse_config.sensitivity, 0.1..=3.0));
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Axis mapping:");
+                });
+
+                let axis_names = ["TX", "TY", "TZ", "RX", "RY", "RZ"];
+                let function_names = ["Pan X", "Pan Y", "Zoom", "Rot X", "Rot Y", "Rot Z"];
+
+                ui.horizontal(|ui| {
+                    // Pan X axis
+                    ui.label("Pan X:");
+                    egui::ComboBox::from_id_salt("pan_x")
+                        .selected_text(axis_names[self.spacemouse_config.pan_x_axis])
+                        .width(50.0)
+                        .show_ui(ui, |ui| {
+                            for (i, name) in axis_names.iter().enumerate() {
+                                ui.selectable_value(&mut self.spacemouse_config.pan_x_axis, i, *name);
+                            }
+                        });
+
+                    // Pan Y axis
+                    ui.label("Pan Y:");
+                    egui::ComboBox::from_id_salt("pan_y")
+                        .selected_text(axis_names[self.spacemouse_config.pan_y_axis])
+                        .width(50.0)
+                        .show_ui(ui, |ui| {
+                            for (i, name) in axis_names.iter().enumerate() {
+                                ui.selectable_value(&mut self.spacemouse_config.pan_y_axis, i, *name);
+                            }
+                        });
+
+                    // Zoom axis
+                    ui.label("Zoom:");
+                    egui::ComboBox::from_id_salt("zoom")
+                        .selected_text(axis_names[self.spacemouse_config.zoom_axis])
+                        .width(50.0)
+                        .show_ui(ui, |ui| {
+                            for (i, name) in axis_names.iter().enumerate() {
+                                ui.selectable_value(&mut self.spacemouse_config.zoom_axis, i, *name);
+                            }
+                        });
+                });
+
+                ui.horizontal(|ui| {
+                    // Rot X axis
+                    ui.label("Rot X:");
+                    egui::ComboBox::from_id_salt("rot_x")
+                        .selected_text(axis_names[self.spacemouse_config.rot_x_axis])
+                        .width(50.0)
+                        .show_ui(ui, |ui| {
+                            for (i, name) in axis_names.iter().enumerate() {
+                                ui.selectable_value(&mut self.spacemouse_config.rot_x_axis, i, *name);
+                            }
+                        });
+
+                    // Rot Y axis
+                    ui.label("Rot Y:");
+                    egui::ComboBox::from_id_salt("rot_y")
+                        .selected_text(axis_names[self.spacemouse_config.rot_y_axis])
+                        .width(50.0)
+                        .show_ui(ui, |ui| {
+                            for (i, name) in axis_names.iter().enumerate() {
+                                ui.selectable_value(&mut self.spacemouse_config.rot_y_axis, i, *name);
+                            }
+                        });
+
+                    // Rot Z axis (unused but configurable)
+                    ui.label("Rot Z:");
+                    egui::ComboBox::from_id_salt("rot_z")
+                        .selected_text(axis_names[self.spacemouse_config.rot_z_axis])
+                        .width(50.0)
+                        .show_ui(ui, |ui| {
+                            for (i, name) in axis_names.iter().enumerate() {
+                                ui.selectable_value(&mut self.spacemouse_config.rot_z_axis, i, *name);
+                            }
+                        });
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Invert:");
+                    for (i, name) in axis_names.iter().enumerate() {
+                        ui.checkbox(&mut self.spacemouse_config.invert[i], *name);
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    if ui.button("Save Config").clicked() {
+                        self.spacemouse_config.save();
+                    }
+                    if ui.button("Reset Defaults").clicked() {
+                        self.spacemouse_config = SpaceMouseConfig::default();
+                    }
+                });
+            }
         });
 
         // Central panel - 3D view
@@ -441,8 +615,54 @@ impl eframe::App for WalkerApp {
             // Mouse controls help
             ui.horizontal(|ui| {
                 ui.label(format!("{} walks | ", self.walks.len()));
-                ui.label("Arrow keys: rotate | Scroll: zoom | Drag: pan");
+                ui.label("Right-drag: rotate | Middle-drag: pan | Scroll: zoom");
             });
+
+            // Handle mouse input for 3D rotation (CAD-style)
+            let response = ui.allocate_rect(ui.available_rect_before_wrap(), egui::Sense::click_and_drag());
+
+            // Track mouse button states
+            if response.drag_started_by(egui::PointerButton::Secondary) {
+                self.is_rotating = true;
+                self.last_mouse_pos = response.interact_pointer_pos();
+            }
+            if response.drag_started_by(egui::PointerButton::Middle) {
+                self.is_panning = true;
+                self.last_mouse_pos = response.interact_pointer_pos();
+            }
+
+            if response.drag_stopped() {
+                self.is_rotating = false;
+                self.is_panning = false;
+                self.last_mouse_pos = None;
+            }
+
+            // Handle mouse drag
+            if let Some(current_pos) = response.interact_pointer_pos() {
+                if let Some(last_pos) = self.last_mouse_pos {
+                    let delta = current_pos - last_pos;
+
+                    if self.is_rotating {
+                        // Right-drag rotates view (CAD-style orbit)
+                        self.camera_angle_y += delta.x * 0.005;
+                        self.camera_angle_x += delta.y * 0.005;
+                    }
+
+                    if self.is_panning {
+                        // Middle-drag pans view
+                        self.camera_target[0] -= delta.x * 0.5;
+                        self.camera_target[1] += delta.y * 0.5;
+                    }
+                }
+                self.last_mouse_pos = Some(current_pos);
+            }
+
+            // Handle scroll for zoom
+            let scroll_delta = ctx.input(|i| i.raw_scroll_delta);
+            if scroll_delta.y != 0.0 {
+                self.camera_distance *= 1.0 - scroll_delta.y * 0.002;
+                self.camera_distance = self.camera_distance.clamp(0.1, 10.0);
+            }
 
             // Handle keyboard input
             ctx.input(|i| {
@@ -460,31 +680,37 @@ impl eframe::App for WalkerApp {
                 }
                 // Home to center
                 if i.key_pressed(egui::Key::Home) { self.center_view(); }
-                // Scroll for zoom
-                if i.raw_scroll_delta.y != 0.0 {
-                    self.camera_distance *= 1.0 - i.raw_scroll_delta.y * 0.002;
-                    self.camera_distance = self.camera_distance.clamp(0.1, 10.0);
-                }
             });
 
             // Clamp values
             self.camera_angle_x = self.camera_angle_x.clamp(-1.5, 1.5);
             self.camera_distance = self.camera_distance.clamp(0.1, 10.0);
 
-            // Build plot with optional auto-bounds reset
-            let mut plot = egui_plot::Plot::new("walk_plot")
+            // Calculate plot bounds based on zoom level
+            let view_range = 100.0 * self.camera_distance as f64;
+
+            // Create axis hints for consistent tick spacing (every 10 units)
+            let x_axis = egui_plot::AxisHints::new_x()
+                .label("X")
+                .formatter(|val, _range| format!("{:.0}", val.value));
+            let y_axis = egui_plot::AxisHints::new_y()
+                .label("Y")
+                .formatter(|val, _range| format!("{:.0}", val.value));
+
+            // Build plot with explicit bounds for zoom control
+            let plot = egui_plot::Plot::new("walk_plot")
                 .data_aspect(1.0)
                 .allow_drag(true)   // Pan with mouse drag
-                .allow_zoom(false)  // We handle zoom ourselves
-                .allow_scroll(false)
+                .allow_zoom(true)   // Allow scroll zoom too
+                .allow_scroll(true)
                 .show_axes(true)
-                .show_grid(self.show_grid);
-
-            // Reset bounds if requested
-            if self.reset_view {
-                plot = plot.auto_bounds([true, true].into());
-                self.reset_view = false;
-            }
+                .show_grid(self.show_grid)
+                .custom_x_axes(vec![x_axis])
+                .custom_y_axes(vec![y_axis])
+                .include_x(-view_range)
+                .include_x(view_range)
+                .include_y(-view_range)
+                .include_y(view_range);
 
             plot.show(ui, |plot_ui| {
                 for (_id, walk) in &self.walks {
@@ -529,8 +755,7 @@ fn init_spacemouse() -> Option<Arc<Mutex<SpaceMouseState>>> {
     const SPACEMOUSE_PRO_WIRELESS: u16 = 0xc632;
 
     let state = Arc::new(Mutex::new(SpaceMouseState {
-        tx: 0.0, ty: 0.0, tz: 0.0,
-        rx: 0.0, ry: 0.0, rz: 0.0,
+        axes: [0.0; 6],  // tx, ty, tz, rx, ry, rz
     }));
 
     let state_clone = state.clone();
@@ -571,18 +796,18 @@ fn init_spacemouse() -> Option<Arc<Mutex<SpaceMouseState>>> {
                 Ok(len) if len > 0 => {
                     if let Ok(mut state) = state_clone.lock() {
                         // Parse SpaceMouse packet
-                        // Report ID 1: Translation (X, Y, Z)
-                        // Report ID 2: Rotation (Rx, Ry, Rz)
+                        // Report ID 1: Translation (X, Y, Z) -> axes[0,1,2]
+                        // Report ID 2: Rotation (Rx, Ry, Rz) -> axes[3,4,5]
                         match buf[0] {
                             1 if len >= 7 => {
-                                state.tx = i16::from_le_bytes([buf[1], buf[2]]) as f32;
-                                state.ty = i16::from_le_bytes([buf[3], buf[4]]) as f32;
-                                state.tz = i16::from_le_bytes([buf[5], buf[6]]) as f32;
+                                state.axes[0] = i16::from_le_bytes([buf[1], buf[2]]) as f32;
+                                state.axes[1] = i16::from_le_bytes([buf[3], buf[4]]) as f32;
+                                state.axes[2] = i16::from_le_bytes([buf[5], buf[6]]) as f32;
                             }
                             2 if len >= 7 => {
-                                state.rx = i16::from_le_bytes([buf[1], buf[2]]) as f32;
-                                state.ry = i16::from_le_bytes([buf[3], buf[4]]) as f32;
-                                state.rz = i16::from_le_bytes([buf[5], buf[6]]) as f32;
+                                state.axes[3] = i16::from_le_bytes([buf[1], buf[2]]) as f32;
+                                state.axes[4] = i16::from_le_bytes([buf[3], buf[4]]) as f32;
+                                state.axes[5] = i16::from_le_bytes([buf[5], buf[6]]) as f32;
                             }
                             _ => {}
                         }
@@ -591,8 +816,7 @@ fn init_spacemouse() -> Option<Arc<Mutex<SpaceMouseState>>> {
                 Ok(_) => {
                     // Timeout or no data, reset values
                     if let Ok(mut state) = state_clone.lock() {
-                        state.tx = 0.0; state.ty = 0.0; state.tz = 0.0;
-                        state.rx = 0.0; state.ry = 0.0; state.rz = 0.0;
+                        state.axes = [0.0; 6];
                     }
                 }
                 Err(_) => break, // Device disconnected
