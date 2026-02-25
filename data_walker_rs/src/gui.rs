@@ -104,14 +104,19 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
 
     // SpaceMouse
     let spacemouse = init_spacemouse();
-    let spacemouse_config = SpaceMouseConfig::load();
+    let mut spacemouse_config = SpaceMouseConfig::load();
+    let mut show_spacemouse_config = false;
 
     // State
     let mut walks: BTreeMap<String, WalkData> = BTreeMap::new();
     let mut selected_sources: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut selected_mapping = "Identity".to_string();
+    let mut prev_mapping = selected_mapping.clone();
     let mut max_points: usize = 5000;
+    let mut prev_max_points: usize = max_points;
     let mut show_grid = true;
+    let mut show_axes = true;
+    let mut axis_ticks: u32 = 10;
     let mut auto_rotate = false;
     let mut rotation_angle: f32 = 0.0;
 
@@ -216,7 +221,7 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                     } else {
                         let axis = up.cross(dir.normalize()).normalize();
                         let angle = up.dot(dir.normalize()).acos();
-                        Mat4::from_axis_angle(axis, radians(angle.to_degrees()))
+                        Mat4::from_axis_angle(axis, radians(angle))
                     };
 
                     let transform = Mat4::from_translation(center)
@@ -321,8 +326,28 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                         }
                     });
 
-                    ui.checkbox(&mut show_grid, "Show Grid");
-                    ui.checkbox(&mut auto_rotate, "Auto-rotate");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut show_grid, "Grid");
+                        ui.checkbox(&mut show_axes, "Axes");
+                        ui.checkbox(&mut auto_rotate, "Auto-rotate");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Ticks:");
+                        egui::ComboBox::from_id_salt("axis_ticks")
+                            .width(60.0)
+                            .selected_text(if axis_ticks == 0 { "Off".to_string() } else { axis_ticks.to_string() })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut axis_ticks, 0, "Off");
+                                ui.selectable_value(&mut axis_ticks, 10, "10");
+                                ui.selectable_value(&mut axis_ticks, 100, "100");
+                                ui.selectable_value(&mut axis_ticks, 1000, "1000");
+                                ui.selectable_value(&mut axis_ticks, 10000, "10000");
+                            });
+                    });
+
+                    if ui.button("SpaceMouse Config").clicked() {
+                        show_spacemouse_config = !show_spacemouse_config;
+                    }
 
                     ui.separator();
 
@@ -369,8 +394,112 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                         ui.label("Right-drag: orbit | Scroll: zoom | Middle-drag: pan");
                     });
                 });
+
+                // Axis labels in screen space
+                if show_axes {
+                    let vp = frame_input.viewport;
+                    let proj = camera.projection();
+                    let view = camera.view();
+                    let pv = proj * view;
+
+                    let axis_label_pos: [(&str, Vec3, egui::Color32); 3] = [
+                        ("X", vec3(105.0, 0.0, 0.0), egui::Color32::from_rgb(220, 50, 50)),
+                        ("Y", vec3(0.0, 105.0, 0.0), egui::Color32::from_rgb(50, 220, 50)),
+                        ("Z", vec3(0.0, 0.0, 105.0), egui::Color32::from_rgb(50, 100, 220)),
+                    ];
+
+                    let painter = egui_ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Foreground,
+                        egui::Id::new("axis_labels"),
+                    ));
+
+                    for (label, world_pos, color) in &axis_label_pos {
+                        let clip = pv * vec4(world_pos.x, world_pos.y, world_pos.z, 1.0);
+                        if clip.w > 0.0 {
+                            let ndc_x = clip.x / clip.w;
+                            let ndc_y = clip.y / clip.w;
+                            let screen_x = (ndc_x * 0.5 + 0.5) * vp.width as f32 + vp.x as f32;
+                            let screen_y = (1.0 - (ndc_y * 0.5 + 0.5)) * vp.height as f32 + vp.y as f32;
+
+                            painter.text(
+                                egui::pos2(screen_x, screen_y),
+                                egui::Align2::CENTER_CENTER,
+                                label,
+                                egui::FontId::proportional(16.0),
+                                *color,
+                            );
+                        }
+                    }
+                }
+
+                // SpaceMouse config window
+                egui::Window::new("SpaceMouse Config")
+                    .open(&mut show_spacemouse_config)
+                    .resizable(false)
+                    .show(egui_ctx, |ui| {
+                        let axis_labels = ["TX", "TY", "TZ", "RX", "RY", "RZ"];
+
+                        ui.heading("Axis Mapping");
+                        egui::Grid::new("axis_map").num_columns(2).show(ui, |ui| {
+                            let mappings: &mut [(&str, &mut usize)] = &mut [
+                                ("Pan X",  &mut spacemouse_config.pan_x_axis),
+                                ("Pan Y",  &mut spacemouse_config.pan_y_axis),
+                                ("Zoom",   &mut spacemouse_config.zoom_axis),
+                                ("Rot X",  &mut spacemouse_config.rot_x_axis),
+                                ("Rot Y",  &mut spacemouse_config.rot_y_axis),
+                                ("Rot Z",  &mut spacemouse_config.rot_z_axis),
+                            ];
+                            for (label, value) in mappings.iter_mut() {
+                                ui.label(*label);
+                                egui::ComboBox::from_id_salt(format!("sm_{}", label))
+                                    .width(50.0)
+                                    .selected_text(axis_labels[**value])
+                                    .show_ui(ui, |ui| {
+                                        for (i, name) in axis_labels.iter().enumerate() {
+                                            ui.selectable_value(*value, i, *name);
+                                        }
+                                    });
+                                ui.end_row();
+                            }
+                        });
+
+                        ui.separator();
+                        ui.heading("Invert Axes");
+                        ui.horizontal(|ui| {
+                            for (i, label) in axis_labels.iter().enumerate() {
+                                ui.checkbox(&mut spacemouse_config.invert[i], *label);
+                            }
+                        });
+
+                        ui.separator();
+                        ui.add(egui::Slider::new(&mut spacemouse_config.sensitivity, 0.1..=5.0).text("Sensitivity"));
+
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button("Save").clicked() {
+                                spacemouse_config.save();
+                            }
+                            if ui.button("Reset").clicked() {
+                                spacemouse_config = SpaceMouseConfig::default();
+                            }
+                        });
+                    });
             },
         );
+
+        // Regenerate walks if mapping or max_points changed
+        if selected_mapping != prev_mapping || max_points != prev_max_points {
+            prev_mapping = selected_mapping.clone();
+            prev_max_points = max_points;
+            let source_ids: Vec<String> = selected_sources.iter().cloned().collect();
+            for sid in &source_ids {
+                if let Some(source) = config.sources.iter().find(|s| &s.id == sid) {
+                    if let Some(walk_data) = load_walk_data(source, &config, max_points, &selected_mapping) {
+                        walks.insert(sid.clone(), walk_data);
+                    }
+                }
+            }
+        }
 
         // Clear and render
         frame_input.screen().clear(ClearState::color_and_depth(0.1, 0.1, 0.15, 1.0, 1.0));
@@ -378,6 +507,99 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
         // Render grid
         for grid_obj in &grid_objects {
             grid_obj.render(&camera, &[]);
+        }
+
+        // Render axes
+        if show_axes {
+            let axis_len = 100.0;
+            let axis_radius = 0.4;
+            let axes_data: [(Vec3, Srgba); 3] = [
+                (vec3(1.0, 0.0, 0.0), Srgba::new(220, 50, 50, 255)),   // X = red
+                (vec3(0.0, 1.0, 0.0), Srgba::new(50, 220, 50, 255)),   // Y = green
+                (vec3(0.0, 0.0, 1.0), Srgba::new(50, 100, 220, 255)),  // Z = blue
+            ];
+            for (dir, color) in &axes_data {
+                let center = *dir * (axis_len * 0.5);
+                let up = vec3(0.0, 1.0, 0.0);
+                let rotation = if dir.dot(up).abs() > 0.999 {
+                    Mat4::identity()
+                } else {
+                    let axis = up.cross(*dir).normalize();
+                    let angle = up.dot(*dir).acos();
+                    Mat4::from_axis_angle(axis, radians(angle))
+                };
+                let transform = Mat4::from_translation(center)
+                    * rotation
+                    * Mat4::from_nonuniform_scale(axis_radius, axis_len * 0.5, axis_radius);
+
+                let mut instances = Instances::default();
+                instances.transformations = vec![transform];
+                instances.colors = Some(vec![*color]);
+
+                let cylinder = CpuMesh::cylinder(8);
+                let axis_obj = Gm::new(
+                    InstancedMesh::new(&context, &instances, &cylinder),
+                    ColorMaterial::default(),
+                );
+                axis_obj.render(&camera, &[]);
+            }
+        }
+
+        // Render axis tick marks
+        if show_axes && axis_ticks > 0 {
+            let tick_size = 1.5;
+            let tick_radius = 0.3;
+            let spacing = axis_ticks as f32;
+            let axis_len = 100.0;
+            let tick_color = Srgba::new(180, 180, 180, 255);
+
+            let mut instances = Instances::default();
+            instances.transformations = Vec::new();
+            instances.colors = Some(Vec::new());
+
+            let axes_dirs: [Vec3; 3] = [
+                vec3(1.0, 0.0, 0.0),
+                vec3(0.0, 1.0, 0.0),
+                vec3(0.0, 0.0, 1.0),
+            ];
+            // Perpendicular directions for tick orientation
+            let tick_perps: [Vec3; 3] = [
+                vec3(0.0, 1.0, 0.0), // X ticks point up
+                vec3(1.0, 0.0, 0.0), // Y ticks point right
+                vec3(0.0, 1.0, 0.0), // Z ticks point up
+            ];
+
+            for (dir, perp) in axes_dirs.iter().zip(tick_perps.iter()) {
+                let mut pos = spacing;
+                while pos <= axis_len {
+                    let center = *dir * pos;
+                    let up = vec3(0.0, 1.0, 0.0);
+                    let rotation = if perp.dot(up).abs() > 0.999 {
+                        Mat4::identity()
+                    } else {
+                        let axis = up.cross(*perp).normalize();
+                        let angle = up.dot(*perp).acos();
+                        Mat4::from_axis_angle(axis, radians(angle))
+                    };
+                    let transform = Mat4::from_translation(center)
+                        * rotation
+                        * Mat4::from_nonuniform_scale(tick_radius, tick_size, tick_radius);
+                    instances.transformations.push(transform);
+                    if let Some(ref mut colors) = instances.colors {
+                        colors.push(tick_color);
+                    }
+                    pos += spacing;
+                }
+            }
+
+            if !instances.transformations.is_empty() {
+                let cylinder = CpuMesh::cylinder(6);
+                let ticks_obj = Gm::new(
+                    InstancedMesh::new(&context, &instances, &cylinder),
+                    ColorMaterial::default(),
+                );
+                ticks_obj.render(&camera, &[]);
+            }
         }
 
         // Render walks

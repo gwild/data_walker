@@ -492,8 +492,11 @@ async fn get_gwosc_data_url(id: &str, url: &str) -> Result<String> {
         return Ok(url.to_string());
     }
 
-    // Extract event name from URL (e.g., GW150914)
-    let event = url.rsplit('/').next().unwrap_or(id);
+    // Extract event name from URL like https://gwosc.org/eventapi/html/GWTC-1-confident/GW150914/v3/
+    let event = url.trim_end_matches('/')
+        .rsplit('/')
+        .nth(1) // skip "v3", get "GW150914"
+        .unwrap_or(id);
 
     // Determine detector from id
     let detector = if id.ends_with("_h1") || id.contains("H1") {

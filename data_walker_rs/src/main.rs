@@ -536,11 +536,14 @@ fn kill_existing_instances() {
         }
     }
 
-    // On Unix, use pkill (but skip our own PID)
+    // On Unix, kill other data_walker gui instances (skip our own PID)
     #[cfg(unix)]
     {
-        let _ = Command::new("pkill")
-            .args(["-f", "data_walker.*gui"])
+        let _ = Command::new("bash")
+            .args(["-c", &format!(
+                "pgrep -f 'data_walker.*gui' | grep -v {} | xargs -r kill",
+                current_pid
+            )])
             .output();
     }
 
