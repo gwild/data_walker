@@ -414,66 +414,15 @@ fn decode_mp3_to_samples(mp3_data: &[u8]) -> Result<Vec<f32>> {
     Ok(samples)
 }
 
-/// Download gravitational wave data from GWOSC
-/// Uses the txt.gz format which is easier to parse than HDF5
-pub async fn download_cosmos(id: &str, output_dir: &PathBuf) -> Result<Vec<u8>> {
-    tracing::info!("Downloading LIGO data: {}", id);
-
-    // Map IDs to GWOSC download URLs
-    // GW150914 was the first detection (Sept 14, 2015)
-    // 32-second 4KHz data is sufficient for our visualization
-    let url = match id {
-        "gw150914_h1" => "https://gwosc.org/archive/data/S6/strain-L/H-H1_LOSC_4_V1-931069952-4096.txt.gz",
-        "gw150914_l1" => "https://gwosc.org/archive/data/S6/strain-L/L-L1_LOSC_4_V1-931069952-4096.txt.gz",
-        _ => anyhow::bail!("Unknown LIGO event: {}", id),
-    };
-
-    tracing::debug!("Fetching from: {}", url);
-
-    let client = reqwest::Client::new();
-    let response = client.get(url)
-        .header("User-Agent", "DataWalker/0.1 (github.com/data-walker)")
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        // Try alternative URL from event portal
-        let alt_url = match id {
-            "gw150914_h1" => "https://gwosc.org/eventapi/json/GWTC-1-confident/GW150914/v3/H-H1_GWOSC_4KHZ_R1-1126259447-32.txt.gz",
-            "gw150914_l1" => "https://gwosc.org/eventapi/json/GWTC-1-confident/GW150914/v3/L-L1_GWOSC_4KHZ_R1-1126259447-32.txt.gz",
-            _ => anyhow::bail!("Unknown LIGO event: {}", id),
-        };
-        tracing::debug!("Trying alternative URL: {}", alt_url);
-
-        let response = client.get(alt_url)
-            .header("User-Agent", "DataWalker/0.1 (github.com/data-walker)")
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            anyhow::bail!("GWOSC returned status {} for {}", response.status(), id);
-        }
-
-        return process_gwosc_response(id, alt_url, response, output_dir).await;
-    }
-
-    process_gwosc_response(id, url, response, output_dir).await
-}
-
-async fn process_gwosc_response(
-    id: &str,
-    url: &str,
-    response: reqwest::Response,
-    output_dir: &PathBuf,
-) -> Result<Vec<u8>> {
-    let bytes = response.bytes().await?;
-    tracing::debug!("Downloaded {} bytes", bytes.len());
-
-    // Decompress gzip data
+/// Load raw cosmos (LIGO) data from txt.gz file and convert to base12
+pub fn load_cosmos_raw(raw_path: &std::path::Path) -> Result<Vec<u8>> {
     use flate2::read::GzDecoder;
     use std::io::Read;
 
-    let mut decoder = GzDecoder::new(&bytes[..]);
+    tracing::debug!("Loading cosmos raw data from {:?}", raw_path);
+
+    let file = std::fs::File::open(raw_path)?;
+    let mut decoder = GzDecoder::new(file);
     let mut text = String::new();
     decoder.read_to_string(&mut text)?;
 
@@ -492,7 +441,7 @@ async fn process_gwosc_response(
         .collect();
 
     if strain.is_empty() {
-        anyhow::bail!("No strain data found in response");
+        anyhow::bail!("No strain data found in file");
     }
 
     tracing::debug!("Parsed {} strain values", strain.len());
@@ -501,19 +450,101 @@ async fn process_gwosc_response(
     let base12 = strain_to_base12(&strain);
     tracing::info!("Converted to {} base12 digits", base12.len());
 
-    // Save to file
-    std::fs::create_dir_all(output_dir)?;
-    let path = output_dir.join(format!("{}.json", id));
-    let data = serde_json::json!({
-        "id": id,
-        "base12": base12,
-        "source": url,
-        "strain_count": strain.len(),
-    });
-    std::fs::write(&path, serde_json::to_string_pretty(&data)?)?;
-    tracing::info!("Saved to {:?}", path);
-
     Ok(base12)
+}
+
+/// Download gravitational wave data from GWOSC
+/// Downloads raw txt.gz file for later conversion via load_cosmos_raw
+pub async fn download_cosmos(id: &str, url: &str, output_dir: &PathBuf) -> Result<PathBuf> {
+    tracing::info!("Downloading LIGO data: {} from {}", id, url);
+
+    std::fs::create_dir_all(output_dir)?;
+    let raw_path = output_dir.join(format!("{}.txt.gz", id));
+
+    // Get actual data URL from GWOSC event API
+    let data_url = get_gwosc_data_url(id, url).await?;
+    tracing::debug!("Fetching from: {}", data_url);
+
+    let client = reqwest::Client::new();
+    let response = client.get(&data_url)
+        .header("User-Agent", "DataWalker/0.1 (github.com/data-walker)")
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("GWOSC returned status {} for {}", response.status(), id);
+    }
+
+    let bytes = response.bytes().await?;
+    tracing::debug!("Downloaded {} bytes", bytes.len());
+
+    // Save raw gzipped data
+    std::fs::write(&raw_path, &bytes)?;
+    tracing::info!("Saved raw data to {:?}", raw_path);
+
+    Ok(raw_path)
+}
+
+/// Get the actual data URL from GWOSC event API
+async fn get_gwosc_data_url(id: &str, url: &str) -> Result<String> {
+    // If URL is already a direct data link, use it
+    if url.ends_with(".txt.gz") || url.ends_with(".hdf5") {
+        return Ok(url.to_string());
+    }
+
+    // Extract event name from URL (e.g., GW150914)
+    let event = url.rsplit('/').next().unwrap_or(id);
+
+    // Determine detector from id
+    let detector = if id.ends_with("_h1") || id.contains("H1") {
+        "H1"
+    } else if id.ends_with("_l1") || id.contains("L1") {
+        "L1"
+    } else {
+        "H1" // Default to Hanford
+    };
+
+    // Try GWOSC event API
+    let api_url = format!(
+        "https://gwosc.org/eventapi/json/GWTC-1-confident/{}/v3/",
+        event.to_uppercase()
+    );
+
+    tracing::debug!("Querying GWOSC API: {}", api_url);
+
+    let client = reqwest::Client::new();
+    let response = client.get(&api_url)
+        .header("User-Agent", "DataWalker/0.1")
+        .send()
+        .await;
+
+    if let Ok(resp) = response {
+        if resp.status().is_success() {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                // Look for txt.gz files in the strain data
+                if let Some(strain) = json.get("strain") {
+                    for (key, value) in strain.as_object().unwrap_or(&serde_json::Map::new()) {
+                        if key.contains(detector) {
+                            if let Some(url) = value.get("url").and_then(|u| u.as_str()) {
+                                if url.ends_with(".txt.gz") {
+                                    return Ok(url.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback to known URLs for common events
+    let fallback = match (event.to_uppercase().as_str(), detector) {
+        ("GW150914", "H1") => "https://gwosc.org/eventapi/json/GWTC-1-confident/GW150914/v3/H-H1_GWOSC_4KHZ_R1-1126259447-32.txt.gz",
+        ("GW150914", "L1") => "https://gwosc.org/eventapi/json/GWTC-1-confident/GW150914/v3/L-L1_GWOSC_4KHZ_R1-1126259447-32.txt.gz",
+        _ => anyhow::bail!("No data URL found for event {} detector {}", event, detector),
+    };
+
+    Ok(fallback.to_string())
 }
 
 /// Convert gravitational wave strain to base12

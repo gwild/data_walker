@@ -329,9 +329,13 @@ async fn download_all(config: &config::Config, data_dir: &PathBuf) -> anyhow::Re
         std::fs::create_dir_all(&cosmos_dir)?;
 
         for source in &cosmos_sources {
-            match download::download_cosmos(&source.id, &cosmos_dir).await {
-                Ok(base12) => {
-                    println!("  [OK] {} ({} digits)", source.name, base12.len());
+            match download::download_cosmos(&source.id, &source.url, &cosmos_dir).await {
+                Ok(raw_path) => {
+                    // Load and convert to base12
+                    match download::load_cosmos_raw(&raw_path) {
+                        Ok(base12) => println!("  [OK] {} ({} digits)", source.name, base12.len()),
+                        Err(e) => println!("  [FAIL] {} (conversion): {}", source.name, e),
+                    }
                 }
                 Err(e) => {
                     println!("  [FAIL] {}: {}", source.name, e);
@@ -427,8 +431,13 @@ async fn download_source(config: &config::Config, id: &str, data_dir: &PathBuf) 
         "cosmos" => {
             let cosmos_dir = data_dir.join("cosmos");
             std::fs::create_dir_all(&cosmos_dir)?;
-            match download::download_cosmos(&source.id, &cosmos_dir).await {
-                Ok(base12) => println!("  Downloaded {} base12 digits", base12.len()),
+            match download::download_cosmos(&source.id, &source.url, &cosmos_dir).await {
+                Ok(raw_path) => {
+                    match download::load_cosmos_raw(&raw_path) {
+                        Ok(base12) => println!("  Downloaded {} base12 digits", base12.len()),
+                        Err(e) => println!("  Conversion failed: {}", e),
+                    }
+                }
                 Err(e) => println!("  Failed: {}", e),
             }
         }
