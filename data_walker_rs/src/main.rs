@@ -201,6 +201,7 @@ async fn download_all(config: &config::Config, data_dir: &PathBuf) -> anyhow::Re
     let mut math_sources = vec![];
     let mut finance_sources = vec![];
     let mut audio_sources = vec![];
+    let mut cosmos_sources = vec![];
     let mut skipped = vec![];
 
     for source in &config.sources {
@@ -212,6 +213,8 @@ async fn download_all(config: &config::Config, data_dir: &PathBuf) -> anyhow::Re
             finance_sources.push(source);
         } else if source.converter == "audio" {
             audio_sources.push(source);
+        } else if source.converter == "cosmos" {
+            cosmos_sources.push(source);
         } else {
             skipped.push(source);
         }
@@ -319,6 +322,28 @@ async fn download_all(config: &config::Config, data_dir: &PathBuf) -> anyhow::Re
         println!();
     }
 
+    // Download Cosmos from GWOSC
+    if !cosmos_sources.is_empty() {
+        println!("=== COSMOS ({} sources) ===", cosmos_sources.len());
+        let cosmos_dir = data_dir.join("cosmos");
+        std::fs::create_dir_all(&cosmos_dir)?;
+
+        for source in &cosmos_sources {
+            match download::download_cosmos(&source.id, &source.url, &cosmos_dir).await {
+                Ok(path) => {
+                    println!("  [OK] {} -> {:?}", source.name, path);
+                }
+                Err(e) => {
+                    println!("  [FAIL] {}: {}", source.name, e);
+                }
+            }
+
+            // Rate limit
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+        println!();
+    }
+
     // Report skipped
     if !skipped.is_empty() {
         println!("=== SKIPPED ({} sources - not implemented) ===", skipped.len());
@@ -397,6 +422,14 @@ async fn download_source(config: &config::Config, id: &str, data_dir: &PathBuf) 
             match download::download_audio(&source.id, &source.url, &audio_dir).await {
                 Ok(base12) => println!("  Downloaded {} base12 digits", base12.len()),
                 Err(e) => println!("  Skipped: {}", e),
+            }
+        }
+        "cosmos" => {
+            let cosmos_dir = data_dir.join("cosmos");
+            std::fs::create_dir_all(&cosmos_dir)?;
+            match download::download_cosmos(&source.id, &source.url, &cosmos_dir).await {
+                Ok(path) => println!("  Downloaded raw strain data to {:?}", path),
+                Err(e) => println!("  Failed: {}", e),
             }
         }
         other => {

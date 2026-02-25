@@ -29,25 +29,55 @@
 
 ---
 
+## ABSOLUTE RULE: STORE RAW DATA ONLY
+
+**Disk stores ONLY raw downloaded data. Everything else is computed on the fly.**
+
+### What gets stored to disk:
+- Raw audio files (.wav, .mp3)
+- Raw DNA sequences (.fasta)
+- Raw strain data (.txt.gz)
+- Raw price data (JSON from API)
+
+### What is NEVER stored to disk:
+- Base-12 sequences (computed on the fly from raw data)
+- 3D points (computed on the fly from base-12 + mapping)
+- Walk metadata duplicating sources.yaml
+
+### The pipeline:
+```
+DISK: raw data files only
+  → ON REQUEST: load raw → convert to base-12 → cache in memory
+  → ON REQUEST: base-12 + mapping → walk engine → 3D points (never stored)
+```
+
+### FORBIDDEN:
+- Saving base-12 arrays to JSON files
+- Saving 3D point arrays anywhere
+- Pre-computing walks and storing results
+- Any "pre-processed" data files
+
+---
+
 ## Architecture: Clean and Simple
 
 ```
-Generator → Data file → Config (FILE_INFO) → Display
-   ↓           ↓              ↓                ↓
-(download)  (clean)       (clean)         (no filters)
+Download → Convert to base-12 → Walk Engine → REST API → Web UI
+   ↓            ↓                   ↓            ↓          ↓
+(real URLs)  (converters)      (quaternions)  (Axum)    (Three.js)
 ```
 
 ### NO hidden layers:
-- No HIDDEN_WALKS
-- No isBaseline filters
+- No fake data
 - No workarounds
+- No hidden filters
 
-If data shouldn't be shown, don't put it in FILE_INFO. Period.
+If data shouldn't be shown, don't put it in sources.yaml. Period.
 
 ### Single Source of Truth:
-- `web/walk_config.js` - all configuration
-- `web/data/*.js` - all walk data (gitignored)
-- `web/thumbnails/` - generated thumbnails (gitignored)
+- `data_walker_rs/sources.yaml` - all source definitions, mappings, categories
+- `data_walker_rs/src/` - all Rust source code
+- `data_walker_rs/web/` - HTML/JS web viewers
 
 ---
 
@@ -67,13 +97,12 @@ Each data source is converted to base-12, then walked through 3D space.
 | **Identity** | `[0,1,2,3,4,5,6,7,8,9,10,11]` | No remapping |
 | **Stock-opt** | `[1,0,2,4,10,5,6,9,8,7,3,11]` | Stock data |
 
-### Generator Pattern:
-```python
-# 1. Download from real source (with URL)
-# 2. Convert to base-12
-# 3. Walk with mapping → 3D points
-# 4. Save: { 'points': [...], 'base12': [...], 'source': 'URL' }
+### Data Flow:
 ```
+sources.yaml → Config → AppState.load_walk(id) → Converter → base12 → walk_base12() → 3D points
+```
+
+Each source entry in `sources.yaml` specifies: id, name, category, subcategory, converter type, default mapping, source URL.
 
 ---
 
@@ -81,18 +110,27 @@ Each data source is converted to base-12, then walked through 3D space.
 
 ```
 data_walker/
-├── scripts/           # Python/JS generators
-│   ├── generate_*.py  # Data generators (download + process)
-│   ├── download_*.py  # Pure downloaders
-│   └── generate_thumbnails.js
-├── web/
-│   ├── sources.html           # Gallery page
-│   ├── neural_walks_compare.html  # 3D comparison tool
-│   ├── walk_config.js         # SSOT config
-│   ├── walk_renderer.js       # Three.js renderer
-│   ├── data/                  # Generated data (gitignored)
-│   └── thumbnails/            # Generated thumbnails (gitignored)
-└── .gitignore
+├── data_walker_rs/
+│   ├── Cargo.toml             # Rust dependencies
+│   ├── sources.yaml           # SSOT: all data sources, mappings, categories
+│   ├── src/
+│   │   ├── main.rs            # CLI (serve, gui, generate-math, list, download)
+│   │   ├── config.rs          # YAML config loader
+│   │   ├── walk.rs            # 3D turtle walk engine (quaternions)
+│   │   ├── state.rs           # Thread-safe walk cache (AppState)
+│   │   ├── server.rs          # Axum REST API
+│   │   ├── download.rs        # Downloaders (NCBI, Yahoo, GWOSC, Archive.org)
+│   │   ├── gui.rs             # Native GUI (egui + three-d)
+│   │   ├── logging.rs         # Rotating file logs
+│   │   └── converters/
+│   │       ├── mod.rs          # DNA, finance, cosmos converters
+│   │       ├── audio.rs        # FFT spectrogram to base-12
+│   │       └── math/           # Constants, fractals, Mandelbrot, sequences
+│   └── web/
+│       ├── index.html          # 3D walk viewer (Three.js)
+│       └── compare.html        # Multi-walk comparison tool
+├── CLAUDE.md
+└── README.md
 ```
 
 ---
@@ -116,23 +154,32 @@ data_walker/
 ## Commands
 
 ```bash
-# Generate data (downloads from real sources)
-python scripts/generate_audio_walks.py
-python scripts/generate_composers_walk.py
-python scripts/generate_math_walks.py
-python scripts/download_amazon.py
-python scripts/download_birdsong.py
-python scripts/download_cosmos.py
-python scripts/download_whales.py
-python scripts/dna_walk_base12.py
+cd data_walker_rs
 
-# Generate thumbnails (requires http-server running)
-npx http-server web -p 8081 &
-node scripts/generate_thumbnails.js
+# Build
+cargo build --release
 
-# Serve gallery
-npx http-server web -p 8080
-# Open http://localhost:8080/sources.html
+# Serve web gallery at http://localhost:8080
+cargo run -- serve
+cargo run -- serve --port 9000
+
+# Download real data from sources
+cargo run -- download --all
+cargo run -- download --category dna
+cargo run -- download --source gw150914_h1
+
+# Generate math walks (no network needed)
+cargo run -- generate-math
+
+# List sources
+cargo run -- list
+cargo run -- list --category cosmos
+
+# Launch native GUI
+cargo run -- gui
+
+# Run tests
+cargo test
 ```
 
 ---

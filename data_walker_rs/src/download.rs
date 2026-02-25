@@ -409,12 +409,142 @@ fn decode_mp3_to_samples(mp3_data: &[u8]) -> Result<Vec<f32>> {
     Ok(samples)
 }
 
-/// Download gravitational wave data from GWOSC
-pub async fn download_cosmos(event: &str, detector: &str, output_dir: &PathBuf) -> Result<Vec<u8>> {
-    tracing::info!("Downloading LIGO data: {} {}", event, detector);
+/// Download gravitational wave strain data from GWOSC
+/// Source: https://gwosc.org/ (Gravitational Wave Open Science Center)
+///
+/// Uses the GWOSC JSON event API to discover .txt.gz strain files,
+/// downloads the 4kHz 32-second segment, and saves raw strain data to disk.
+/// Base-12 conversion happens on the fly when the walk is requested.
+pub async fn download_cosmos(id: &str, url: &str, output_dir: &PathBuf) -> Result<PathBuf> {
+    // Determine detector from source ID (e.g., "gw150914_h1" -> "H1")
+    let detector = if id.ends_with("_h1") {
+        "H1"
+    } else if id.ends_with("_l1") {
+        "L1"
+    } else {
+        anyhow::bail!("Cannot determine detector from source ID '{}' (expected _h1 or _l1 suffix)", id);
+    };
 
-    // GWOSC provides HDF5 files - need to implement parsing
-    anyhow::bail!("LIGO download not yet implemented - requires HDF5 parsing")
+    tracing::info!("Downloading LIGO strain data: {} detector {}", id, detector);
+
+    // Convert HTML event URL to JSON API URL
+    // e.g., "https://gwosc.org/eventapi/html/GWTC-1-confident/GW150914/v3/"
+    //     -> "https://gwosc.org/eventapi/json/GWTC-1-confident/GW150914/v3/"
+    let json_url = url.replace("/html/", "/json/");
+    tracing::debug!("Querying GWOSC event API: {}", json_url);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
+
+    // Fetch event metadata from GWOSC JSON API
+    let response = client.get(&json_url)
+        .header("User-Agent", "DataWalker/0.1 (github.com/data-walker)")
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("GWOSC event API returned status {}", response.status());
+    }
+
+    let event_json: serde_json::Value = response.json().await?;
+
+    // Find .txt.gz strain file URL for our detector
+    // Prefer 4kHz 32-second segment (manageable size, focused on event)
+    let strain_url = find_strain_txt_url(&event_json, detector)?;
+    tracing::info!("Found strain data URL: {}", strain_url);
+
+    // Download the .txt.gz file
+    let response = client.get(&strain_url)
+        .header("User-Agent", "DataWalker/0.1 (github.com/data-walker)")
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("Failed to download strain data: {}", response.status());
+    }
+
+    let compressed = response.bytes().await?;
+    tracing::debug!("Downloaded {} bytes of compressed strain data", compressed.len());
+
+    // Save raw compressed data to disk — NO conversion, raw data only
+    std::fs::create_dir_all(output_dir)?;
+    let path = output_dir.join(format!("{}.txt.gz", id));
+    std::fs::write(&path, &compressed)?;
+    tracing::info!("Saved raw strain data to {:?} ({} bytes)", path, compressed.len());
+
+    Ok(path)
+}
+
+/// Load raw cosmos strain data from a .txt.gz file and convert to base-12 on the fly.
+pub fn load_cosmos_raw(path: &std::path::Path) -> Result<Vec<u8>> {
+    let compressed = std::fs::read(path)?;
+
+    // Decompress gzip
+    let mut decoder = flate2::read::GzDecoder::new(&compressed[..]);
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut decoder, &mut text)?;
+
+    // Parse strain values (one f64 per line)
+    let strain: Vec<f64> = text.lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.trim().parse::<f64>().ok())
+        .collect();
+
+    if strain.is_empty() {
+        anyhow::bail!("No strain values found in {:?}", path);
+    }
+
+    tracing::info!("Loaded {} strain values from {:?}", strain.len(), path);
+
+    // Convert to base-12 on the fly
+    Ok(crate::converters::convert_cosmos(&strain))
+}
+
+/// Find a .txt.gz strain data URL from GWOSC event API JSON response.
+/// Prefers 4kHz 32-second segment for the specified detector.
+fn find_strain_txt_url(event_json: &serde_json::Value, detector: &str) -> Result<String> {
+    // GWOSC JSON structure: { "events": { "<event-name>": { "strain": [...] } } }
+    let events = event_json.get("events")
+        .and_then(|e| e.as_object())
+        .ok_or_else(|| anyhow::anyhow!("Invalid GWOSC JSON: missing 'events' object"))?;
+
+    // Get the first (usually only) event
+    let event = events.values().next()
+        .ok_or_else(|| anyhow::anyhow!("No events found in GWOSC response"))?;
+
+    let strain_list = event.get("strain")
+        .and_then(|s| s.as_array())
+        .ok_or_else(|| anyhow::anyhow!("No strain data in GWOSC event"))?;
+
+    // Filter for our detector and txt format (GWOSC uses "txt" as format key,
+    // but the actual URL ends in .txt.gz)
+    let txt_entries: Vec<&serde_json::Value> = strain_list.iter()
+        .filter(|entry| {
+            let det = entry.get("detector").and_then(|d| d.as_str()).unwrap_or("");
+            let fmt = entry.get("format").and_then(|f| f.as_str()).unwrap_or("");
+            det == detector && fmt == "txt"
+        })
+        .collect();
+
+    if txt_entries.is_empty() {
+        anyhow::bail!("No txt strain files found for detector {}", detector);
+    }
+
+    // Prefer 4kHz 32-second segment
+    let preferred = txt_entries.iter()
+        .find(|entry| {
+            let rate = entry.get("sampling_rate").and_then(|r| r.as_u64()).unwrap_or(0);
+            let dur = entry.get("duration").and_then(|d| d.as_u64()).unwrap_or(0);
+            rate == 4096 && dur == 32
+        });
+
+    let entry = preferred.unwrap_or(&txt_entries[0]);
+
+    entry.get("url")
+        .and_then(|u| u.as_str())
+        .map(|u| u.to_string())
+        .ok_or_else(|| anyhow::anyhow!("Strain entry missing 'url' field"))
 }
 
 /// Download stock data from Yahoo Finance
