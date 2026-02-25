@@ -118,16 +118,46 @@ impl AppState {
                 }
             }
             "audio" => {
-                tracing::error!("Audio converter not yet implemented for '{}'", id);
-                return None;
+                let audio_dir = std::path::PathBuf::from(&self.data_dir).join("audio");
+                match crate::download::download_audio(&source.id, &source.url, &audio_dir).await {
+                    Ok(data) => data,
+                    Err(e) => {
+                        tracing::error!("Failed to download audio '{}': {}", id, e);
+                        return None;
+                    }
+                }
             }
             "cosmos" => {
-                tracing::error!("Cosmos converter not yet implemented for '{}'", id);
-                return None;
+                let cosmos_dir = std::path::PathBuf::from(&self.data_dir).join("cosmos");
+                let raw_path = cosmos_dir.join(format!("{}.txt.gz", id));
+
+                // Download raw data if not already on disk
+                if !raw_path.exists() {
+                    if let Err(e) = crate::download::download_cosmos(&source.id, &source.url, &cosmos_dir).await {
+                        tracing::error!("Failed to download cosmos '{}': {}", id, e);
+                        return None;
+                    }
+                }
+
+                // Load raw strain and convert to base-12 on the fly
+                match crate::download::load_cosmos_raw(&raw_path) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        tracing::error!("Failed to load cosmos raw data '{}': {}", id, e);
+                        return None;
+                    }
+                }
             }
             "finance" => {
-                tracing::error!("Finance converter not yet implemented for '{}'", id);
-                return None;
+                let finance_dir = std::path::PathBuf::from(&self.data_dir).join("finance");
+                let symbol = source.url.split('/').last().unwrap_or(&source.id).replace("%5E", "^");
+                match crate::download::download_finance(&symbol, &finance_dir).await {
+                    Ok(data) => data,
+                    Err(e) => {
+                        tracing::error!("Failed to download finance '{}': {}", id, e);
+                        return None;
+                    }
+                }
             }
             other => {
                 tracing::error!("Unknown converter '{}' for source '{}'", other, id);
