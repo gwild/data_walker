@@ -119,7 +119,7 @@ impl AppState {
                 }
 
                 // Convert on-the-fly
-                match crate::converters::load_dna_raw(&raw_path) {
+                match crate::converters::load_dna_raw(&raw_path, 12) {
                     Ok(data) => data,
                     Err(e) => {
                         tracing::error!("Failed to convert DNA '{}': {}", id, e);
@@ -150,7 +150,7 @@ impl AppState {
                 };
 
                 // Convert on-the-fly
-                match crate::converters::load_audio_raw(&raw_path) {
+                match crate::converters::load_audio_raw(&raw_path, 12) {
                     Ok(data) => data,
                     Err(e) => {
                         tracing::error!("Failed to convert audio '{}': {}", id, e);
@@ -172,7 +172,7 @@ impl AppState {
                 }
 
                 // Convert on-the-fly
-                match crate::converters::load_cosmos_raw(&raw_path) {
+                match crate::converters::load_cosmos_raw(&raw_path, 12) {
                     Ok(data) => data,
                     Err(e) => {
                         tracing::error!("Failed to convert cosmos '{}': {}", id, e);
@@ -195,7 +195,7 @@ impl AppState {
                 }
 
                 // Convert on-the-fly
-                match crate::converters::load_finance_raw(&raw_path) {
+                match crate::converters::load_finance_raw(&raw_path, 12) {
                     Ok(data) => data,
                     Err(e) => {
                         tracing::error!("Failed to convert finance '{}': {}", id, e);

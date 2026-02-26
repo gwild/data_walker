@@ -111,6 +111,58 @@ pub fn walk_base12(base12: &[u8], mapping: &[u8; 12], max_points: usize) -> Vec<
     }
 }
 
+/// Walk a base-4 sequence through 2D space with Z stacking on revisits
+///
+/// # Directions
+/// * 0: +X, 1: -X, 2: +Y, 3: -Y
+///
+/// When a point is revisited, Z increments (stacks upward)
+pub fn walk_base4(base4: &[u8], max_points: usize) -> Vec<[f32; 3]> {
+    use std::collections::HashMap;
+
+    if base4.is_empty() {
+        return vec![[0.0, 0.0, 0.0]];
+    }
+
+    let dirs: [[f32; 2]; 4] = [
+        [1.0, 0.0],   // 0: +X
+        [-1.0, 0.0],  // 1: -X
+        [0.0, 1.0],   // 2: +Y
+        [0.0, -1.0],  // 3: -Y
+    ];
+
+    let mut path = Vec::with_capacity(base4.len().min(max_points));
+    let mut x: i32 = 0;
+    let mut y: i32 = 0;
+    let mut visits: HashMap<(i32, i32), u32> = HashMap::new();
+
+    for &digit in base4 {
+        let d = (digit % 4) as usize;
+        x += dirs[d][0] as i32;
+        y += dirs[d][1] as i32;
+
+        let count = visits.entry((x, y)).or_insert(0);
+        *count += 1;
+        let z = (*count - 1) as f32;
+
+        path.push([x as f32, y as f32, z]);
+    }
+
+    // Subsample if too many points
+    if path.len() <= max_points {
+        path
+    } else {
+        let step = (path.len() as f32 / max_points as f32).ceil() as usize;
+        let mut result: Vec<[f32; 3]> = path.iter().step_by(step).copied().collect();
+        if result.last() != path.last() {
+            if let Some(&last) = path.last() {
+                result.push(last);
+            }
+        }
+        result
+    }
+}
+
 /// Get mapping by name
 pub fn named_mapping(name: &str) -> [u8; 12] {
     match name {

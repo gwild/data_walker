@@ -114,6 +114,8 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
     let mut selected_sources: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut selected_mapping = "Identity".to_string();
     let mut prev_mapping = selected_mapping.clone();
+    let mut selected_base: u32 = 12;
+    let mut prev_base: u32 = 12;
     let mut max_points: usize = 5000;
     let mut prev_max_points: usize = max_points;
     let mut show_grid = true;
@@ -391,16 +393,27 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                     ui.heading("Data Walks");
                     ui.separator();
 
-                    // Mapping selector
+                    // Base and mapping selectors
                     ui.horizontal(|ui| {
-                        ui.label("Mapping:");
-                        egui::ComboBox::from_id_salt("mapping")
-                            .selected_text(&selected_mapping)
+                        ui.label("Base:");
+                        egui::ComboBox::from_id_salt("base")
+                            .width(40.0)
+                            .selected_text(format!("{}", selected_base))
                             .show_ui(ui, |ui| {
-                                for name in config.mappings.keys() {
-                                    ui.selectable_value(&mut selected_mapping, name.clone(), name);
-                                }
+                                ui.selectable_value(&mut selected_base, 12, "12");
+                                ui.selectable_value(&mut selected_base, 4, "4");
                             });
+                        ui.label("Mapping:");
+                        let mapping_enabled = selected_base == 12;
+                        ui.add_enabled_ui(mapping_enabled, |ui| {
+                            egui::ComboBox::from_id_salt("mapping")
+                                .selected_text(&selected_mapping)
+                                .show_ui(ui, |ui| {
+                                    for name in config.mappings.keys() {
+                                        ui.selectable_value(&mut selected_mapping, name.clone(), name);
+                                    }
+                                });
+                        });
                     });
 
                     ui.add(egui::Slider::new(&mut max_points, 100..=10000).text("Max points"));
@@ -475,7 +488,7 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                                             if checked {
                                                 selected_sources.insert(source.id.clone());
                                                 // Load walk
-                                                if let Some(walk_data) = load_walk_data(&source, &config, max_points, &selected_mapping) {
+                                                if let Some(walk_data) = load_walk_data(&source, &config, max_points, &selected_mapping, selected_base) {
                                                     walks.insert(source.id.clone(), walk_data);
                                                 }
                                             } else {
@@ -661,14 +674,15 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
             },
         );
 
-        // Regenerate walks if mapping or max_points changed
-        if selected_mapping != prev_mapping || max_points != prev_max_points {
+        // Regenerate walks if mapping, base, or max_points changed
+        if selected_mapping != prev_mapping || max_points != prev_max_points || selected_base != prev_base {
             prev_mapping = selected_mapping.clone();
             prev_max_points = max_points;
+            prev_base = selected_base;
             let source_ids: Vec<String> = selected_sources.iter().cloned().collect();
             for sid in &source_ids {
                 if let Some(source) = config.sources.iter().find(|s| &s.id == sid) {
-                    if let Some(walk_data) = load_walk_data(source, &config, max_points, &selected_mapping) {
+                    if let Some(walk_data) = load_walk_data(source, &config, max_points, &selected_mapping, selected_base) {
                         walks.insert(sid.clone(), walk_data);
                     }
                 }
@@ -843,18 +857,23 @@ fn load_walk_data(
     config: &Config,
     max_points: usize,
     mapping_name: &str,
+    base: u32,
 ) -> Option<WalkData> {
-    // All conversion happens on-the-fly - no pre-computed base12 storage
-    let base12 = if source.converter.starts_with("math.") {
-        // Math is computed directly
-        MathGenerator::from_converter_string(&source.converter)?.generate(max_points)
-    } else {
-        // Load raw file and convert on-the-fly
-        use crate::converters;
+    use crate::converters;
+    use crate::walk::walk_base4;
 
+    // All conversion happens on-the-fly - no pre-computed storage
+    let digits = if source.converter.starts_with("math.") {
+        // Math always generates base-12; for base-4, reduce mod 4
+        let base12 = MathGenerator::from_converter_string(&source.converter)?.generate(max_points);
+        if base == 4 {
+            base12.iter().map(|&d| d % 4).collect()
+        } else {
+            base12
+        }
+    } else {
         match source.converter.as_str() {
             "audio" => {
-                // Try WAV first, then MP3
                 let wav_path = std::path::PathBuf::from(format!("data/audio/{}.wav", source.id));
                 let mp3_path = std::path::PathBuf::from(format!("data/audio/{}.mp3", source.id));
 
@@ -867,7 +886,7 @@ fn load_walk_data(
                     return None;
                 };
 
-                match converters::load_audio_raw(&path) {
+                match converters::load_audio_raw(&path, base) {
                     Ok(data) => data,
                     Err(e) => {
                         warn!("Failed to convert audio {}: {}", source.id, e);
@@ -876,7 +895,6 @@ fn load_walk_data(
                 }
             }
             "dna" => {
-                // Extract accession from URL for filename
                 let accession = source.url.rsplit('/').next().unwrap_or(&source.id);
                 let path = std::path::PathBuf::from(format!("data/dna/{}.fasta", accession.replace(".", "_")));
 
@@ -885,7 +903,7 @@ fn load_walk_data(
                     return None;
                 }
 
-                match converters::load_dna_raw(&path) {
+                match converters::load_dna_raw(&path, base) {
                     Ok(data) => data,
                     Err(e) => {
                         warn!("Failed to convert DNA {}: {}", source.id, e);
@@ -901,7 +919,7 @@ fn load_walk_data(
                     return None;
                 }
 
-                match converters::load_cosmos_raw(&path) {
+                match converters::load_cosmos_raw(&path, base) {
                     Ok(data) => data,
                     Err(e) => {
                         warn!("Failed to convert cosmos {}: {}", source.id, e);
@@ -921,7 +939,7 @@ fn load_walk_data(
                     return None;
                 }
 
-                match converters::load_finance_raw(&path) {
+                match converters::load_finance_raw(&path, base) {
                     Ok(data) => data,
                     Err(e) => {
                         warn!("Failed to convert finance {}: {}", source.id, e);
@@ -933,19 +951,22 @@ fn load_walk_data(
         }
     };
 
-    info!("Loaded {} base12 digits for {}", base12.len(), source.id);
+    info!("Loaded {} base-{} digits for {}", digits.len(), base, source.id);
 
-    let mapping = config.mappings.get(mapping_name)
-        .map(|v| {
-            let mut arr = [0u8; 12];
-            for (i, &val) in v.iter().enumerate().take(12) {
-                arr[i] = val;
-            }
-            arr
-        })
-        .unwrap_or([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
-
-    let points = walk_base12(&base12, &mapping, max_points);
+    let points = if base == 4 {
+        walk_base4(&digits, max_points)
+    } else {
+        let mapping = config.mappings.get(mapping_name)
+            .map(|v| {
+                let mut arr = [0u8; 12];
+                for (i, &val) in v.iter().enumerate().take(12) {
+                    arr[i] = val;
+                }
+                arr
+            })
+            .unwrap_or([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        walk_base12(&digits, &mapping, max_points)
+    };
     info!("Generated {} walk points for {}", points.len(), source.id);
 
     // Compute revisit counts - round positions to integer grid

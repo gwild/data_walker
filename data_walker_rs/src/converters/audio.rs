@@ -71,8 +71,58 @@ pub fn audio_to_base12(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     base12
 }
 
-/// Load WAV file and convert to base-12
-pub fn wav_to_base12(path: &Path) -> anyhow::Result<Vec<u8>> {
+/// Convert audio samples to base-4 using spectrogram analysis
+pub fn audio_to_base4(samples: &[f32], sample_rate: u32) -> Vec<u8> {
+    if samples.len() < FFT_SIZE {
+        return vec![2];
+    }
+
+    let mut planner = FftPlanner::new();
+    let fft = planner.plan_fft_forward(FFT_SIZE);
+
+    let mut base4 = Vec::new();
+    let mut pos = 0;
+
+    let window: Vec<f32> = (0..FFT_SIZE)
+        .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / FFT_SIZE as f32).cos()))
+        .collect();
+
+    while pos + FFT_SIZE <= samples.len() {
+        let mut buffer: Vec<Complex<f32>> = samples[pos..pos + FFT_SIZE]
+            .iter()
+            .zip(window.iter())
+            .map(|(&s, &w)| Complex::new(s * w, 0.0))
+            .collect();
+
+        fft.process(&mut buffer);
+
+        let half = FFT_SIZE / 2;
+        let (max_bin, _) = buffer[1..half]
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i + 1, c.norm()))
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+            .unwrap_or((1, 0.0));
+
+        let freq = max_bin as f32 * sample_rate as f32 / FFT_SIZE as f32;
+        let log_freq = (freq.max(20.0) / 20.0).ln();
+        let log_max = (20000.0_f32 / 20.0).ln();
+        let normalized = (log_freq / log_max).clamp(0.0, 1.0);
+        let digit = (normalized * 3.99).floor() as u8;
+
+        base4.push(digit);
+        pos += HOP_SIZE;
+    }
+
+    if base4.is_empty() {
+        base4.push(2);
+    }
+
+    base4
+}
+
+/// Load WAV file and convert to base digits
+pub fn wav_to_base(path: &Path, base: u32) -> anyhow::Result<Vec<u8>> {
     let reader = hound::WavReader::open(path)?;
     let spec = reader.spec();
     let sample_rate = spec.sample_rate;
@@ -100,7 +150,10 @@ pub fn wav_to_base12(path: &Path) -> anyhow::Result<Vec<u8>> {
         samples
     };
 
-    Ok(audio_to_base12(&mono, sample_rate))
+    Ok(match base {
+        4 => audio_to_base4(&mono, sample_rate),
+        _ => audio_to_base12(&mono, sample_rate),
+    })
 }
 
 /// Convert raw audio bytes (WAV format) to base-12

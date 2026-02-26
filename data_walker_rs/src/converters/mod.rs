@@ -115,14 +115,65 @@ pub fn convert_cosmos(strain: &[f64]) -> Vec<u8> {
 }
 
 // ============================================================================
-// Raw file loaders - load file and convert to base12 on-the-fly
+// Base-4 converters
 // ============================================================================
 
-/// Load FASTA file and convert to base-12
-pub fn load_dna_raw(path: &Path) -> anyhow::Result<Vec<u8>> {
+/// Normalize values to 0-3 range
+pub fn normalize_to_base4(values: &[f64]) -> Vec<u8> {
+    if values.is_empty() {
+        return vec![0];
+    }
+
+    let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let range = max - min;
+
+    if range == 0.0 {
+        return vec![2; values.len()];
+    }
+
+    values
+        .iter()
+        .map(|&v| {
+            let normalized = (v - min) / range;
+            (normalized * 3.99).floor() as u8
+        })
+        .collect()
+}
+
+/// DNA base-4: direct ACGT → 0,1,2,3 (each nucleotide is one digit)
+pub fn convert_dna_base4(sequence: &str) -> Vec<u8> {
+    sequence.chars().filter_map(|c| match c {
+        'A' | 'a' => Some(0),
+        'C' | 'c' => Some(1),
+        'G' | 'g' => Some(2),
+        'T' | 't' => Some(3),
+        _ => None,
+    }).collect()
+}
+
+/// Finance base-4: price deltas normalized to 0-3
+pub fn convert_finance_base4(prices: &[f64]) -> Vec<u8> {
+    if prices.len() < 2 {
+        return vec![0];
+    }
+    let deltas: Vec<f64> = prices.windows(2).map(|w| (w[1] - w[0]) / w[0]).collect();
+    normalize_to_base4(&deltas)
+}
+
+/// Cosmos base-4: strain normalized to 0-3
+pub fn convert_cosmos_base4(strain: &[f64]) -> Vec<u8> {
+    normalize_to_base4(strain)
+}
+
+// ============================================================================
+// Raw file loaders - load file and convert on-the-fly
+// ============================================================================
+
+/// Load FASTA file and convert to base digits
+pub fn load_dna_raw(path: &Path, base: u32) -> anyhow::Result<Vec<u8>> {
     let content = std::fs::read_to_string(path)?;
 
-    // Extract sequence (skip header lines starting with >)
     let sequence: String = content
         .lines()
         .filter(|line| !line.starts_with('>'))
@@ -133,11 +184,14 @@ pub fn load_dna_raw(path: &Path) -> anyhow::Result<Vec<u8>> {
         anyhow::bail!("No sequence data in FASTA file");
     }
 
-    Ok(convert_dna(&sequence))
+    Ok(match base {
+        4 => convert_dna_base4(&sequence),
+        _ => convert_dna(&sequence),
+    })
 }
 
-/// Load finance JSON (raw prices) and convert to base-12
-pub fn load_finance_raw(path: &Path) -> anyhow::Result<Vec<u8>> {
+/// Load finance JSON (raw prices) and convert to base digits
+pub fn load_finance_raw(path: &Path, base: u32) -> anyhow::Result<Vec<u8>> {
     let content = std::fs::read_to_string(path)?;
     let json: serde_json::Value = serde_json::from_str(&content)?;
 
@@ -152,11 +206,14 @@ pub fn load_finance_raw(path: &Path) -> anyhow::Result<Vec<u8>> {
         anyhow::bail!("Not enough price data");
     }
 
-    Ok(convert_finance(&prices))
+    Ok(match base {
+        4 => convert_finance_base4(&prices),
+        _ => convert_finance(&prices),
+    })
 }
 
-/// Load cosmos strain data (.txt.gz) and convert to base-12
-pub fn load_cosmos_raw(path: &Path) -> anyhow::Result<Vec<u8>> {
+/// Load cosmos strain data (.txt.gz) and convert to base digits
+pub fn load_cosmos_raw(path: &Path, base: u32) -> anyhow::Result<Vec<u8>> {
     use std::io::{BufRead, BufReader};
     use flate2::read::GzDecoder;
 
@@ -170,12 +227,10 @@ pub fn load_cosmos_raw(path: &Path) -> anyhow::Result<Vec<u8>> {
         let line = line?;
         let trimmed = line.trim();
 
-        // Skip empty lines and comments
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
 
-        // Parse strain value (scientific notation supported)
         if let Ok(value) = trimmed.parse::<f64>() {
             if value.is_finite() {
                 strain_values.push(value);
@@ -187,28 +242,28 @@ pub fn load_cosmos_raw(path: &Path) -> anyhow::Result<Vec<u8>> {
         anyhow::bail!("No valid strain data in file");
     }
 
-    Ok(convert_cosmos(&strain_values))
+    Ok(match base {
+        4 => convert_cosmos_base4(&strain_values),
+        _ => convert_cosmos(&strain_values),
+    })
 }
 
-/// Load audio file (WAV or MP3) and convert to base-12
-pub fn load_audio_raw(path: &Path) -> anyhow::Result<Vec<u8>> {
+/// Load audio file (WAV or MP3) and convert to base digits
+pub fn load_audio_raw(path: &Path, base: u32) -> anyhow::Result<Vec<u8>> {
     let ext = path.extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
 
     match ext.as_str() {
-        "wav" => audio::wav_to_base12(path),
-        "mp3" => {
-            // For MP3, use symphonia to decode
-            load_mp3_raw(path)
-        }
+        "wav" => audio::wav_to_base(path, base),
+        "mp3" => load_mp3_raw(path, base),
         _ => anyhow::bail!("Unsupported audio format: {}", ext),
     }
 }
 
-/// Load MP3 file and convert to base-12
-fn load_mp3_raw(path: &Path) -> anyhow::Result<Vec<u8>> {
+/// Load MP3 file and convert to base digits
+fn load_mp3_raw(path: &Path, base: u32) -> anyhow::Result<Vec<u8>> {
     use symphonia::core::codecs::DecoderOptions;
     use symphonia::core::formats::FormatOptions;
     use symphonia::core::io::MediaSourceStream;
@@ -292,7 +347,10 @@ fn load_mp3_raw(path: &Path) -> anyhow::Result<Vec<u8>> {
         anyhow::bail!("No audio samples decoded from MP3");
     }
 
-    Ok(audio::audio_to_base12(&samples, sample_rate))
+    Ok(match base {
+        4 => audio::audio_to_base4(&samples, sample_rate),
+        _ => audio::audio_to_base12(&samples, sample_rate),
+    })
 }
 
 #[cfg(test)]
