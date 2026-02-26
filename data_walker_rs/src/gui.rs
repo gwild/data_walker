@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
-use tracing::info;
+use tracing::{info, warn};
 use three_d::*;
 use three_d::egui;
 
@@ -75,6 +75,8 @@ struct WalkData {
     points: Vec<[f32; 3]>,
     color: [f32; 3],
     visible: bool,
+    // Point revisit counts: (position, count) - positions rounded to grid
+    revisit_counts: std::collections::HashMap<(i32, i32, i32), u32>,
 }
 
 /// Run the native 3D GUI viewer using three-d
@@ -116,6 +118,9 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
     let mut prev_max_points: usize = max_points;
     let mut show_grid = true;
     let mut show_axes = true;
+    let mut show_points = true;
+    let mut show_lines = true;
+    let mut point_scale: f32 = 0.5;
     let mut axis_ticks: u32 = 10;
     let mut auto_rotate = false;
     let mut rotation_angle: f32 = 0.0;
@@ -181,15 +186,34 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
             camera.set_view(vec3(new_x, pos.y, new_z), target, vec3(0.0, 1.0, 0.0));
         }
 
-        // Handle orbit control
-        orbit_control.handle_events(&mut camera, &mut frame_input.events);
+        // Handle orbit control - only when cursor is in plot area (not over GUI panels)
+        // Side panel is 250px wide, bottom panel is ~25px
+        let panel_width = 260.0;
+        let bottom_panel_height = 30.0;
+        let in_plot_area = frame_input.events.iter().all(|event| {
+            match event {
+                three_d::Event::MousePress { position, .. } |
+                three_d::Event::MouseRelease { position, .. } |
+                three_d::Event::MouseMotion { position, .. } |
+                three_d::Event::MouseWheel { position, .. } => {
+                    position.x > panel_width &&
+                    position.y < (frame_input.viewport.height as f32 - bottom_panel_height)
+                }
+                _ => true,
+            }
+        });
+
+        if in_plot_area {
+            orbit_control.handle_events(&mut camera, &mut frame_input.events);
+        }
         camera.set_viewport(frame_input.viewport);
 
         // Build line geometry for visible walks
         let mut walk_lines: Vec<Gm<InstancedMesh, ColorMaterial>> = Vec::new();
+        let mut walk_points: Vec<Gm<InstancedMesh, ColorMaterial>> = Vec::new();
 
         for (_id, walk) in &walks {
-            if !walk.visible || walk.points.len() < 2 {
+            if !walk.visible || walk.points.is_empty() {
                 continue;
             }
 
@@ -200,48 +224,93 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                 255,
             );
 
-            // Create line segments using thin cylinders
-            let mut instances = Instances::default();
-            instances.transformations = Vec::new();
-            instances.colors = Some(Vec::new());
+            // Lines (thin cylinders)
+            if show_lines && walk.points.len() >= 2 {
+                let mut instances = Instances::default();
+                instances.transformations = Vec::new();
+                instances.colors = Some(Vec::new());
 
-            for i in 0..walk.points.len() - 1 {
-                let p1 = vec3(walk.points[i][0], walk.points[i][1], walk.points[i][2]);
-                let p2 = vec3(walk.points[i + 1][0], walk.points[i + 1][1], walk.points[i + 1][2]);
+                for i in 0..walk.points.len() - 1 {
+                    let p1 = vec3(walk.points[i][0], walk.points[i][1], walk.points[i][2]);
+                    let p2 = vec3(walk.points[i + 1][0], walk.points[i + 1][1], walk.points[i + 1][2]);
 
-                let center = (p1 + p2) * 0.5;
-                let dir = p2 - p1;
-                let length = dir.magnitude();
+                    let center = (p1 + p2) * 0.5;
+                    let dir = p2 - p1;
+                    let length = dir.magnitude();
 
-                if length > 0.001 {
-                    // Create transform for cylinder
-                    let up = vec3(0.0, 1.0, 0.0);
-                    let rotation = if dir.normalize().dot(up).abs() > 0.999 {
-                        Mat4::identity()
-                    } else {
-                        let axis = up.cross(dir.normalize()).normalize();
-                        let angle = up.dot(dir.normalize()).acos();
-                        Mat4::from_axis_angle(axis, radians(angle))
-                    };
+                    if length > 0.001 {
+                        let up = vec3(0.0, 1.0, 0.0);
+                        let rotation = if dir.normalize().dot(up).abs() > 0.999 {
+                            Mat4::identity()
+                        } else {
+                            let axis = up.cross(dir.normalize()).normalize();
+                            let angle = up.dot(dir.normalize()).acos();
+                            Mat4::from_axis_angle(axis, radians(angle))
+                        };
 
-                    let transform = Mat4::from_translation(center)
-                        * rotation
-                        * Mat4::from_nonuniform_scale(0.5, length * 0.5, 0.5);
+                        let transform = Mat4::from_translation(center)
+                            * rotation
+                            * Mat4::from_nonuniform_scale(0.3, length * 0.5, 0.3);
 
-                    instances.transformations.push(transform);
-                    if let Some(ref mut colors) = instances.colors {
-                        colors.push(color);
+                        instances.transformations.push(transform);
+                        if let Some(ref mut colors) = instances.colors {
+                            colors.push(color);
+                        }
                     }
+                }
+
+                if !instances.transformations.is_empty() {
+                    let cylinder = CpuMesh::cylinder(6);
+                    let instanced = Gm::new(
+                        InstancedMesh::new(&context, &instances, &cylinder),
+                        ColorMaterial::default(),
+                    );
+                    walk_lines.push(instanced);
                 }
             }
 
-            if !instances.transformations.is_empty() {
-                let cylinder = CpuMesh::cylinder(8);
-                let instanced = Gm::new(
-                    InstancedMesh::new(&context, &instances, &cylinder),
-                    ColorMaterial::default(),
-                );
-                walk_lines.push(instanced);
+            // Points (spheres scaled by revisit count)
+            if show_points {
+                let mut instances = Instances::default();
+                instances.transformations = Vec::new();
+                instances.colors = Some(Vec::new());
+
+                // Get max revisit count for scaling
+                let max_revisits = walk.revisit_counts.values().max().copied().unwrap_or(1) as f32;
+
+                // Render a sphere at each unique position
+                for (&(x, y, z), &count) in &walk.revisit_counts {
+                    // Scale sphere size based on revisit count (log scale for better visibility)
+                    let base_size = 0.8 * point_scale;
+                    let scale_factor = 1.0 + (count as f32).ln().max(0.0) / max_revisits.ln().max(1.0) * 2.0;
+                    let size = base_size * scale_factor;
+
+                    let transform = Mat4::from_translation(vec3(x as f32, y as f32, z as f32))
+                        * Mat4::from_scale(size);
+
+                    instances.transformations.push(transform);
+
+                    // Color intensity based on revisit count
+                    let intensity = 0.5 + 0.5 * (count as f32 / max_revisits).sqrt();
+                    let point_color = Srgba::new(
+                        ((walk.color[0] * intensity) * 255.0).min(255.0) as u8,
+                        ((walk.color[1] * intensity) * 255.0).min(255.0) as u8,
+                        ((walk.color[2] * intensity) * 255.0).min(255.0) as u8,
+                        255,
+                    );
+                    if let Some(ref mut colors) = instances.colors {
+                        colors.push(point_color);
+                    }
+                }
+
+                if !instances.transformations.is_empty() {
+                    let sphere = CpuMesh::sphere(8);
+                    let instanced = Gm::new(
+                        InstancedMesh::new(&context, &instances, &sphere),
+                        ColorMaterial::default(),
+                    );
+                    walk_points.push(instanced);
+                }
             }
         }
 
@@ -332,6 +401,13 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                         ui.checkbox(&mut auto_rotate, "Auto-rotate");
                     });
                     ui.horizontal(|ui| {
+                        ui.checkbox(&mut show_points, "Points");
+                        ui.checkbox(&mut show_lines, "Lines");
+                    });
+                    if show_points {
+                        ui.add(egui::Slider::new(&mut point_scale, 0.1..=1.0).text("Point scale"));
+                    }
+                    ui.horizontal(|ui| {
                         ui.label("Ticks:");
                         egui::ComboBox::from_id_salt("axis_ticks")
                             .width(60.0)
@@ -359,9 +435,8 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                                 for source in sources {
                                     let mut checked = selected_sources.contains(&source.id);
 
-                                    // Check if data is available
-                                    let is_available = source.converter.starts_with("math.") ||
-                                        check_data_exists(&source.id, &source.converter);
+                                    // Check if data is available (raw files for downloaded data, or math sources)
+                                    let is_available = check_data_exists(&source.id, &source.converter, &source.url);
 
                                     if is_available {
                                         if ui.checkbox(&mut checked, &source.name).changed() {
@@ -402,32 +477,99 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                     let view = camera.view();
                     let pv = proj * view;
 
+                    let painter = egui_ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Foreground,
+                        egui::Id::new("axis_labels"),
+                    ));
+
+                    // Helper to project world pos to screen
+                    let project = |world_pos: Vec3| -> Option<egui::Pos2> {
+                        let clip = pv * vec4(world_pos.x, world_pos.y, world_pos.z, 1.0);
+                        if clip.w > 0.0 {
+                            let ndc_x = clip.x / clip.w;
+                            let ndc_y = clip.y / clip.w;
+                            // Check if in view frustum
+                            if ndc_x.abs() < 1.5 && ndc_y.abs() < 1.5 {
+                                let screen_x = (ndc_x * 0.5 + 0.5) * vp.width as f32 + vp.x as f32;
+                                let screen_y = (1.0 - (ndc_y * 0.5 + 0.5)) * vp.height as f32 + vp.y as f32;
+                                return Some(egui::pos2(screen_x, screen_y));
+                            }
+                        }
+                        None
+                    };
+
+                    // Axis name labels at ends
                     let axis_label_pos: [(&str, Vec3, egui::Color32); 3] = [
                         ("X", vec3(105.0, 0.0, 0.0), egui::Color32::from_rgb(220, 50, 50)),
                         ("Y", vec3(0.0, 105.0, 0.0), egui::Color32::from_rgb(50, 220, 50)),
                         ("Z", vec3(0.0, 0.0, 105.0), egui::Color32::from_rgb(50, 100, 220)),
                     ];
 
-                    let painter = egui_ctx.layer_painter(egui::LayerId::new(
-                        egui::Order::Foreground,
-                        egui::Id::new("axis_labels"),
-                    ));
-
                     for (label, world_pos, color) in &axis_label_pos {
-                        let clip = pv * vec4(world_pos.x, world_pos.y, world_pos.z, 1.0);
-                        if clip.w > 0.0 {
-                            let ndc_x = clip.x / clip.w;
-                            let ndc_y = clip.y / clip.w;
-                            let screen_x = (ndc_x * 0.5 + 0.5) * vp.width as f32 + vp.x as f32;
-                            let screen_y = (1.0 - (ndc_y * 0.5 + 0.5)) * vp.height as f32 + vp.y as f32;
-
+                        if let Some(screen_pos) = project(*world_pos) {
                             painter.text(
-                                egui::pos2(screen_x, screen_y),
+                                screen_pos,
                                 egui::Align2::CENTER_CENTER,
-                                label,
+                                *label,
                                 egui::FontId::proportional(16.0),
                                 *color,
                             );
+                        }
+                    }
+
+                    // Numeric tick labels - positioned at tick marks with screen-space offset
+                    if axis_ticks > 0 {
+                        let spacing = axis_ticks as f32;
+                        let axis_len = 100.0;
+                        let tick_color = egui::Color32::from_rgb(160, 160, 160);
+                        let label_offset = 12.0; // Screen-space pixel offset
+
+                        // X axis ticks (red) - labels below
+                        let mut pos = spacing;
+                        while pos <= axis_len {
+                            if let Some(mut screen_pos) = project(vec3(pos, 0.0, 0.0)) {
+                                screen_pos.y += label_offset;
+                                painter.text(
+                                    screen_pos,
+                                    egui::Align2::CENTER_TOP,
+                                    format!("{}", pos as i32),
+                                    egui::FontId::proportional(11.0),
+                                    tick_color,
+                                );
+                            }
+                            pos += spacing;
+                        }
+
+                        // Y axis ticks (green) - labels to the left
+                        let mut pos = spacing;
+                        while pos <= axis_len {
+                            if let Some(mut screen_pos) = project(vec3(0.0, pos, 0.0)) {
+                                screen_pos.x -= label_offset;
+                                painter.text(
+                                    screen_pos,
+                                    egui::Align2::RIGHT_CENTER,
+                                    format!("{}", pos as i32),
+                                    egui::FontId::proportional(11.0),
+                                    tick_color,
+                                );
+                            }
+                            pos += spacing;
+                        }
+
+                        // Z axis ticks (blue) - labels to the right
+                        let mut pos = spacing;
+                        while pos <= axis_len {
+                            if let Some(mut screen_pos) = project(vec3(0.0, 0.0, pos)) {
+                                screen_pos.x += label_offset;
+                                painter.text(
+                                    screen_pos,
+                                    egui::Align2::LEFT_CENTER,
+                                    format!("{}", pos as i32),
+                                    egui::FontId::proportional(11.0),
+                                    tick_color,
+                                );
+                            }
+                            pos += spacing;
                         }
                     }
                 }
@@ -607,6 +749,11 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
             walk_obj.render(&camera, &[]);
         }
 
+        // Render walk points
+        for point_obj in &walk_points {
+            point_obj.render(&camera, &[]);
+        }
+
         // Render GUI
         let _ = frame_input.screen().write(|| gui.render());
 
@@ -616,15 +763,31 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn check_data_exists(id: &str, converter: &str) -> bool {
-    let path = match converter {
-        "audio" => format!("data/audio/{}.json", id),
-        "dna" => format!("data/dna/{}.json", id),
-        "cosmos" => format!("data/cosmos/{}.json", id),
-        "finance" => format!("data/finance/{}.json", id),
-        _ => return false,
-    };
-    std::path::Path::new(&path).exists()
+fn check_data_exists(id: &str, converter: &str, url: &str) -> bool {
+    match converter {
+        "audio" => {
+            // Check for WAV or MP3
+            std::path::Path::new(&format!("data/audio/{}.wav", id)).exists() ||
+            std::path::Path::new(&format!("data/audio/{}.mp3", id)).exists()
+        }
+        "dna" => {
+            // Extract accession from URL
+            let accession = url.rsplit('/').next().unwrap_or(id);
+            std::path::Path::new(&format!("data/dna/{}.fasta", accession.replace(".", "_"))).exists()
+        }
+        "cosmos" => {
+            std::path::Path::new(&format!("data/cosmos/{}.txt.gz", id)).exists()
+        }
+        "finance" => {
+            let symbol = url.split('/').last().unwrap_or(id)
+                .replace("%5E", "^")
+                .replace("^", "")
+                .replace("-", "_");
+            std::path::Path::new(&format!("data/finance/{}.json", symbol)).exists()
+        }
+        c if c.starts_with("math.") => true, // Math is computed, always available
+        _ => false,
+    }
 }
 
 fn load_walk_data(
@@ -633,22 +796,93 @@ fn load_walk_data(
     max_points: usize,
     mapping_name: &str,
 ) -> Option<WalkData> {
+    // All conversion happens on-the-fly - no pre-computed base12 storage
     let base12 = if source.converter.starts_with("math.") {
+        // Math is computed directly
         MathGenerator::from_converter_string(&source.converter)?.generate(max_points)
     } else {
-        // Load from cache
-        let path = match source.converter.as_str() {
-            "audio" => format!("data/audio/{}.json", source.id),
-            "dna" => format!("data/dna/{}.json", source.id),
-            "cosmos" => format!("data/cosmos/{}.json", source.id),
-            "finance" => format!("data/finance/{}.json", source.id),
-            _ => return None,
-        };
+        // Load raw file and convert on-the-fly
+        use crate::converters;
 
-        let contents = std::fs::read_to_string(&path).ok()?;
-        let json: serde_json::Value = serde_json::from_str(&contents).ok()?;
-        let arr = json.get("base12")?.as_array()?;
-        arr.iter().filter_map(|v| v.as_u64().map(|n| n as u8)).collect()
+        match source.converter.as_str() {
+            "audio" => {
+                // Try WAV first, then MP3
+                let wav_path = std::path::PathBuf::from(format!("data/audio/{}.wav", source.id));
+                let mp3_path = std::path::PathBuf::from(format!("data/audio/{}.mp3", source.id));
+
+                let path = if wav_path.exists() {
+                    wav_path
+                } else if mp3_path.exists() {
+                    mp3_path
+                } else {
+                    warn!("No audio file found for {}", source.id);
+                    return None;
+                };
+
+                match converters::load_audio_raw(&path) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        warn!("Failed to convert audio {}: {}", source.id, e);
+                        return None;
+                    }
+                }
+            }
+            "dna" => {
+                // Extract accession from URL for filename
+                let accession = source.url.rsplit('/').next().unwrap_or(&source.id);
+                let path = std::path::PathBuf::from(format!("data/dna/{}.fasta", accession.replace(".", "_")));
+
+                if !path.exists() {
+                    warn!("No FASTA file found for {}: {:?}", source.id, path);
+                    return None;
+                }
+
+                match converters::load_dna_raw(&path) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        warn!("Failed to convert DNA {}: {}", source.id, e);
+                        return None;
+                    }
+                }
+            }
+            "cosmos" => {
+                let path = std::path::PathBuf::from(format!("data/cosmos/{}.txt.gz", source.id));
+
+                if !path.exists() {
+                    warn!("No cosmos file found for {}: {:?}", source.id, path);
+                    return None;
+                }
+
+                match converters::load_cosmos_raw(&path) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        warn!("Failed to convert cosmos {}: {}", source.id, e);
+                        return None;
+                    }
+                }
+            }
+            "finance" => {
+                let symbol = source.url.split('/').last().unwrap_or(&source.id)
+                    .replace("%5E", "^")
+                    .replace("^", "")
+                    .replace("-", "_");
+                let path = std::path::PathBuf::from(format!("data/finance/{}.json", symbol));
+
+                if !path.exists() {
+                    warn!("No finance file found for {}: {:?}", source.id, path);
+                    return None;
+                }
+
+                match converters::load_finance_raw(&path) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        warn!("Failed to convert finance {}: {}", source.id, e);
+                        return None;
+                    }
+                }
+            }
+            _ => return None,
+        }
     };
 
     info!("Loaded {} base12 digits for {}", base12.len(), source.id);
@@ -666,6 +900,15 @@ fn load_walk_data(
     let points = walk_base12(&base12, &mapping, max_points);
     info!("Generated {} walk points for {}", points.len(), source.id);
 
+    // Compute revisit counts - round positions to integer grid
+    let mut revisit_counts: std::collections::HashMap<(i32, i32, i32), u32> = std::collections::HashMap::new();
+    for p in &points {
+        let key = (p[0].round() as i32, p[1].round() as i32, p[2].round() as i32);
+        *revisit_counts.entry(key).or_insert(0) += 1;
+    }
+    let max_revisits = revisit_counts.values().max().copied().unwrap_or(1);
+    info!("Max revisits for {}: {} at {} unique positions", source.id, max_revisits, revisit_counts.len());
+
     // Color based on hash of id
     let hash = source.id.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
     let hue = (hash % 360) as f32 / 360.0;
@@ -676,6 +919,7 @@ fn load_walk_data(
         points,
         color,
         visible: true,
+        revisit_counts,
     })
 }
 

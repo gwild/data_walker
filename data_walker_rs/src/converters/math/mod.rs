@@ -134,8 +134,8 @@ impl MathGenerator {
                 Some(MathGenerator::Julia { c_re: -0.123, c_im: 0.745, z0_re: 0.0, z0_im: 0.0 })
             }
             (Some(&"julia"), Some(&"dragon")) => {
-                // Dragon Julia
-                Some(MathGenerator::Julia { c_re: -0.8, c_im: 0.156, z0_re: 0.0, z0_im: 0.0 })
+                // Dragon Julia - use non-zero starting point for longer orbit
+                Some(MathGenerator::Julia { c_re: -0.8, c_im: 0.156, z0_re: 0.1, z0_im: 0.0 })
             }
             (Some(&"julia"), Some(&"spiral")) => {
                 // Spiral Julia

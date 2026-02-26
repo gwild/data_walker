@@ -134,39 +134,20 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Generate all math walks
-fn generate_math(config: &config::Config, output: &PathBuf) -> anyhow::Result<()> {
-    use converters::math::MathGenerator;
-
-    std::fs::create_dir_all(output)?;
-
+/// Generate all math walks - now computed on-the-fly in GUI
+/// This command is kept for compatibility but math is computed during plotting
+fn generate_math(config: &config::Config, _output: &PathBuf) -> anyhow::Result<()> {
     let math_sources: Vec<_> = config
         .sources
         .iter()
         .filter(|s| s.converter.starts_with("math."))
         .collect();
 
-    println!("Generating {} math walks...", math_sources.len());
-
-    for source in math_sources {
-        if let Some(generator) = MathGenerator::from_converter_string(&source.converter) {
-            let base12 = generator.generate(5000);
-            let path = output.join(format!("{}.json", source.id));
-
-            let data = serde_json::json!({
-                "id": source.id,
-                "name": source.name,
-                "category": source.category,
-                "subcategory": source.subcategory,
-                "base12": base12,
-            });
-
-            std::fs::write(&path, serde_json::to_string_pretty(&data)?)?;
-            println!("  {} -> {:?} ({} digits)", source.name, path, base12.len());
-        }
+    println!("Math sources ({}) are now computed on-the-fly during plotting:", math_sources.len());
+    for source in &math_sources {
+        println!("  - {} ({})", source.name, source.converter);
     }
-
-    println!("Done!");
+    println!("\nNo files generated - math data is computed when needed.");
     Ok(())
 }
 
@@ -220,30 +201,17 @@ async fn download_all(config: &config::Config, data_dir: &PathBuf) -> anyhow::Re
         }
     }
 
-    // Generate math (local computation)
+    // Math sources are computed on-the-fly during plotting - no download needed
     if !math_sources.is_empty() {
         println!("=== MATH ({} sources) ===", math_sources.len());
-        let math_dir = data_dir.join("math");
-        std::fs::create_dir_all(&math_dir)?;
-
+        println!("  Math data is computed on-the-fly during plotting.");
         for source in &math_sources {
-            if let Some(generator) = converters::math::MathGenerator::from_converter_string(&source.converter) {
-                let base12 = generator.generate(10000);
-                let path = math_dir.join(format!("{}.json", source.id));
-                let data = serde_json::json!({
-                    "id": source.id,
-                    "name": source.name,
-                    "base12": base12,
-                    "source": "computed"
-                });
-                std::fs::write(&path, serde_json::to_string(&data)?)?;
-                println!("  [OK] {} ({} digits)", source.name, base12.len());
-            }
+            println!("  [COMPUTED] {}", source.name);
         }
         println!();
     }
 
-    // Download DNA from NCBI
+    // Download DNA from NCBI - stores raw FASTA files
     if !dna_sources.is_empty() {
         println!("=== DNA ({} sources) ===", dna_sources.len());
         let dna_dir = data_dir.join("dna");
@@ -257,8 +225,8 @@ async fn download_all(config: &config::Config, data_dir: &PathBuf) -> anyhow::Re
                 .unwrap_or(&source.id);
 
             match download::download_dna(accession, &dna_dir).await {
-                Ok(base12) => {
-                    println!("  [OK] {} ({} digits)", source.name, base12.len());
+                Ok(path) => {
+                    println!("  [OK] {} -> {:?}", source.name, path);
                 }
                 Err(e) => {
                     println!("  [FAIL] {}: {}", source.name, e);
@@ -271,7 +239,7 @@ async fn download_all(config: &config::Config, data_dir: &PathBuf) -> anyhow::Re
         println!();
     }
 
-    // Download Finance from Yahoo
+    // Download Finance from Yahoo - stores raw price data
     if !finance_sources.is_empty() {
         println!("=== FINANCE ({} sources) ===", finance_sources.len());
         let finance_dir = data_dir.join("finance");
@@ -286,8 +254,8 @@ async fn download_all(config: &config::Config, data_dir: &PathBuf) -> anyhow::Re
                 .replace("%5E", "^"); // Handle encoded ^ for indices
 
             match download::download_finance(&symbol, &finance_dir).await {
-                Ok(base12) => {
-                    println!("  [OK] {} ({} digits)", source.name, base12.len());
+                Ok(path) => {
+                    println!("  [OK] {} -> {:?}", source.name, path);
                 }
                 Err(e) => {
                     println!("  [FAIL] {}: {}", source.name, e);
@@ -300,7 +268,7 @@ async fn download_all(config: &config::Config, data_dir: &PathBuf) -> anyhow::Re
         println!();
     }
 
-    // Download Audio from ESC-50 and other sources
+    // Download Audio from ESC-50 and other sources - stores raw WAV/MP3 files
     if !audio_sources.is_empty() {
         println!("=== AUDIO ({} sources) ===", audio_sources.len());
         let audio_dir = data_dir.join("audio");
@@ -308,8 +276,8 @@ async fn download_all(config: &config::Config, data_dir: &PathBuf) -> anyhow::Re
 
         for source in &audio_sources {
             match download::download_audio(&source.id, &source.url, &audio_dir).await {
-                Ok(base12) => {
-                    println!("  [OK] {} ({} digits)", source.name, base12.len());
+                Ok(path) => {
+                    println!("  [OK] {} -> {:?}", source.name, path);
                 }
                 Err(e) => {
                     println!("  [SKIP] {}: {}", source.name, e);
@@ -322,7 +290,7 @@ async fn download_all(config: &config::Config, data_dir: &PathBuf) -> anyhow::Re
         println!();
     }
 
-    // Download Cosmos from GWOSC
+    // Download Cosmos from GWOSC - stores raw strain data (.txt.gz)
     if !cosmos_sources.is_empty() {
         println!("=== COSMOS ({} sources) ===", cosmos_sources.len());
         let cosmos_dir = data_dir.join("cosmos");
@@ -330,12 +298,8 @@ async fn download_all(config: &config::Config, data_dir: &PathBuf) -> anyhow::Re
 
         for source in &cosmos_sources {
             match download::download_cosmos(&source.id, &source.url, &cosmos_dir).await {
-                Ok(raw_path) => {
-                    // Load and convert to base12
-                    match download::load_cosmos_raw(&raw_path) {
-                        Ok(base12) => println!("  [OK] {} ({} digits)", source.name, base12.len()),
-                        Err(e) => println!("  [FAIL] {} (conversion): {}", source.name, e),
-                    }
+                Ok(path) => {
+                    println!("  [OK] {} -> {:?}", source.name, path);
                 }
                 Err(e) => {
                     println!("  [FAIL] {}: {}", source.name, e);
@@ -381,7 +345,7 @@ async fn download_category(config: &config::Config, category: &str, data_dir: &P
     Ok(())
 }
 
-/// Download a single source
+/// Download a single source - stores RAW data only
 async fn download_source(config: &config::Config, id: &str, data_dir: &PathBuf) -> anyhow::Result<()> {
     let source = config.sources.iter()
         .find(|s| s.id == id)
@@ -394,37 +358,25 @@ async fn download_source(config: &config::Config, id: &str, data_dir: &PathBuf) 
             let dna_dir = data_dir.join("dna");
             std::fs::create_dir_all(&dna_dir)?;
             let accession = source.url.split('/').last().unwrap_or(&source.id);
-            let base12 = download::download_dna(accession, &dna_dir).await?;
-            println!("  Downloaded {} base12 digits", base12.len());
+            let path = download::download_dna(accession, &dna_dir).await?;
+            println!("  Saved raw FASTA to {:?}", path);
         }
         converter if converter.starts_with("math.") => {
-            let math_dir = data_dir.join("math");
-            std::fs::create_dir_all(&math_dir)?;
-            if let Some(generator) = converters::math::MathGenerator::from_converter_string(converter) {
-                let base12 = generator.generate(10000);
-                let path = math_dir.join(format!("{}.json", source.id));
-                let data = serde_json::json!({
-                    "id": source.id,
-                    "name": source.name,
-                    "base12": base12,
-                    "source": "computed"
-                });
-                std::fs::write(&path, serde_json::to_string(&data)?)?;
-                println!("  Generated {} base12 digits", base12.len());
-            }
+            // Math is computed on-the-fly during plotting
+            println!("  Math data is computed on-the-fly - no download needed");
         }
         "finance" => {
             let finance_dir = data_dir.join("finance");
             std::fs::create_dir_all(&finance_dir)?;
             let symbol = source.url.split('/').last().unwrap_or(&source.id).replace("%5E", "^");
-            let base12 = download::download_finance(&symbol, &finance_dir).await?;
-            println!("  Downloaded {} base12 digits", base12.len());
+            let path = download::download_finance(&symbol, &finance_dir).await?;
+            println!("  Saved raw prices to {:?}", path);
         }
         "audio" => {
             let audio_dir = data_dir.join("audio");
             std::fs::create_dir_all(&audio_dir)?;
             match download::download_audio(&source.id, &source.url, &audio_dir).await {
-                Ok(base12) => println!("  Downloaded {} base12 digits", base12.len()),
+                Ok(path) => println!("  Saved raw audio to {:?}", path),
                 Err(e) => println!("  Skipped: {}", e),
             }
         }
@@ -432,12 +384,7 @@ async fn download_source(config: &config::Config, id: &str, data_dir: &PathBuf) 
             let cosmos_dir = data_dir.join("cosmos");
             std::fs::create_dir_all(&cosmos_dir)?;
             match download::download_cosmos(&source.id, &source.url, &cosmos_dir).await {
-                Ok(raw_path) => {
-                    match download::load_cosmos_raw(&raw_path) {
-                        Ok(base12) => println!("  Downloaded {} base12 digits", base12.len()),
-                        Err(e) => println!("  Conversion failed: {}", e),
-                    }
-                }
+                Ok(path) => println!("  Saved raw strain data to {:?}", path),
                 Err(e) => println!("  Failed: {}", e),
             }
         }

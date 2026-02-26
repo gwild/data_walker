@@ -102,27 +102,58 @@ impl AppState {
             return Some(walk);
         }
 
-        // Non-math sources: try to download
+        // Non-math sources: load raw file and convert on-the-fly
         let base12 = match source.converter.as_str() {
             "dna" => {
-                // Extract accession from URL
                 let accession = extract_ncbi_accession(&source.url);
-                tracing::info!("Downloading DNA for '{}' accession: {}", id, accession);
-                let output_dir = std::path::PathBuf::from(&self.data_dir).join("dna");
-                match crate::download::download_dna(&accession, &output_dir).await {
+                let dna_dir = std::path::PathBuf::from(&self.data_dir).join("dna");
+                let raw_path = dna_dir.join(format!("{}.fasta", accession.replace(".", "_")));
+
+                // Download if not on disk
+                if !raw_path.exists() {
+                    tracing::info!("Downloading DNA for '{}' accession: {}", id, accession);
+                    if let Err(e) = crate::download::download_dna(&accession, &dna_dir).await {
+                        tracing::error!("Failed to download DNA '{}': {}", id, e);
+                        return None;
+                    }
+                }
+
+                // Convert on-the-fly
+                match crate::converters::load_dna_raw(&raw_path) {
                     Ok(data) => data,
                     Err(e) => {
-                        tracing::error!("Failed to download DNA '{}': {}", id, e);
+                        tracing::error!("Failed to convert DNA '{}': {}", id, e);
                         return None;
                     }
                 }
             }
             "audio" => {
                 let audio_dir = std::path::PathBuf::from(&self.data_dir).join("audio");
-                match crate::download::download_audio(&source.id, &source.url, &audio_dir).await {
+                // Check for WAV or MP3
+                let wav_path = audio_dir.join(format!("{}.wav", source.id));
+                let mp3_path = audio_dir.join(format!("{}.mp3", source.id));
+
+                let raw_path = if wav_path.exists() {
+                    wav_path
+                } else if mp3_path.exists() {
+                    mp3_path
+                } else {
+                    // Download if not on disk
+                    tracing::info!("Downloading audio for '{}'", id);
+                    match crate::download::download_audio(&source.id, &source.url, &audio_dir).await {
+                        Ok(path) => path,
+                        Err(e) => {
+                            tracing::error!("Failed to download audio '{}': {}", id, e);
+                            return None;
+                        }
+                    }
+                };
+
+                // Convert on-the-fly
+                match crate::converters::load_audio_raw(&raw_path) {
                     Ok(data) => data,
                     Err(e) => {
-                        tracing::error!("Failed to download audio '{}': {}", id, e);
+                        tracing::error!("Failed to convert audio '{}': {}", id, e);
                         return None;
                     }
                 }
@@ -131,19 +162,20 @@ impl AppState {
                 let cosmos_dir = std::path::PathBuf::from(&self.data_dir).join("cosmos");
                 let raw_path = cosmos_dir.join(format!("{}.txt.gz", id));
 
-                // Download raw data if not already on disk
+                // Download if not on disk
                 if !raw_path.exists() {
+                    tracing::info!("Downloading cosmos data for '{}'", id);
                     if let Err(e) = crate::download::download_cosmos(&source.id, &source.url, &cosmos_dir).await {
                         tracing::error!("Failed to download cosmos '{}': {}", id, e);
                         return None;
                     }
                 }
 
-                // Load raw strain and convert to base-12 on the fly
-                match crate::download::load_cosmos_raw(&raw_path) {
+                // Convert on-the-fly
+                match crate::converters::load_cosmos_raw(&raw_path) {
                     Ok(data) => data,
                     Err(e) => {
-                        tracing::error!("Failed to load cosmos raw data '{}': {}", id, e);
+                        tracing::error!("Failed to convert cosmos '{}': {}", id, e);
                         return None;
                     }
                 }
@@ -151,10 +183,22 @@ impl AppState {
             "finance" => {
                 let finance_dir = std::path::PathBuf::from(&self.data_dir).join("finance");
                 let symbol = source.url.split('/').last().unwrap_or(&source.id).replace("%5E", "^");
-                match crate::download::download_finance(&symbol, &finance_dir).await {
+                let raw_path = finance_dir.join(format!("{}.json", symbol.replace("^", "").replace("-", "_")));
+
+                // Download if not on disk
+                if !raw_path.exists() {
+                    tracing::info!("Downloading finance data for '{}'", id);
+                    if let Err(e) = crate::download::download_finance(&symbol, &finance_dir).await {
+                        tracing::error!("Failed to download finance '{}': {}", id, e);
+                        return None;
+                    }
+                }
+
+                // Convert on-the-fly
+                match crate::converters::load_finance_raw(&raw_path) {
                     Ok(data) => data,
                     Err(e) => {
-                        tracing::error!("Failed to download finance '{}': {}", id, e);
+                        tracing::error!("Failed to convert finance '{}': {}", id, e);
                         return None;
                     }
                 }

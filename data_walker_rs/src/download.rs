@@ -1,15 +1,21 @@
-//! Download CLI commands - fetch real data from sources
+//! Download CLI commands - fetch RAW data from sources
 //!
-//! All data comes from documented sources with URLs.
+//! IMPORTANT: This module downloads and stores RAW DATA ONLY.
+//! All base-12 conversion happens on-the-fly during plotting.
+//!
+//! Raw data formats:
+//! - DNA: .fasta files (ACGT sequence)
+//! - Audio: .wav or .mp3 files
+//! - Cosmos: .txt.gz files (strain values)
+//! - Finance: .json files (raw price arrays)
 
 use anyhow::Result;
 use std::path::PathBuf;
 
-/// Download DNA sequence from NCBI GenBank
-pub async fn download_dna(accession: &str, output_dir: &PathBuf) -> Result<Vec<u8>> {
+/// Download DNA sequence from NCBI GenBank - stores RAW FASTA
+pub async fn download_dna(accession: &str, output_dir: &PathBuf) -> Result<PathBuf> {
     tracing::info!("Downloading DNA sequence: {}", accession);
 
-    // NCBI E-utilities API for FASTA format
     let url = format!(
         "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id={}&rettype=fasta&retmode=text",
         accession
@@ -30,102 +36,27 @@ pub async fn download_dna(accession: &str, output_dir: &PathBuf) -> Result<Vec<u
     let fasta = response.text().await?;
     tracing::debug!("Downloaded {} bytes of FASTA data", fasta.len());
 
-    // Parse FASTA and convert to base12
-    let base12 = fasta_to_base12(&fasta)?;
-    tracing::info!("Converted to {} base12 digits", base12.len());
-
-    // Save to file
+    // Save RAW FASTA file
     std::fs::create_dir_all(output_dir)?;
-    let path = output_dir.join(format!("{}.json", accession.replace(".", "_")));
-    let data = serde_json::json!({
-        "accession": accession,
-        "base12": base12,
-        "source": url,
-    });
-    std::fs::write(&path, serde_json::to_string_pretty(&data)?)?;
-    tracing::info!("Saved to {:?}", path);
+    let path = output_dir.join(format!("{}.fasta", accession.replace(".", "_")));
+    std::fs::write(&path, &fasta)?;
+    tracing::info!("Saved raw FASTA to {:?}", path);
 
-    Ok(base12)
+    Ok(path)
 }
 
-/// Convert FASTA DNA sequence (ACGT) to base12
-fn fasta_to_base12(fasta: &str) -> Result<Vec<u8>> {
-    let mut sequence = String::new();
-
-    // Parse FASTA: skip header lines starting with >
-    for line in fasta.lines() {
-        if line.starts_with('>') {
-            continue;
-        }
-        sequence.push_str(line.trim());
-    }
-
-    if sequence.is_empty() {
-        anyhow::bail!("No sequence data found in FASTA");
-    }
-
-    // Convert ACGT to base-4, then to base-12
-    // Method: accumulate base-4 digits, output base-12 when we have enough
-    let mut base12 = Vec::new();
-    let mut accumulator: u64 = 0;
-    let mut acc_bits = 0;
-
-    for ch in sequence.chars() {
-        let base4 = match ch.to_ascii_uppercase() {
-            'A' => 0,
-            'C' => 1,
-            'G' => 2,
-            'T' => 3,
-            _ => continue, // Skip N, gaps, etc.
-        };
-
-        // Shift in 2 bits (base-4 digit)
-        accumulator = (accumulator << 2) | base4;
-        acc_bits += 2;
-
-        // When we have 8+ bits, extract base-12 digits
-        // 12 = 2^3.58..., so we need about 3.58 bits per base-12 digit
-        // Using 8 bits gives us 2 base-12 digits with some remainder
-        while acc_bits >= 8 {
-            // Extract top bits for base-12
-            let shift = acc_bits - 8;
-            let byte = ((accumulator >> shift) & 0xFF) as u8;
-
-            // Convert byte to base-12 (0-255 -> 0-11)
-            // Use modulo to distribute evenly
-            base12.push(byte % 12);
-
-            // Keep remainder
-            accumulator &= (1 << shift) - 1;
-            acc_bits = shift;
-        }
-    }
-
-    // Handle remaining bits
-    if acc_bits > 0 {
-        base12.push((accumulator % 12) as u8);
-    }
-
-    Ok(base12)
-}
-
-/// Download audio and convert to base-12
-/// Supports ESC-50 categories and direct WAV URLs
-pub async fn download_audio(id: &str, url: &str, output_dir: &PathBuf) -> Result<Vec<u8>> {
+/// Download audio - stores RAW audio file (WAV or MP3)
+pub async fn download_audio(id: &str, url: &str, output_dir: &PathBuf) -> Result<PathBuf> {
     tracing::info!("Downloading audio: {} from {}", id, url);
 
-    // ESC-50 audio mappings (category-file pairs from the dataset)
-    // Target categories: 0=dog, 4=frog, 5=cat, 7=insects, 9=crow, 10=rain,
-    // 11=sea_waves, 12=crackling_fire, 13=crickets, 14=chirping_birds, 16=wind, 19=thunderstorm
+    // ESC-50 audio mappings
     let esc50_files: std::collections::HashMap<&str, &str> = [
-        // Animals
         ("dog", "1-100032-A-0.wav"),
         ("cat", "1-34094-A-5.wav"),
         ("crow", "1-103298-A-9.wav"),
         ("insects_buzzing", "1-17585-A-7.wav"),
         ("crickets", "1-57316-A-13.wav"),
         ("chirping_birds", "1-100038-A-14.wav"),
-        // Frogs (category 4) - actual ESC-50 files
         ("tree_frog_1", "1-15689-A-4.wav"),
         ("tree_frog_2", "1-15689-B-4.wav"),
         ("tree_frog_3", "1-17970-A-4.wav"),
@@ -135,7 +66,6 @@ pub async fn download_audio(id: &str, url: &str, output_dir: &PathBuf) -> Result
         ("tropical_frog", "1-31836-A-4.wav"),
         ("edible_frog", "1-31836-B-4.wav"),
         ("heavy_frogs", "2-32515-A-4.wav"),
-        // Environment
         ("rain", "1-17367-A-10.wav"),
         ("sea_waves", "1-28135-A-11.wav"),
         ("fire", "1-17150-A-12.wav"),
@@ -145,10 +75,9 @@ pub async fn download_audio(id: &str, url: &str, output_dir: &PathBuf) -> Result
 
     std::fs::create_dir_all(output_dir)?;
 
-    // Check if this is an ESC-50 source
+    // ESC-50 sources - download WAV
     if url.contains("ESC-50") {
         if let Some(&filename) = esc50_files.get(id) {
-            // ESC-50 raw audio URL
             let audio_url = format!(
                 "https://github.com/karolpiczak/ESC-50/raw/master/audio/{}",
                 filename
@@ -169,26 +98,16 @@ pub async fn download_audio(id: &str, url: &str, output_dir: &PathBuf) -> Result
             let wav_data = response.bytes().await?;
             tracing::debug!("Downloaded {} bytes of WAV data", wav_data.len());
 
-            // Convert to base12
-            let base12 = crate::converters::audio::wav_bytes_to_base12(&wav_data)?;
-            tracing::info!("Converted to {} base12 digits", base12.len());
+            // Save RAW WAV file
+            let path = output_dir.join(format!("{}.wav", id));
+            std::fs::write(&path, &wav_data)?;
+            tracing::info!("Saved raw WAV to {:?}", path);
 
-            // Save to file
-            let path = output_dir.join(format!("{}.json", id));
-            let data = serde_json::json!({
-                "id": id,
-                "base12": base12,
-                "source": audio_url,
-            });
-            std::fs::write(&path, serde_json::to_string_pretty(&data)?)?;
-            tracing::info!("Saved to {:?}", path);
-
-            return Ok(base12);
+            return Ok(path);
         }
     }
 
-    // Whale sounds from verified Archive.org collection (CC0 Public Domain)
-    // Source: https://archive.org/details/whale-songs-whale-sound-effects
+    // Whale sounds from Archive.org
     let whale_sounds: std::collections::HashMap<&str, &str> = [
         ("whale_humpback", "https://archive.org/download/whale-songs-whale-sound-effects/Humpback%20Whale-SoundBible.com-93645231.mp3"),
         ("whale_blue", "https://archive.org/download/whale-songs-whale-sound-effects/lowwhalesong-33955.mp3"),
@@ -198,11 +117,10 @@ pub async fn download_audio(id: &str, url: &str, output_dir: &PathBuf) -> Result
     ].into_iter().collect();
 
     if let Some(&mp3_url) = whale_sounds.get(id) {
-        return download_and_convert_mp3(id, mp3_url, output_dir).await;
+        return download_raw_mp3(id, mp3_url, output_dir).await;
     }
 
-    // Birdsong from verified Archive.org collection (CC0 Public Domain)
-    // Source: https://archive.org/details/various-bird-sounds
+    // Archive.org bird sounds
     let archive_birds: std::collections::HashMap<&str, &str> = [
         ("forest_birds", "https://archive.org/download/various-bird-sounds/Various%20Bird%20Sounds.mp3"),
         ("sea_birds", "https://archive.org/download/various-bird-sounds/NatureSounds.mp3"),
@@ -214,11 +132,10 @@ pub async fn download_audio(id: &str, url: &str, output_dir: &PathBuf) -> Result
     ].into_iter().collect();
 
     if let Some(&mp3_url) = archive_birds.get(id) {
-        return download_and_convert_mp3(id, mp3_url, output_dir).await;
+        return download_raw_mp3(id, mp3_url, output_dir).await;
     }
 
-    // Archive.org indigenous music - Brazilian Indian Music anthology (verified URLs)
-    // Source: https://archive.org/details/lp_anthology-of-brazilian-indian-music_various-javahe-juruna-karaja-kraho-suya-tr
+    // Archive.org indigenous music
     let archive_indigenous: std::collections::HashMap<&str, &str> = [
         ("karaja_solo", "https://archive.org/download/lp_anthology-of-brazilian-indian-music_various-javahe-juruna-karaja-kraho-suya-tr/disc1/01.01.%20Solo%20Song%2C%20Man.mp3"),
         ("karaja_dance", "https://archive.org/download/lp_anthology-of-brazilian-indian-music_various-javahe-juruna-karaja-kraho-suya-tr/disc1/01.02.%20Jahave%20%28Sacred%20Masked%20Dance%2C%20Songs%2C%20%22Aruana%22%2C%20Two%20Masks%20Dancing%29.mp3"),
@@ -226,82 +143,36 @@ pub async fn download_audio(id: &str, url: &str, output_dir: &PathBuf) -> Result
     ].into_iter().collect();
 
     if let Some(&mp3_url) = archive_indigenous.get(id) {
-        return download_and_convert_mp3(id, mp3_url, output_dir).await;
+        return download_raw_mp3(id, mp3_url, output_dir).await;
     }
 
-    // Classical music from verified Archive.org collections (Public Domain)
+    // Classical music from Archive.org
     let classical_composers: std::collections::HashMap<&str, &str> = [
-        // Bach - verified URLs from Archive.org
         ("bach_prelude_c", "https://archive.org/download/prelude-and-fugue-no.-1-in-c-major-bwv-846-from-bachs-well-tempered-clavier-gulda-pianist/Prelude%20and%20Fugue%20No.%201%20in%20C%20major%2C%20BWV%20846%2C%20from%20Bachs%20Well-tempered%20Clavier%2C%20Gulda%20pianist.mp3"),
         ("bach_fugue_c", "https://archive.org/download/prelude-and-fugue-no.-1-in-c-major-bwv-846-from-bachs-well-tempered-clavier-gulda-pianist/Prelude%20and%20Fugue%20No.%201%20in%20C%20major%2C%20BWV%20846%2C%20from%20Bachs%20Well-tempered%20Clavier%2C%20Gulda%20pianist.mp3"),
         ("bach_invention", "https://archive.org/download/prelude-and-fugue-no.-1-in-c-major-bwv-846-from-bachs-well-tempered-clavier-gulda-pianist/Prelude%20and%20Fugue%20No.%201%20in%20C%20major%2C%20BWV%20846%2C%20from%20Bachs%20Well-tempered%20Clavier%2C%20Gulda%20pianist.mp3"),
         ("bach_toccata", "https://archive.org/download/ToccataAndFugueInDMinorBWV565/Toccata%20and%20Fugue%20in%20D%20Minor%2C%20BWV%20565.mp3"),
-        // Beethoven - verified URLs from Archive.org
         ("beethoven_elise", "https://archive.org/download/beethoven-fur-elise/Beethoven%20-%20F%C3%BCr%20Elise%20.mp3"),
         ("beethoven_moonlight", "https://archive.org/download/MoonlightSonata_845/Sonata_no_14_in_c_sharp_minor_moonlight_op_27_no_2_Iii.Presto.mp3"),
         ("beethoven_ode", "https://archive.org/download/LudwigVanBeethovenSymphonyNo.5Full/Ludwig%20van%20Beethoven%20-%20Symphony%20No.%205%20%5BFull%5D.mp3"),
         ("beethoven_5th", "https://archive.org/download/LudwigVanBeethovenSymphonyNo.5Full/Ludwig%20van%20Beethoven%20-%20Symphony%20No.%205%20%5BFull%5D.mp3"),
         ("beethoven_pathetique", "https://archive.org/download/MoonlightSonata_845/Sonata_no_14_in_c_sharp_minor_moonlight_op_27_no_2_Iii.Presto.mp3"),
-        // Schoenberg - real recordings from Archive.org
-        // Source: https://archive.org/details/lp_piano-music_arnold-schoenberg-jurg-von-vintschger
         ("schoenberg_suite", "https://archive.org/download/lp_piano-music_arnold-schoenberg-jurg-von-vintschger/disc1/02.01.%20Side%202%3A%205%20Piano%20Pieces%2C%20Op.%2023%3A%20No.%201%3B%20No.%202%3B%20No.%203%3B%20No.%204%3B%20No.%205%3B%20Suite%20For%20Piano%2C%20Op.%2025%3A%20Praeludium%3B%20Gavotte%20-%20Musette%20-%20Gavotte%3B%20Intermezzo%3B%20Menuett%3B%20Gigue.mp3"),
-        // Source: https://archive.org/details/musicofarnoldsch00scho (Three little orchestra pieces - Variations Op.31 not available separately)
         ("schoenberg_variations", "https://archive.org/download/musicofarnoldsch00scho/03_Three_little_orchestra_pieces__1910.mp3"),
-        // Source: https://archive.org/details/lp_quintet-for-wind-instruments-op-26_arnold-schoenberg-philadelphia-woodwind-qu
         ("schoenberg_quartet", "https://archive.org/download/lp_quintet-for-wind-instruments-op-26_arnold-schoenberg-philadelphia-woodwind-qu/disc1/01.01.%20Quintet%20For%20Wind%20Instruments%2C%20Op.%2026%3A%20I%20-%20Schwungvoll.mp3"),
-        // Source: https://archive.org/details/lp_schoenberg-transfigured-night-verklarte-na_arnold-schoenberg-charles-martin-loeffler
         ("schoenberg_verklarte", "https://archive.org/download/lp_schoenberg-transfigured-night-verklarte-na_arnold-schoenberg-charles-martin-loeffler/disc1/01.01.%20Transfigured%20Night%20%28Verklarte%20Nacht%2C%20Op.%204%29.mp3"),
-        // Source: https://archive.org/details/musicofarnoldsch00scho (Pelleas - Pierrot Lunaire not available separately)
         ("schoenberg_pierrot", "https://archive.org/download/musicofarnoldsch00scho/01_Pelleas_and_Melisande.mp3"),
     ].into_iter().collect();
 
     if let Some(&mp3_url) = classical_composers.get(id) {
-        return download_and_convert_mp3(id, mp3_url, output_dir).await;
+        return download_raw_mp3(id, mp3_url, output_dir).await;
     }
 
-    // For other audio sources
     anyhow::bail!("Audio source '{}' requires manual download from: {}", id, url)
 }
 
-/// Download WAV audio and convert to base12
-async fn download_and_convert_audio(id: &str, url: &str, output_dir: &PathBuf) -> Result<Vec<u8>> {
-    tracing::info!("Downloading WAV: {} from {}", id, url);
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()?;
-
-    let response = client.get(url)
-        .header("User-Agent", "DataWalker/0.1 (github.com/data-walker)")
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        anyhow::bail!("Failed to download {}: {}", id, response.status());
-    }
-
-    let audio_data = response.bytes().await?;
-    tracing::debug!("Downloaded {} bytes", audio_data.len());
-
-    // Convert to base12
-    let base12 = crate::converters::audio::wav_bytes_to_base12(&audio_data)?;
-    tracing::info!("Converted to {} base12 digits", base12.len());
-
-    // Save to file
-    let path = output_dir.join(format!("{}.json", id));
-    let data = serde_json::json!({
-        "id": id,
-        "base12": base12,
-        "source": url,
-    });
-    std::fs::write(&path, serde_json::to_string_pretty(&data)?)?;
-    tracing::info!("Saved to {:?}", path);
-
-    Ok(base12)
-}
-
-/// Download MP3 audio, decode, and convert to base12
-async fn download_and_convert_mp3(id: &str, url: &str, output_dir: &PathBuf) -> Result<Vec<u8>> {
+/// Download raw MP3 file (no conversion)
+async fn download_raw_mp3(id: &str, url: &str, output_dir: &PathBuf) -> Result<PathBuf> {
     tracing::info!("Downloading MP3: {} from {}", id, url);
 
     let client = reqwest::Client::builder()
@@ -320,141 +191,15 @@ async fn download_and_convert_mp3(id: &str, url: &str, output_dir: &PathBuf) -> 
     let mp3_data = response.bytes().await?;
     tracing::debug!("Downloaded {} bytes of MP3", mp3_data.len());
 
-    // Decode MP3 to PCM samples
-    let samples = decode_mp3_to_samples(&mp3_data)?;
-    tracing::debug!("Decoded to {} samples", samples.len());
+    // Save RAW MP3 file
+    let path = output_dir.join(format!("{}.mp3", id));
+    std::fs::write(&path, &mp3_data)?;
+    tracing::info!("Saved raw MP3 to {:?}", path);
 
-    // Convert to base12 using FFT spectrogram
-    let base12 = crate::converters::audio::audio_to_base12(&samples, 44100);
-    tracing::info!("Converted to {} base12 digits", base12.len());
-
-    // Save to file
-    let path = output_dir.join(format!("{}.json", id));
-    let data = serde_json::json!({
-        "id": id,
-        "base12": base12,
-        "source": url,
-    });
-    std::fs::write(&path, serde_json::to_string_pretty(&data)?)?;
-    tracing::info!("Saved to {:?}", path);
-
-    Ok(base12)
+    Ok(path)
 }
 
-/// Decode MP3 data to f32 samples
-fn decode_mp3_to_samples(mp3_data: &[u8]) -> Result<Vec<f32>> {
-    use symphonia::core::audio::SampleBuffer;
-    use symphonia::core::codecs::DecoderOptions;
-    use symphonia::core::formats::FormatOptions;
-    use symphonia::core::io::MediaSourceStream;
-    use symphonia::core::meta::MetadataOptions;
-    use symphonia::core::probe::Hint;
-
-    let cursor = std::io::Cursor::new(mp3_data.to_vec());
-    let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
-
-    let mut hint = Hint::new();
-    hint.with_extension("mp3");
-
-    let format_opts = FormatOptions::default();
-    let metadata_opts = MetadataOptions::default();
-    let decoder_opts = DecoderOptions::default();
-
-    let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &format_opts, &metadata_opts)?;
-
-    let mut format = probed.format;
-
-    let track = format.default_track()
-        .ok_or_else(|| anyhow::anyhow!("No audio track found"))?;
-
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &decoder_opts)?;
-
-    let track_id = track.id;
-    let mut samples = Vec::new();
-
-    loop {
-        match format.next_packet() {
-            Ok(packet) => {
-                if packet.track_id() != track_id {
-                    continue;
-                }
-
-                match decoder.decode(&packet) {
-                    Ok(decoded) => {
-                        let spec = *decoded.spec();
-                        let duration = decoded.capacity() as u64;
-
-                        let mut sample_buf = SampleBuffer::<f32>::new(duration, spec);
-                        sample_buf.copy_interleaved_ref(decoded);
-
-                        // Convert to mono if stereo
-                        let buf_samples = sample_buf.samples();
-                        if spec.channels.count() == 2 {
-                            for chunk in buf_samples.chunks(2) {
-                                if chunk.len() == 2 {
-                                    samples.push((chunk[0] + chunk[1]) / 2.0);
-                                }
-                            }
-                        } else {
-                            samples.extend_from_slice(buf_samples);
-                        }
-                    }
-                    Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            Err(symphonia::core::errors::Error::IoError(e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(e) => return Err(e.into()),
-        }
-    }
-
-    Ok(samples)
-}
-
-/// Load raw cosmos (LIGO) data from txt.gz file and convert to base12
-pub fn load_cosmos_raw(raw_path: &std::path::Path) -> Result<Vec<u8>> {
-    use flate2::read::GzDecoder;
-    use std::io::Read;
-
-    tracing::debug!("Loading cosmos raw data from {:?}", raw_path);
-
-    let file = std::fs::File::open(raw_path)?;
-    let mut decoder = GzDecoder::new(file);
-    let mut text = String::new();
-    decoder.read_to_string(&mut text)?;
-
-    tracing::debug!("Decompressed to {} characters", text.len());
-
-    // Parse strain values - one per line, floating point
-    let strain: Vec<f64> = text.lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                None
-            } else {
-                line.parse::<f64>().ok()
-            }
-        })
-        .collect();
-
-    if strain.is_empty() {
-        anyhow::bail!("No strain data found in file");
-    }
-
-    tracing::debug!("Parsed {} strain values", strain.len());
-
-    // Convert strain to base12
-    let base12 = strain_to_base12(&strain);
-    tracing::info!("Converted to {} base12 digits", base12.len());
-
-    Ok(base12)
-}
-
-/// Download gravitational wave data from GWOSC
-/// Downloads raw txt.gz file for later conversion via load_cosmos_raw
+/// Download gravitational wave data from GWOSC - stores RAW strain data
 pub async fn download_cosmos(id: &str, url: &str, output_dir: &PathBuf) -> Result<PathBuf> {
     tracing::info!("Downloading LIGO data: {} from {}", id, url);
 
@@ -478,36 +223,32 @@ pub async fn download_cosmos(id: &str, url: &str, output_dir: &PathBuf) -> Resul
     let bytes = response.bytes().await?;
     tracing::debug!("Downloaded {} bytes", bytes.len());
 
-    // Save raw gzipped data
+    // Save RAW gzipped strain data
     std::fs::write(&raw_path, &bytes)?;
-    tracing::info!("Saved raw data to {:?}", raw_path);
+    tracing::info!("Saved raw strain data to {:?}", raw_path);
 
     Ok(raw_path)
 }
 
 /// Get the actual data URL from GWOSC event API
 async fn get_gwosc_data_url(id: &str, url: &str) -> Result<String> {
-    // If URL is already a direct data link, use it
     if url.ends_with(".txt.gz") || url.ends_with(".hdf5") {
         return Ok(url.to_string());
     }
 
-    // Extract event name from URL like https://gwosc.org/eventapi/html/GWTC-1-confident/GW150914/v3/
     let event = url.trim_end_matches('/')
         .rsplit('/')
-        .nth(1) // skip "v3", get "GW150914"
+        .nth(1)
         .unwrap_or(id);
 
-    // Determine detector from id
     let detector = if id.ends_with("_h1") || id.contains("H1") {
         "H1"
     } else if id.ends_with("_l1") || id.contains("L1") {
         "L1"
     } else {
-        "H1" // Default to Hanford
+        "H1"
     };
 
-    // Try GWOSC event API
     let api_url = format!(
         "https://gwosc.org/eventapi/json/GWTC-1-confident/{}/v3/",
         event.to_uppercase()
@@ -524,7 +265,6 @@ async fn get_gwosc_data_url(id: &str, url: &str) -> Result<String> {
     if let Ok(resp) = response {
         if resp.status().is_success() {
             if let Ok(json) = resp.json::<serde_json::Value>().await {
-                // Look for txt.gz files in the strain data
                 if let Some(strain) = json.get("strain") {
                     for (key, value) in strain.as_object().unwrap_or(&serde_json::Map::new()) {
                         if key.contains(detector) {
@@ -540,7 +280,7 @@ async fn get_gwosc_data_url(id: &str, url: &str) -> Result<String> {
         }
     }
 
-    // Fallback to known URLs for common events
+    // Fallback URLs
     let fallback = match (event.to_uppercase().as_str(), detector) {
         ("GW150914", "H1") => "https://gwosc.org/eventapi/json/GWTC-1-confident/GW150914/v3/H-H1_GWOSC_4KHZ_R1-1126259447-32.txt.gz",
         ("GW150914", "L1") => "https://gwosc.org/eventapi/json/GWTC-1-confident/GW150914/v3/L-L1_GWOSC_4KHZ_R1-1126259447-32.txt.gz",
@@ -550,36 +290,10 @@ async fn get_gwosc_data_url(id: &str, url: &str) -> Result<String> {
     Ok(fallback.to_string())
 }
 
-/// Convert gravitational wave strain to base12
-/// Strain values are tiny (10^-21) and oscillating around zero
-fn strain_to_base12(strain: &[f64]) -> Vec<u8> {
-    if strain.is_empty() {
-        return vec![];
-    }
-
-    // Find min/max for normalization
-    let min_s = strain.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max_s = strain.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let range = max_s - min_s;
-
-    if range <= 0.0 {
-        return vec![6; strain.len()]; // All same value -> middle digit
-    }
-
-    // Normalize to 0-11
-    strain.iter()
-        .map(|&s| {
-            let normalized = (s - min_s) / range;
-            (normalized * 11.999).floor() as u8
-        })
-        .collect()
-}
-
-/// Download stock data from Yahoo Finance
-pub async fn download_finance(symbol: &str, output_dir: &PathBuf) -> Result<Vec<u8>> {
+/// Download stock data from Yahoo Finance - stores RAW price data
+pub async fn download_finance(symbol: &str, output_dir: &PathBuf) -> Result<PathBuf> {
     tracing::info!("Downloading stock data: {}", symbol);
 
-    // Yahoo Finance chart API - get 5 years of daily data
     let url = format!(
         "https://query1.finance.yahoo.com/v8/finance/chart/{}?interval=1d&range=5y",
         symbol
@@ -599,7 +313,7 @@ pub async fn download_finance(symbol: &str, output_dir: &PathBuf) -> Result<Vec<
 
     let json: serde_json::Value = response.json().await?;
 
-    // Extract close prices from the response
+    // Extract raw price data
     let prices: Vec<f64> = json["chart"]["result"][0]["indicators"]["quote"][0]["close"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("Failed to parse price data"))?
@@ -607,79 +321,37 @@ pub async fn download_finance(symbol: &str, output_dir: &PathBuf) -> Result<Vec<
         .filter_map(|v| v.as_f64())
         .collect();
 
+    let timestamps: Vec<i64> = json["chart"]["result"][0]["timestamp"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
+        .unwrap_or_default();
+
     tracing::debug!("Got {} price points", prices.len());
 
     if prices.len() < 2 {
         anyhow::bail!("Not enough price data");
     }
 
-    // Convert to base12 using price deltas
-    let base12 = prices_to_base12(&prices);
-    tracing::info!("Converted to {} base12 digits", base12.len());
-
-    // Save to file
+    // Save RAW price data (not base12)
     std::fs::create_dir_all(output_dir)?;
     let path = output_dir.join(format!("{}.json", symbol.replace("^", "").replace("-", "_")));
     let data = serde_json::json!({
         "symbol": symbol,
-        "base12": base12,
+        "prices": prices,
+        "timestamps": timestamps,
         "source": url,
-        "price_count": prices.len(),
     });
     std::fs::write(&path, serde_json::to_string_pretty(&data)?)?;
-    tracing::info!("Saved to {:?}", path);
+    tracing::info!("Saved raw prices to {:?}", path);
 
-    Ok(base12)
-}
-
-/// Convert price series to base12 using normalized deltas
-fn prices_to_base12(prices: &[f64]) -> Vec<u8> {
-    if prices.len() < 2 {
-        return vec![];
-    }
-
-    // Compute log returns (percentage changes)
-    let returns: Vec<f64> = prices.windows(2)
-        .filter_map(|w| {
-            if w[0] > 0.0 && w[1] > 0.0 {
-                Some((w[1] / w[0]).ln())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    if returns.is_empty() {
-        return vec![];
-    }
-
-    // Find min/max for normalization
-    let min_ret = returns.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max_ret = returns.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let range = max_ret - min_ret;
-
-    if range <= 0.0 {
-        return vec![6; returns.len()]; // All same value -> middle digit
-    }
-
-    // Normalize to 0-11
-    returns.iter()
-        .map(|&r| {
-            let normalized = (r - min_ret) / range;
-            (normalized * 11.999).floor() as u8
-        })
-        .collect()
+    Ok(path)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
-    fn test_fasta_to_base12() {
-        let fasta = ">test\nACGTACGT\nACGTACGT";
-        let result = fasta_to_base12(fasta).unwrap();
-        assert!(!result.is_empty());
-        assert!(result.iter().all(|&x| x < 12));
+    fn test_placeholder() {
+        // Tests moved to converters module
+        assert!(true);
     }
 }
