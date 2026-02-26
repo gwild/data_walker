@@ -44,5 +44,8 @@ egui = "0.29"
 egui_plot = "0.29"
 three-d = { version = "0.18", features = ["egui-gui"] }
 
+# Screenshot
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 # SpaceMouse support
 hidapi = "2"

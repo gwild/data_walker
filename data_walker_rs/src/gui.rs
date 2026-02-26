@@ -121,8 +121,10 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
     let mut show_points = true;
     let mut show_lines = true;
     let mut point_scale: f32 = 0.5;
+    let mut line_scale: f32 = 0.3;
     let mut axis_ticks: u32 = 10;
     let mut auto_rotate = false;
+    let mut screenshot_requested = false;
     let mut rotation_angle: f32 = 0.0;
 
     // GUI state
@@ -224,11 +226,14 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                 255,
             );
 
-            // Lines (thin cylinders)
+            // Lines (cones scaled by visit count)
             if show_lines && walk.points.len() >= 2 {
                 let mut instances = Instances::default();
                 instances.transformations = Vec::new();
                 instances.colors = Some(Vec::new());
+
+                let max_revisits = walk.revisit_counts.values().max().copied().unwrap_or(1) as f32;
+                let ln_max = max_revisits.ln().max(1.0);
 
                 for i in 0..walk.points.len() - 1 {
                     let p1 = vec3(walk.points[i][0], walk.points[i][1], walk.points[i][2]);
@@ -239,6 +244,25 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                     let length = dir.magnitude();
 
                     if length > 0.001 {
+                        // Look up visit counts at both endpoints
+                        let key1 = (
+                            walk.points[i][0].round() as i32,
+                            walk.points[i][1].round() as i32,
+                            walk.points[i][2].round() as i32,
+                        );
+                        let key2 = (
+                            walk.points[i + 1][0].round() as i32,
+                            walk.points[i + 1][1].round() as i32,
+                            walk.points[i + 1][2].round() as i32,
+                        );
+                        let count1 = *walk.revisit_counts.get(&key1).unwrap_or(&1) as f32;
+                        let count2 = *walk.revisit_counts.get(&key2).unwrap_or(&1) as f32;
+                        let avg_count = (count1 + count2) * 0.5;
+
+                        // Scale radius by visit count (log scale)
+                        let radius = line_scale
+                            * (0.15 + 0.85 * avg_count.ln().max(0.0) / ln_max);
+
                         let up = vec3(0.0, 1.0, 0.0);
                         let rotation = if dir.normalize().dot(up).abs() > 0.999 {
                             Mat4::identity()
@@ -250,7 +274,7 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
 
                         let transform = Mat4::from_translation(center)
                             * rotation
-                            * Mat4::from_nonuniform_scale(0.3, length * 0.5, 0.3);
+                            * Mat4::from_nonuniform_scale(radius, length * 0.5, radius);
 
                         instances.transformations.push(transform);
                         if let Some(ref mut colors) = instances.colors {
@@ -260,9 +284,9 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                 }
 
                 if !instances.transformations.is_empty() {
-                    let cylinder = CpuMesh::cylinder(6);
+                    let cone = CpuMesh::cone(12);
                     let instanced = Gm::new(
-                        InstancedMesh::new(&context, &instances, &cylinder),
+                        InstancedMesh::new(&context, &instances, &cone),
                         ColorMaterial::default(),
                     );
                     walk_lines.push(instanced);
@@ -407,6 +431,9 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                     if show_points {
                         ui.add(egui::Slider::new(&mut point_scale, 0.1..=1.0).text("Point scale"));
                     }
+                    if show_lines {
+                        ui.add(egui::Slider::new(&mut line_scale, 0.05..=2.0).text("Line scale"));
+                    }
                     ui.horizontal(|ui| {
                         ui.label("Ticks:");
                         egui::ComboBox::from_id_salt("axis_ticks")
@@ -421,9 +448,14 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                             });
                     });
 
-                    if ui.button("SpaceMouse Config").clicked() {
-                        show_spacemouse_config = !show_spacemouse_config;
-                    }
+                    ui.horizontal(|ui| {
+                        if ui.button("SpaceMouse Config").clicked() {
+                            show_spacemouse_config = !show_spacemouse_config;
+                        }
+                        if ui.button("Screenshot").clicked() {
+                            screenshot_requested = true;
+                        }
+                    });
 
                     ui.separator();
 
@@ -756,6 +788,22 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
 
         // Render GUI
         let _ = frame_input.screen().write(|| gui.render());
+
+        // Screenshot capture
+        if screenshot_requested {
+            screenshot_requested = false;
+            let vp = frame_input.viewport;
+            let pixels: Vec<[u8; 4]> = frame_input.screen().read_color();
+            let flat: Vec<u8> = pixels.iter().flat_map(|p| p.iter().copied()).collect();
+            if let Some(img) = image::RgbaImage::from_raw(vp.width, vp.height, flat) {
+                let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                let filename = format!("data_walker_{}.png", timestamp);
+                match img.save(&filename) {
+                    Ok(()) => info!("Screenshot saved to {}", filename),
+                    Err(e) => warn!("Failed to save screenshot: {}", e),
+                }
+            }
+        }
 
         FrameOutput::default()
     });

@@ -1096,6 +1096,7 @@ dependencies = [
  "flate2",
  "hidapi",
  "hound",
+ "image",
  "num-complex",
  "reqwest",
  "rustfft",

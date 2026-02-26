@@ -47,7 +47,8 @@ pub fn normalize_to_base12(values: &[f64]) -> Vec<u8> {
         .collect()
 }
 
-/// DNA Converter: ACGT (base-4) to base-12 streaming
+/// DNA Converter: ACGT (base-4) to base-12 via fixed chunks
+/// Process 5 nucleotides at a time (4^5 = 1024), convert to base-12 digits
 pub fn convert_dna(sequence: &str) -> Vec<u8> {
     let base4_map = |c: char| -> Option<u64> {
         match c {
@@ -61,24 +62,34 @@ pub fn convert_dna(sequence: &str) -> Vec<u8> {
 
     let mut base12 = Vec::new();
     let mut accumulator: u64 = 0;
-    let mut power: u64 = 1;
+    let mut count: u32 = 0;
 
     for ch in sequence.chars() {
         if let Some(digit) = base4_map(ch) {
-            accumulator += digit * power;
-            power *= 4;
+            accumulator += digit * 4u64.pow(count);
+            count += 1;
 
-            // Emit base-12 digits when accumulator is large enough
-            while accumulator >= 12 {
-                base12.push((accumulator % 12) as u8);
-                accumulator /= 12;
+            // Every 5 nucleotides (4^5 = 1024), emit base-12 digits and reset
+            if count == 5 {
+                while accumulator > 0 {
+                    base12.push((accumulator % 12) as u8);
+                    accumulator /= 12;
+                }
+                count = 0;
             }
         }
     }
 
-    // Emit remaining
-    if accumulator > 0 || base12.is_empty() {
-        base12.push((accumulator % 12) as u8);
+    // Emit remaining partial chunk
+    if accumulator > 0 {
+        while accumulator > 0 {
+            base12.push((accumulator % 12) as u8);
+            accumulator /= 12;
+        }
+    }
+
+    if base12.is_empty() {
+        base12.push(0);
     }
 
     base12
