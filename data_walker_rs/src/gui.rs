@@ -79,6 +79,60 @@ struct WalkData {
     revisit_counts: std::collections::HashMap<(i32, i32, i32), u32>,
 }
 
+/// Linearly interpolate a position along a walk's points
+fn interpolate_walk_position(points: &[[f32; 3]], t: f32) -> Vec3 {
+    if points.is_empty() {
+        return vec3(0.0, 0.0, 0.0);
+    }
+    if points.len() == 1 {
+        return vec3(points[0][0], points[0][1], points[0][2]);
+    }
+
+    // t is 0.0-1.0, map to index space
+    let max_idx = (points.len() - 1) as f32;
+    let exact_idx = t * max_idx;
+    let idx0 = (exact_idx.floor() as usize).min(points.len() - 1);
+    let idx1 = (idx0 + 1).min(points.len() - 1);
+    let frac = exact_idx - idx0 as f32;
+
+    // Lerp between the two points
+    let p0 = vec3(points[idx0][0], points[idx0][1], points[idx0][2]);
+    let p1 = vec3(points[idx1][0], points[idx1][1], points[idx1][2]);
+
+    p0 * (1.0 - frac) + p1 * frac
+}
+
+/// Calculate average position along all selected walks at a given progress (0.0-1.0)
+/// Returns (current_pos, look_ahead_pos) for direction calculation, or None if no walks
+fn calculate_average_path_position(
+    walks: &BTreeMap<String, WalkData>,
+    selected_ids: &std::collections::HashSet<String>,
+    progress: f32,
+) -> Option<(Vec3, Vec3)> {
+    let selected_walks: Vec<_> = walks.iter()
+        .filter(|(id, w)| selected_ids.contains(*id) && w.visible && !w.points.is_empty())
+        .collect();
+
+    if selected_walks.is_empty() {
+        return None;
+    }
+
+    // Smoothly interpolate current position and a look-ahead position
+    let look_ahead = (progress + 0.01).min(1.0);
+
+    let mut current_sum = vec3(0.0, 0.0, 0.0);
+    let mut ahead_sum = vec3(0.0, 0.0, 0.0);
+    let mut count = 0.0;
+
+    for (_, walk) in &selected_walks {
+        current_sum += interpolate_walk_position(&walk.points, progress);
+        ahead_sum += interpolate_walk_position(&walk.points, look_ahead);
+        count += 1.0;
+    }
+
+    Some((current_sum / count, ahead_sum / count))
+}
+
 /// Run the native 3D GUI viewer using three-d
 pub fn run_viewer(config: Config) -> anyhow::Result<()> {
     // Create window
@@ -127,7 +181,17 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
     let mut axis_ticks: u32 = 10;
     let mut auto_rotate = false;
     let mut screenshot_requested = false;
+    let mut screenshot_status: Option<(String, f64)> = None; // (message, expire_time)
     let mut rotation_angle: f32 = 0.0;
+
+    // Data Flight mode
+    let mut flight_mode = false;
+    let mut flight_playing = false;          // Is flight animation playing
+    let mut flight_speed: f32 = 10.0;        // Points per second (Hz)
+    let mut flight_reverse = false;          // Go backwards
+    let mut flight_look_back = false;        // Look behind instead of ahead
+    let mut flight_progress: f32 = 0.0;      // 0.0 to 1.0 along path
+    let mut last_frame_time: f64 = 0.0;      // For delta time calculation
 
     // GUI state
     let mut gui = GUI::new(&context);
@@ -140,6 +204,15 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
 
     // Main loop
     window.render_loop(move |mut frame_input| {
+        // Handle keyboard events (spacebar for play/pause)
+        for event in &frame_input.events {
+            if let three_d::Event::KeyPress { kind, .. } = event {
+                if *kind == three_d::Key::Space && flight_mode {
+                    flight_playing = !flight_playing;
+                }
+            }
+        }
+
         // Handle SpaceMouse
         if let Some(ref sm) = spacemouse {
             if let Ok(state) = sm.lock() {
@@ -178,8 +251,8 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
             }
         }
 
-        // Auto-rotate
-        if auto_rotate {
+        // Auto-rotate (only when not in flight mode)
+        if auto_rotate && !flight_mode {
             rotation_angle += 0.01;
             let pos = camera.position();
             let target = camera.target();
@@ -188,6 +261,74 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
             let new_x = rotation_angle.cos() * dist;
             let new_z = rotation_angle.sin() * dist;
             camera.set_view(vec3(new_x, pos.y, new_z), target, vec3(0.0, 1.0, 0.0));
+        }
+
+        // Data Flight camera update
+        if flight_mode {
+            // Calculate delta time
+            let delta = if last_frame_time > 0.0 {
+                (frame_input.accumulated_time - last_frame_time) as f32
+            } else {
+                0.0
+            };
+            last_frame_time = frame_input.accumulated_time;
+
+            // Update progress only when playing
+            if flight_playing {
+                // Get max walk length from selected walks
+                let max_len = walks.iter()
+                    .filter(|(id, w)| selected_sources.contains(*id) && w.visible && !w.points.is_empty())
+                    .map(|(_, w)| w.points.len())
+                    .max()
+                    .unwrap_or(1000) as f32;
+
+                // flight_speed is in Hz (points per second)
+                // progress_per_second = points_per_second / total_points
+                let progress_per_second = flight_speed / max_len;
+                let progress_delta = progress_per_second * delta;
+
+                if flight_reverse {
+                    flight_progress = (flight_progress - progress_delta).max(0.0);
+                } else {
+                    flight_progress = (flight_progress + progress_delta).min(1.0);
+                }
+            }
+
+            // Get average position along path
+            if let Some((current_pos, next_pos)) = calculate_average_path_position(
+                &walks, &selected_sources, flight_progress
+            ) {
+                // Direction of travel
+                let dir_vec = next_pos - current_pos;
+                let dir_mag = dir_vec.magnitude();
+
+                if dir_mag > 0.001 {
+                    let direction = dir_vec / dir_mag;
+
+                    // Camera offset: slightly behind and above the path
+                    let up = vec3(0.0, 1.0, 0.0);
+                    let right_vec = direction.cross(up);
+                    let right_mag = right_vec.magnitude();
+                    let cam_up = if right_mag > 0.001 {
+                        (right_vec / right_mag).cross(direction).normalize()
+                    } else {
+                        up
+                    };
+
+                    let offset_distance = 15.0;
+                    let offset_height = 5.0;
+                    let camera_pos = current_pos - direction * offset_distance + cam_up * offset_height;
+
+                    // Look target: ahead or behind based on toggle
+                    let look_target = if flight_look_back {
+                        current_pos - direction * 10.0
+                    } else {
+                        next_pos
+                    };
+
+                    camera.set_view(camera_pos, look_target, up);
+                }
+            }
         }
 
         // Handle orbit control - only when cursor is in plot area (not over GUI panels)
@@ -207,7 +348,8 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
             }
         });
 
-        if in_plot_area {
+        // Disable orbit control when in flight mode
+        if in_plot_area && !flight_mode {
             orbit_control.handle_events(&mut camera, &mut frame_input.events);
         }
         camera.set_viewport(frame_input.viewport);
@@ -454,10 +596,10 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                             .selected_text(if axis_ticks == 0 { "Off".to_string() } else { axis_ticks.to_string() })
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut axis_ticks, 0, "Off");
+                                ui.selectable_value(&mut axis_ticks, 5, "5");
                                 ui.selectable_value(&mut axis_ticks, 10, "10");
-                                ui.selectable_value(&mut axis_ticks, 100, "100");
-                                ui.selectable_value(&mut axis_ticks, 1000, "1000");
-                                ui.selectable_value(&mut axis_ticks, 10000, "10000");
+                                ui.selectable_value(&mut axis_ticks, 20, "20");
+                                ui.selectable_value(&mut axis_ticks, 50, "50");
                             });
                     });
 
@@ -469,6 +611,42 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                             screenshot_requested = true;
                         }
                     });
+
+                    // Data Flight controls
+                    ui.separator();
+                    ui.heading("Data Flight");
+                    ui.checkbox(&mut flight_mode, "Enable Flight");
+
+                    if flight_mode {
+                        // Play/Pause button with spacebar hint
+                        ui.horizontal(|ui| {
+                            let button_text = if flight_playing { "⏸ Pause" } else { "▶ Play" };
+                            if ui.button(button_text).clicked() {
+                                flight_playing = !flight_playing;
+                            }
+                            ui.label("(Space)");
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Speed:");
+                            ui.add(egui::Slider::new(&mut flight_speed, 0.01..=60.0).logarithmic(true).suffix(" Hz"));
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.label("Progress:");
+                            ui.add(egui::Slider::new(&mut flight_progress, 0.0..=1.0));
+                        });
+
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut flight_reverse, "Reverse");
+                            ui.checkbox(&mut flight_look_back, "Look Back");
+                        });
+
+                        if ui.button("Reset to Start").clicked() {
+                            flight_progress = if flight_reverse { 1.0 } else { 0.0 };
+                            flight_playing = false;
+                        }
+                    }
 
                     ui.separator();
 
@@ -509,9 +687,18 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                 // Bottom panel
                 egui::TopBottomPanel::bottom("status").show(egui_ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(format!("{} walks loaded", walks.len()));
-                        ui.separator();
-                        ui.label("Right-drag: orbit | Scroll: zoom | Middle-drag: pan");
+                        // Show screenshot status if active
+                        if let Some((ref msg, expire_time)) = screenshot_status {
+                            if frame_input.accumulated_time < expire_time {
+                                ui.label(egui::RichText::new(msg).color(egui::Color32::GREEN));
+                            } else {
+                                screenshot_status = None;
+                            }
+                        } else {
+                            ui.label(format!("{} walks loaded", walks.len()));
+                            ui.separator();
+                            ui.label("Right-drag: orbit | Scroll: zoom | Middle-drag: pan");
+                        }
                     });
                 });
 
@@ -562,56 +749,54 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                         }
                     }
 
-                    // Numeric tick labels - positioned at tick marks with screen-space offset
+                    // Numeric tick labels - directly on axes, no offset
                     if axis_ticks > 0 {
                         let spacing = axis_ticks as f32;
                         let axis_len = 100.0;
-                        let tick_color = egui::Color32::from_rgb(160, 160, 160);
-                        let label_offset = 12.0; // Screen-space pixel offset
 
-                        // X axis ticks (red) - labels below
+                        // X axis ticks (red)
+                        let x_color = egui::Color32::from_rgb(220, 120, 120);
                         let mut pos = spacing;
                         while pos <= axis_len {
-                            if let Some(mut screen_pos) = project(vec3(pos, 0.0, 0.0)) {
-                                screen_pos.y += label_offset;
+                            if let Some(screen_pos) = project(vec3(pos, 0.0, 0.0)) {
                                 painter.text(
                                     screen_pos,
-                                    egui::Align2::CENTER_TOP,
+                                    egui::Align2::CENTER_CENTER,
                                     format!("{}", pos as i32),
                                     egui::FontId::proportional(11.0),
-                                    tick_color,
+                                    x_color,
                                 );
                             }
                             pos += spacing;
                         }
 
-                        // Y axis ticks (green) - labels to the left
+                        // Y axis ticks (green)
+                        let y_color = egui::Color32::from_rgb(120, 220, 120);
                         let mut pos = spacing;
                         while pos <= axis_len {
-                            if let Some(mut screen_pos) = project(vec3(0.0, pos, 0.0)) {
-                                screen_pos.x -= label_offset;
+                            if let Some(screen_pos) = project(vec3(0.0, pos, 0.0)) {
                                 painter.text(
                                     screen_pos,
-                                    egui::Align2::RIGHT_CENTER,
+                                    egui::Align2::CENTER_CENTER,
                                     format!("{}", pos as i32),
                                     egui::FontId::proportional(11.0),
-                                    tick_color,
+                                    y_color,
                                 );
                             }
                             pos += spacing;
                         }
 
-                        // Z axis ticks (blue) - labels to the right
+                        // Z axis ticks (blue)
+                        let z_color = egui::Color32::from_rgb(120, 150, 220);
                         let mut pos = spacing;
                         while pos <= axis_len {
-                            if let Some(mut screen_pos) = project(vec3(0.0, 0.0, pos)) {
-                                screen_pos.x += label_offset;
+                            if let Some(screen_pos) = project(vec3(0.0, 0.0, pos)) {
                                 painter.text(
                                     screen_pos,
-                                    egui::Align2::LEFT_CENTER,
+                                    egui::Align2::CENTER_CENTER,
                                     format!("{}", pos as i32),
                                     egui::FontId::proportional(11.0),
-                                    tick_color,
+                                    z_color,
                                 );
                             }
                             pos += spacing;
@@ -811,10 +996,28 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
             let flat: Vec<u8> = pixels.iter().flat_map(|p| p.iter().copied()).collect();
             if let Some(img) = image::RgbaImage::from_raw(vp.width, vp.height, flat) {
                 let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-                let filename = format!("data_walker_{}.png", timestamp);
+                let screenshots_dir = std::path::PathBuf::from("screenshots");
+                let _ = std::fs::create_dir_all(&screenshots_dir);
+                let filename = screenshots_dir.join(format!("data_walker_{}.png", timestamp));
+                // Get absolute path for display
+                let abs_path = std::env::current_dir()
+                    .map(|p| p.join(&filename).display().to_string())
+                    .unwrap_or_else(|_| filename.display().to_string());
                 match img.save(&filename) {
-                    Ok(()) => info!("Screenshot saved to {}", filename),
-                    Err(e) => warn!("Failed to save screenshot: {}", e),
+                    Ok(()) => {
+                        info!("Screenshot saved to {}", abs_path);
+                        screenshot_status = Some((
+                            format!("Saved: {}", abs_path),
+                            frame_input.accumulated_time + 4.0, // Show for 4 seconds
+                        ));
+                    }
+                    Err(e) => {
+                        warn!("Failed to save screenshot: {}", e);
+                        screenshot_status = Some((
+                            format!("Failed: {}", e),
+                            frame_input.accumulated_time + 4.0,
+                        ));
+                    }
                 }
             }
         }
