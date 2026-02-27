@@ -13,6 +13,7 @@ mod gui;
 mod logging;
 mod server;
 mod state;
+mod thumbnail;
 mod walk;
 
 use clap::{Parser, Subcommand};
@@ -54,6 +55,17 @@ enum Commands {
         /// Filter by category
         #[arg(short, long)]
         category: Option<String>,
+    },
+
+    /// Generate thumbnail images for all sources
+    GenerateThumbnails {
+        /// Output directory for thumbnails
+        #[arg(short, long, default_value = "web/thumbnails")]
+        output: PathBuf,
+
+        /// Thumbnail size in pixels
+        #[arg(long, default_value = "512")]
+        size: u32,
     },
 
     /// Download data from sources
@@ -110,6 +122,10 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::GenerateMath { output } => {
             generate_math(&config, &output)?;
+        }
+
+        Commands::GenerateThumbnails { output, size } => {
+            thumbnail::generate(&config, &output, size)?;
         }
 
         Commands::List { category } => {
