@@ -79,7 +79,8 @@ struct WalkData {
     revisit_counts: std::collections::HashMap<(i32, i32, i32), u32>,
 }
 
-/// Linearly interpolate a position along a walk's points
+/// Catmull-Rom spline interpolation along a walk's points
+/// Creates smooth curves that pass through all control points
 fn interpolate_walk_position(points: &[[f32; 3]], t: f32) -> Vec3 {
     if points.is_empty() {
         return vec3(0.0, 0.0, 0.0);
@@ -87,19 +88,45 @@ fn interpolate_walk_position(points: &[[f32; 3]], t: f32) -> Vec3 {
     if points.len() == 1 {
         return vec3(points[0][0], points[0][1], points[0][2]);
     }
+    if points.len() == 2 {
+        // Fall back to linear for just 2 points
+        let p0 = vec3(points[0][0], points[0][1], points[0][2]);
+        let p1 = vec3(points[1][0], points[1][1], points[1][2]);
+        return p0 * (1.0 - t) + p1 * t;
+    }
 
-    // t is 0.0-1.0, map to index space
-    let max_idx = (points.len() - 1) as f32;
-    let exact_idx = t * max_idx;
-    let idx0 = (exact_idx.floor() as usize).min(points.len() - 1);
-    let idx1 = (idx0 + 1).min(points.len() - 1);
-    let frac = exact_idx - idx0 as f32;
+    // t is 0.0-1.0, map to segment index space
+    let num_segments = points.len() - 1;
+    let exact_idx = t * num_segments as f32;
+    let segment = (exact_idx.floor() as usize).min(num_segments - 1);
+    let local_t = exact_idx - segment as f32;
 
-    // Lerp between the two points
-    let p0 = vec3(points[idx0][0], points[idx0][1], points[idx0][2]);
-    let p1 = vec3(points[idx1][0], points[idx1][1], points[idx1][2]);
+    // Get 4 control points for Catmull-Rom (P0, P1, P2, P3)
+    // P1 and P2 are the segment endpoints, P0 and P3 are neighbors for tangent calculation
+    let i1 = segment;
+    let i2 = (segment + 1).min(points.len() - 1);
 
-    p0 * (1.0 - frac) + p1 * frac
+    // For boundary points, extrapolate or clamp
+    let i0 = if segment == 0 { 0 } else { segment - 1 };
+    let i3 = (segment + 2).min(points.len() - 1);
+
+    let p0 = vec3(points[i0][0], points[i0][1], points[i0][2]);
+    let p1 = vec3(points[i1][0], points[i1][1], points[i1][2]);
+    let p2 = vec3(points[i2][0], points[i2][1], points[i2][2]);
+    let p3 = vec3(points[i3][0], points[i3][1], points[i3][2]);
+
+    // Catmull-Rom spline formula:
+    // P(t) = 0.5 * [(2*P1) + (-P0 + P2)*t + (2*P0 - 5*P1 + 4*P2 - P3)*t² + (-P0 + 3*P1 - 3*P2 + P3)*t³]
+    let t2 = local_t * local_t;
+    let t3 = t2 * local_t;
+
+    let result = (p1 * 2.0
+        + (p2 - p0) * local_t
+        + (p0 * 2.0 - p1 * 5.0 + p2 * 4.0 - p3) * t2
+        + (p1 * 3.0 - p0 - p2 * 3.0 + p3) * t3)
+        * 0.5;
+
+    result
 }
 
 /// Calculate average position along all selected walks at a given progress (0.0-1.0)
@@ -192,9 +219,15 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
     let mut flight_look_back = false;        // Look behind instead of ahead
     let mut flight_progress: f32 = 0.0;      // 0.0 to 1.0 along path
     let mut last_frame_time: f64 = 0.0;      // For delta time calculation
+    let mut flight_loop = false;             // Enable looping
+    let mut flight_loop_mode: u8 = 0;        // 0 = Repeat, 1 = Fwd/Rev (ping-pong)
+    let mut show_loop_menu = false;          // Dropdown visibility
 
     // GUI state
     let mut gui = GUI::new(&context);
+
+    // Color pool for dynamic assignment
+    let mut color_pool = ColorPool::new();
 
     // Pre-build category list
     let mut by_category: BTreeMap<String, Vec<crate::config::Source>> = BTreeMap::new();
@@ -288,9 +321,37 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                 let progress_delta = progress_per_second * delta;
 
                 if flight_reverse {
-                    flight_progress = (flight_progress - progress_delta).max(0.0);
+                    flight_progress -= progress_delta;
+                    if flight_progress <= 0.0 {
+                        if flight_loop {
+                            if flight_loop_mode == 1 {
+                                // Fwd/Rev: reverse direction
+                                flight_reverse = false;
+                                flight_progress = 0.0;
+                            } else {
+                                // Repeat: jump to end
+                                flight_progress = 1.0;
+                            }
+                        } else {
+                            flight_progress = 0.0;
+                        }
+                    }
                 } else {
-                    flight_progress = (flight_progress + progress_delta).min(1.0);
+                    flight_progress += progress_delta;
+                    if flight_progress >= 1.0 {
+                        if flight_loop {
+                            if flight_loop_mode == 1 {
+                                // Fwd/Rev: reverse direction
+                                flight_reverse = true;
+                                flight_progress = 1.0;
+                            } else {
+                                // Repeat: jump to start
+                                flight_progress = 0.0;
+                            }
+                        } else {
+                            flight_progress = 1.0;
+                        }
+                    }
                 }
             }
 
@@ -564,6 +625,7 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                         if ui.button("Deselect All").clicked() {
                             selected_sources.clear();
                             walks.clear();
+                            color_pool.clear();
                         }
                         if ui.button("Center View").clicked() {
                             camera.set_view(
@@ -642,6 +704,36 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                             ui.checkbox(&mut flight_look_back, "Look Back");
                         });
 
+                        // Loop control: checkbox enables, label click opens dropdown
+                        ui.horizontal(|ui| {
+                            // Checkbox without label
+                            if ui.checkbox(&mut flight_loop, "").changed() {
+                                // Just toggling loop on/off
+                            }
+
+                            // Clickable label that opens mode dropdown
+                            let loop_mode_text = if flight_loop_mode == 1 { "Loop: Fwd/Rev" } else { "Loop: Repeat" };
+                            let label_response = ui.selectable_label(show_loop_menu, loop_mode_text);
+                            if label_response.clicked() {
+                                show_loop_menu = !show_loop_menu;
+                            }
+                        });
+
+                        // Dropdown menu for loop mode
+                        if show_loop_menu {
+                            ui.horizontal(|ui| {
+                                ui.label("  ");  // indent
+                                if ui.selectable_label(flight_loop_mode == 0, "Repeat").clicked() {
+                                    flight_loop_mode = 0;
+                                    show_loop_menu = false;
+                                }
+                                if ui.selectable_label(flight_loop_mode == 1, "Fwd/Rev").clicked() {
+                                    flight_loop_mode = 1;
+                                    show_loop_menu = false;
+                                }
+                            });
+                        }
+
                         if ui.button("Reset to Start").clicked() {
                             flight_progress = if flight_reverse { 1.0 } else { 0.0 };
                             flight_playing = false;
@@ -665,13 +757,17 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                                         if ui.checkbox(&mut checked, &source.name).changed() {
                                             if checked {
                                                 selected_sources.insert(source.id.clone());
+                                                // Get color from pool for maximum contrast
+                                                let color = color_pool.get_color(&source.id);
                                                 // Load walk
-                                                if let Some(walk_data) = load_walk_data(&source, &config, max_points, &selected_mapping, selected_base) {
+                                                if let Some(walk_data) = load_walk_data(&source, &config, max_points, &selected_mapping, selected_base, color) {
                                                     walks.insert(source.id.clone(), walk_data);
                                                 }
                                             } else {
                                                 selected_sources.remove(&source.id);
                                                 walks.remove(&source.id);
+                                                // Release color back to pool
+                                                color_pool.release_color(&source.id);
                                             }
                                         }
                                     } else {
@@ -869,7 +965,9 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
             let source_ids: Vec<String> = selected_sources.iter().cloned().collect();
             for sid in &source_ids {
                 if let Some(source) = config.sources.iter().find(|s| &s.id == sid) {
-                    if let Some(walk_data) = load_walk_data(source, &config, max_points, &selected_mapping, selected_base) {
+                    // Reuse existing color assignment
+                    let color = color_pool.get_color(&sid);
+                    if let Some(walk_data) = load_walk_data(source, &config, max_points, &selected_mapping, selected_base, color) {
                         walks.insert(sid.clone(), walk_data);
                     }
                 }
@@ -1063,6 +1161,7 @@ fn load_walk_data(
     max_points: usize,
     mapping_name: &str,
     base: u32,
+    color: [f32; 3],
 ) -> Option<WalkData> {
     use crate::converters;
     use crate::walk::walk_base4;
@@ -1183,11 +1282,6 @@ fn load_walk_data(
     let max_revisits = revisit_counts.values().max().copied().unwrap_or(1);
     info!("Max revisits for {}: {} at {} unique positions", source.id, max_revisits, revisit_counts.len());
 
-    // Color based on hash of id
-    let hash = source.id.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
-    let hue = (hash % 360) as f32 / 360.0;
-    let color = hsv_to_rgb(hue, 0.7, 0.9);
-
     Some(WalkData {
         name: source.name.clone(),
         points,
@@ -1289,4 +1383,126 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
     };
 
     [r + m, g + m, b + m]
+}
+
+/// Maximally distinct color palette based on Glasbey algorithm principles.
+/// Colors are pre-computed to maximize minimum perceptual distance in CIELAB space.
+/// Designed for dark backgrounds (0.1, 0.1, 0.15).
+/// First 12 colors have excellent contrast; extends to 24 for larger datasets.
+const DISTINCT_COLORS: [[f32; 3]; 24] = [
+    // Primary distinct colors (maximally separated in CIELAB)
+    [1.00, 0.30, 0.30],  // 0: Bright red
+    [0.30, 0.85, 0.40],  // 1: Green
+    [0.40, 0.60, 1.00],  // 2: Sky blue
+    [1.00, 0.85, 0.20],  // 3: Yellow
+    [0.90, 0.40, 0.90],  // 4: Magenta
+    [0.20, 0.90, 0.90],  // 5: Cyan
+    [1.00, 0.60, 0.20],  // 6: Orange
+    [0.70, 0.50, 1.00],  // 7: Purple
+    [0.60, 1.00, 0.60],  // 8: Lime
+    [1.00, 0.50, 0.60],  // 9: Salmon
+    [0.50, 0.80, 1.00],  // 10: Light blue
+    [0.95, 0.75, 0.50],  // 11: Peach
+    // Secondary colors (still good contrast)
+    [0.80, 0.20, 0.50],  // 12: Rose
+    [0.40, 0.70, 0.50],  // 13: Sea green
+    [0.70, 0.70, 0.30],  // 14: Olive
+    [0.50, 0.30, 0.70],  // 15: Deep purple
+    [0.30, 0.60, 0.60],  // 16: Teal
+    [0.90, 0.55, 0.45],  // 17: Coral
+    [0.60, 0.40, 0.30],  // 18: Brown
+    [0.75, 0.85, 0.85],  // 19: Light gray-cyan
+    [0.85, 0.65, 0.80],  // 20: Pink
+    [0.55, 0.75, 0.35],  // 21: Yellow-green
+    [0.45, 0.45, 0.85],  // 22: Slate blue
+    [0.90, 0.35, 0.60],  // 23: Hot pink
+];
+
+/// Color pool for dynamic assignment with maximum contrast
+#[derive(Default)]
+struct ColorPool {
+    /// Maps source ID to assigned color index
+    assignments: std::collections::HashMap<String, usize>,
+    /// Tracks which color indices are in use
+    in_use: std::collections::HashSet<usize>,
+}
+
+impl ColorPool {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Get or assign a color for a source ID
+    /// Returns the RGB color array
+    fn get_color(&mut self, source_id: &str) -> [f32; 3] {
+        // Return existing assignment
+        if let Some(&idx) = self.assignments.get(source_id) {
+            return DISTINCT_COLORS[idx];
+        }
+
+        // Find first unused color index
+        let mut idx = 0;
+        while self.in_use.contains(&idx) && idx < DISTINCT_COLORS.len() {
+            idx += 1;
+        }
+
+        // If all colors used, find color with maximum distance to currently used colors
+        if idx >= DISTINCT_COLORS.len() {
+            idx = self.find_best_reuse_color();
+        }
+
+        self.assignments.insert(source_id.to_string(), idx);
+        self.in_use.insert(idx);
+        DISTINCT_COLORS[idx]
+    }
+
+    /// Release a color when a walk is removed
+    fn release_color(&mut self, source_id: &str) {
+        if let Some(idx) = self.assignments.remove(source_id) {
+            self.in_use.remove(&idx);
+        }
+    }
+
+    /// Find the best color to reuse when all are taken
+    /// Uses simple RGB distance (not CIELAB but fast)
+    fn find_best_reuse_color(&self) -> usize {
+        // Collect currently used colors
+        let used_colors: Vec<[f32; 3]> = self.in_use.iter()
+            .filter(|&&i| i < DISTINCT_COLORS.len())
+            .map(|&i| DISTINCT_COLORS[i])
+            .collect();
+
+        if used_colors.is_empty() {
+            return 0;
+        }
+
+        // Find palette color with maximum minimum distance to used colors
+        let mut best_idx = 0;
+        let mut best_min_dist = 0.0f32;
+
+        for (idx, color) in DISTINCT_COLORS.iter().enumerate() {
+            let min_dist = used_colors.iter()
+                .map(|used| {
+                    let dr = color[0] - used[0];
+                    let dg = color[1] - used[1];
+                    let db = color[2] - used[2];
+                    // Weighted RGB distance (green is more perceptually significant)
+                    (2.0 * dr * dr + 4.0 * dg * dg + 3.0 * db * db).sqrt()
+                })
+                .fold(f32::INFINITY, f32::min);
+
+            if min_dist > best_min_dist {
+                best_min_dist = min_dist;
+                best_idx = idx;
+            }
+        }
+
+        best_idx
+    }
+
+    /// Clear all assignments
+    fn clear(&mut self) {
+        self.assignments.clear();
+        self.in_use.clear();
+    }
 }
