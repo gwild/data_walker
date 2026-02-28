@@ -704,30 +704,32 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
 
                 // Axis labels in screen space
                 if show_axes {
-                    let vp = frame_input.viewport;
-                    let proj = camera.projection();
-                    let view = camera.view();
-                    let pv = proj * view;
-
                     let painter = egui_ctx.layer_painter(egui::LayerId::new(
                         egui::Order::Foreground,
                         egui::Id::new("axis_labels"),
                     ));
 
-                    // Helper to project world pos to screen
+                    // Helper to project world pos to screen using UV coordinates
+                    // UV coords are 0-1 normalized, convert to logical screen points
+                    let vp = frame_input.viewport;
+                    let dpr = frame_input.device_pixel_ratio;
+                    let screen_width = vp.width as f32 / dpr;
+                    let screen_height = vp.height as f32 / dpr;
+
                     let project = |world_pos: Vec3| -> Option<egui::Pos2> {
-                        let clip = pv * vec4(world_pos.x, world_pos.y, world_pos.z, 1.0);
-                        if clip.w > 0.0 {
-                            let ndc_x = clip.x / clip.w;
-                            let ndc_y = clip.y / clip.w;
-                            // Check if in view frustum
-                            if ndc_x.abs() < 1.5 && ndc_y.abs() < 1.5 {
-                                let screen_x = (ndc_x * 0.5 + 0.5) * vp.width as f32 + vp.x as f32;
-                                let screen_y = (1.0 - (ndc_y * 0.5 + 0.5)) * vp.height as f32 + vp.y as f32;
-                                return Some(egui::pos2(screen_x, screen_y));
-                            }
+                        // Check if position is in front of camera
+                        let view_dir = camera.view_direction();
+                        let to_point = world_pos - camera.position();
+                        if view_dir.dot(to_point) <= 0.0 {
+                            return None;
                         }
-                        None
+
+                        let uv = camera.uv_coordinates_at_position(world_pos);
+                        // UV: (0,0) is bottom-left, (1,1) is top-right
+                        // Screen: (0,0) is top-left, so flip Y
+                        let screen_x = uv.u * screen_width;
+                        let screen_y = (1.0 - uv.v) * screen_height;
+                        Some(egui::pos2(screen_x, screen_y))
                     };
 
                     // Axis name labels at ends

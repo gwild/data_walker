@@ -146,17 +146,20 @@ pub async fn download_audio(id: &str, url: &str, output_dir: &PathBuf) -> Result
         return download_raw_mp3(id, mp3_url, output_dir).await;
     }
 
-    // Classical music from Archive.org
+    // Classical music from Archive.org - UNIQUE URLs for each piece
     let classical_composers: std::collections::HashMap<&str, &str> = [
-        ("bach_prelude_c", "https://archive.org/download/prelude-and-fugue-no.-1-in-c-major-bwv-846-from-bachs-well-tempered-clavier-gulda-pianist/Prelude%20and%20Fugue%20No.%201%20in%20C%20major%2C%20BWV%20846%2C%20from%20Bachs%20Well-tempered%20Clavier%2C%20Gulda%20pianist.mp3"),
-        ("bach_fugue_c", "https://archive.org/download/prelude-and-fugue-no.-1-in-c-major-bwv-846-from-bachs-well-tempered-clavier-gulda-pianist/Prelude%20and%20Fugue%20No.%201%20in%20C%20major%2C%20BWV%20846%2C%20from%20Bachs%20Well-tempered%20Clavier%2C%20Gulda%20pianist.mp3"),
-        ("bach_invention", "https://archive.org/download/prelude-and-fugue-no.-1-in-c-major-bwv-846-from-bachs-well-tempered-clavier-gulda-pianist/Prelude%20and%20Fugue%20No.%201%20in%20C%20major%2C%20BWV%20846%2C%20from%20Bachs%20Well-tempered%20Clavier%2C%20Gulda%20pianist.mp3"),
+        // Bach - each piece has its own unique recording
+        ("bach_prelude_c", "https://archive.org/download/bach-well-tempered-clavier-book-1/Kimiko%20Ishizaka%20-%20Bach-%20Well-Tempered%20Clavier%2C%20Book%201%20-%2001%20Prelude%20No.%201%20in%20C%20major%2C%20BWV%20846.mp3"),
+        ("bach_fugue_c", "https://archive.org/download/bach-well-tempered-clavier-book-1/Kimiko%20Ishizaka%20-%20Bach-%20Well-Tempered%20Clavier%2C%20Book%201%20-%2004%20Fugue%20No.%202%20in%20C%20minor%2C%20BWV%20847.mp3"),
+        ("bach_invention", "https://archive.org/download/BachInventionNo.1/Bach%20invention%20no.1.mp3"),
         ("bach_toccata", "https://archive.org/download/ToccataAndFugueInDMinorBWV565/Toccata%20and%20Fugue%20in%20D%20Minor%2C%20BWV%20565.mp3"),
+        // Beethoven - each piece has its own unique recording
         ("beethoven_elise", "https://archive.org/download/beethoven-fur-elise/Beethoven%20-%20F%C3%BCr%20Elise%20.mp3"),
         ("beethoven_moonlight", "https://archive.org/download/MoonlightSonata_845/Sonata_no_14_in_c_sharp_minor_moonlight_op_27_no_2_Iii.Presto.mp3"),
-        ("beethoven_ode", "https://archive.org/download/LudwigVanBeethovenSymphonyNo.5Full/Ludwig%20van%20Beethoven%20-%20Symphony%20No.%205%20%5BFull%5D.mp3"),
+        ("beethoven_ode", "https://archive.org/download/lp_beethoven-ode-to-joy_arturo-toscanini-nbc-symphony-orchestra/disc1/01.01.%20Fourth%20Movement%3A%20Presto%20%28Part%201%29.mp3"),
         ("beethoven_5th", "https://archive.org/download/LudwigVanBeethovenSymphonyNo.5Full/Ludwig%20van%20Beethoven%20-%20Symphony%20No.%205%20%5BFull%5D.mp3"),
-        ("beethoven_pathetique", "https://archive.org/download/MoonlightSonata_845/Sonata_no_14_in_c_sharp_minor_moonlight_op_27_no_2_Iii.Presto.mp3"),
+        ("beethoven_pathetique", "https://archive.org/download/BeethovenPathetiqueSonata/Beethoven__Piano_Sonata_Pathetique__Arthur_Rubenstein.mp3"),
+        // Schoenberg
         ("schoenberg_suite", "https://archive.org/download/lp_piano-music_arnold-schoenberg-jurg-von-vintschger/disc1/02.01.%20Side%202%3A%205%20Piano%20Pieces%2C%20Op.%2023%3A%20No.%201%3B%20No.%202%3B%20No.%203%3B%20No.%204%3B%20No.%205%3B%20Suite%20For%20Piano%2C%20Op.%2025%3A%20Praeludium%3B%20Gavotte%20-%20Musette%20-%20Gavotte%3B%20Intermezzo%3B%20Menuett%3B%20Gigue.mp3"),
         ("schoenberg_variations", "https://archive.org/download/musicofarnoldsch00scho/03_Three_little_orchestra_pieces__1910.mp3"),
         ("schoenberg_quartet", "https://archive.org/download/lp_quintet-for-wind-instruments-op-26_arnold-schoenberg-philadelphia-woodwind-qu/disc1/01.01.%20Quintet%20For%20Wind%20Instruments%2C%20Op.%2026%3A%20I%20-%20Schwungvoll.mp3"),
