@@ -165,7 +165,7 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
     // Create window
     let window = Window::new(WindowSettings {
         title: "Data Walker - 3D".to_string(),
-        max_size: Some((1920, 1080)),
+        max_size: None,
         ..Default::default()
     })?;
 
