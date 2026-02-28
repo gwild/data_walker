@@ -62,9 +62,9 @@ DISK: raw data files only
 ## Architecture: Clean and Simple
 
 ```
-Download → Convert to base-12 → Walk Engine → REST API → Web UI
-   ↓            ↓                   ↓            ↓          ↓
-(real URLs)  (converters)      (quaternions)  (Axum)    (Three.js)
+Download → Convert to base-12 → Walk Engine → Native GUI
+   ↓            ↓                   ↓            ↓
+(real URLs)  (converters)      (quaternions)  (egui + three-d)
 ```
 
 ### NO hidden layers:
@@ -114,21 +114,20 @@ data_walker/
 │   ├── Cargo.toml             # Rust dependencies
 │   ├── sources.yaml           # SSOT: all data sources, mappings, categories
 │   ├── src/
-│   │   ├── main.rs            # CLI (serve, gui, generate-math, list, download)
+│   │   ├── main.rs            # CLI (gui, generate-thumbnails, generate-math, list, download)
 │   │   ├── config.rs          # YAML config loader
-│   │   ├── walk.rs            # 3D turtle walk engine (quaternions)
-│   │   ├── state.rs           # Thread-safe walk cache (AppState)
-│   │   ├── server.rs          # Axum REST API
+│   │   ├── walk.rs            # 3D turtle walk engine (quaternions, base-12 + base-4)
 │   │   ├── download.rs        # Downloaders (NCBI, Yahoo, GWOSC, Archive.org)
 │   │   ├── gui.rs             # Native GUI (egui + three-d)
+│   │   ├── thumbnail.rs       # Thumbnail renderer (three-d offscreen capture)
 │   │   ├── logging.rs         # Rotating file logs
 │   │   └── converters/
-│   │       ├── mod.rs          # DNA, finance, cosmos converters
-│   │       ├── audio.rs        # FFT spectrogram to base-12
+│   │       ├── mod.rs          # DNA, finance, cosmos converters (base-12 + base-4)
+│   │       ├── audio.rs        # FFT spectrogram to base-12/base-4
 │   │       └── math/           # Constants, fractals, Mandelbrot, sequences
-│   └── web/
-│       ├── index.html          # 3D walk viewer (Three.js)
-│       └── compare.html        # Multi-walk comparison tool
+│   └── .claude/skills/         # Custom slash commands
+│       ├── download/           # /download - download raw data
+│       └── authenticate-sources/ # /authenticate-sources - validate sources
 ├── CLAUDE.md
 └── README.md
 ```
@@ -159,10 +158,6 @@ cd data_walker_rs
 # Build
 cargo build --release
 
-# Serve web gallery at http://localhost:8080
-cargo run -- serve
-cargo run -- serve --port 9000
-
 # Download real data from sources
 cargo run -- download --all
 cargo run -- download --category dna
@@ -178,9 +173,33 @@ cargo run -- list --category cosmos
 # Launch native GUI
 cargo run -- gui
 
+# Generate thumbnails for gallery
+cargo run -- generate-thumbnails
+cargo run -- generate-thumbnails --size 256
+
 # Run tests
 cargo test
 ```
+
+---
+
+## Skills (Slash Commands)
+
+| Skill | Description |
+|-------|-------------|
+| `/download` | Download raw data (`--all`, `--category <name>`, `--source <id>`) |
+| `/authenticate-sources` | Validate all sources have real URLs and data on disk |
+
+---
+
+## ABSOLUTE RULE: RELATIVE PATHS ONLY
+
+**NEVER use absolute paths in any code, config, or skill files.**
+
+- Use relative paths from the working directory (`data_walker_rs/`)
+- `sources.yaml` not `/home/user/data_walker/data_walker_rs/sources.yaml`
+- `data/audio/dog.wav` not `/home/user/data_walker/data_walker_rs/data/audio/dog.wav`
+- `cargo run -- download` not `cd /home/user/... && cargo run -- download`
 
 ---
 

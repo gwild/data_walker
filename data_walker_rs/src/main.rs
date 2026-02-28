@@ -1,7 +1,8 @@
 //! Data Walker - Rust Implementation
 //!
 //! CLI commands:
-//! - serve: Start HTTP server
+//! - gui: Launch native 3D viewer
+//! - generate-thumbnails: Render walk thumbnails
 //! - generate-math: Generate math-based walks
 //! - list: List available sources
 //! - download: Download data from sources
@@ -11,8 +12,6 @@ mod converters;
 mod download;
 mod gui;
 mod logging;
-mod server;
-mod state;
 mod thumbnail;
 mod walk;
 
@@ -33,13 +32,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start HTTP server
-    Serve {
-        /// Port to listen on
-        #[arg(short, long, default_value = "8080")]
-        port: u16,
-    },
-
     /// Launch native GUI viewer
     Gui,
 
@@ -60,7 +52,7 @@ enum Commands {
     /// Generate thumbnail images for all sources
     GenerateThumbnails {
         /// Output directory for thumbnails
-        #[arg(short, long, default_value = "web/thumbnails")]
+        #[arg(short, long, default_value = "thumbnails")]
         output: PathBuf,
 
         /// Thumbnail size in pixels
@@ -108,11 +100,6 @@ async fn main() -> anyhow::Result<()> {
     let secrets = config::Secrets::load();
 
     match cli.command {
-        Commands::Serve { port } => {
-            let state = state::AppState::new(config, secrets.data_dir);
-            server::serve(state, port).await?;
-        }
-
         Commands::Gui => {
             // Kill any existing instance first
             kill_existing_instances();
