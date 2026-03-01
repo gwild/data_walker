@@ -444,6 +444,7 @@ fn default_config() -> config::Config {
 
     config::Config {
         mappings,
+        mappings_base6: HashMap::new(),
         categories,
         converters: HashMap::new(),
         sources,

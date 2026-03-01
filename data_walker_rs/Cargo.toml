@@ -41,6 +41,7 @@ eframe = "0.29"
 egui = "0.29"
 egui_plot = "0.29"
 three-d = { version = "0.18", features = ["egui-gui"] }
+winit = "0.28"
 
 # Screenshot
 image = { version = "0.25", default-features = false, features = ["png"] }

@@ -12,6 +12,8 @@ pub type Mapping = [u8; 12];
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub mappings: HashMap<String, Vec<u8>>,
+    #[serde(default)]
+    pub mappings_base6: HashMap<String, Vec<u8>>,
     pub categories: HashMap<String, String>,
     pub converters: HashMap<String, String>,
     pub sources: Vec<Source>,
@@ -59,6 +61,20 @@ impl Config {
             .unwrap_or([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
     }
 
+    /// Get a base-6 mapping by name, returns identity if not found
+    pub fn get_mapping_base6(&self, name: &str) -> [u8; 6] {
+        self.mappings_base6
+            .get(name)
+            .map(|v| {
+                let mut arr = [0u8; 6];
+                for (i, &val) in v.iter().take(6).enumerate() {
+                    arr[i] = val;
+                }
+                arr
+            })
+            .unwrap_or([0, 1, 2, 3, 4, 5])
+    }
+
     /// Get source by ID
     pub fn get_source(&self, id: &str) -> Option<&Source> {
         self.sources.iter().find(|s| s.id == id)
@@ -94,6 +110,7 @@ mod tests {
     fn test_identity_mapping() {
         let config = Config {
             mappings: HashMap::new(),
+            mappings_base6: HashMap::new(),
             categories: HashMap::new(),
             converters: HashMap::new(),
             sources: vec![],

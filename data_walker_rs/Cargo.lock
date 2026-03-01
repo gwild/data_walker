@@ -1054,6 +1054,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "winit 0.28.7",
 ]
 
 [[package]]

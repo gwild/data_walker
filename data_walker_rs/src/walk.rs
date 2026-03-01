@@ -163,6 +163,47 @@ pub fn walk_base4(base4: &[u8], max_points: usize) -> Vec<[f32; 3]> {
     }
 }
 
+/// Walk a base-6 sequence through 3D space (translations only, no rotations)
+///
+/// # Arguments
+/// * `base6` - Array of digits 0-5
+/// * `mapping` - Permutation array [6] remapping digits to directions
+/// * `max_points` - Maximum points to return
+///
+/// # Directions (after mapping)
+/// 0: +X, 1: -X, 2: +Y, 3: -Y, 4: +Z, 5: -Z
+pub fn walk_base6(base6: &[u8], mapping: &[u8; 6], max_points: usize) -> Vec<[f32; 3]> {
+    if base6.is_empty() {
+        return vec![[0.0, 0.0, 0.0]];
+    }
+
+    let mut path = Vec::with_capacity(base6.len().min(max_points));
+    let mut pos = [0.0f32, 0.0, 0.0];
+
+    for &digit in base6 {
+        let d = mapping[(digit % 6) as usize] as usize;
+        let dir = LOCAL_DIRS[d % 6];
+        pos[0] += dir[0];
+        pos[1] += dir[1];
+        pos[2] += dir[2];
+        path.push(pos);
+    }
+
+    // Subsample if too many points
+    if path.len() <= max_points {
+        path
+    } else {
+        let step = (path.len() as f32 / max_points as f32).ceil() as usize;
+        let mut result: Vec<[f32; 3]> = path.iter().step_by(step).copied().collect();
+        if result.last() != path.last() {
+            if let Some(&last) = path.last() {
+                result.push(last);
+            }
+        }
+        result
+    }
+}
+
 /// Get mapping by name
 pub fn named_mapping(name: &str) -> [u8; 12] {
     match name {

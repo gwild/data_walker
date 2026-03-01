@@ -152,6 +152,7 @@ pub fn wav_to_base(path: &Path, base: u32) -> anyhow::Result<Vec<u8>> {
 
     Ok(match base {
         4 => audio_to_base4(&mono, sample_rate),
+        6 => audio_to_base12(&mono, sample_rate).iter().map(|&d| d % 6).collect(),
         _ => audio_to_base12(&mono, sample_rate),
     })
 }

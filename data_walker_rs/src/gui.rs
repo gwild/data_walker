@@ -162,12 +162,28 @@ fn calculate_average_path_position(
 
 /// Run the native 3D GUI viewer using three-d
 pub fn run_viewer(config: Config) -> anyhow::Result<()> {
-    // Create window
-    let window = Window::new(WindowSettings {
-        title: "Data Walker - 3D".to_string(),
-        max_size: None,
-        ..Default::default()
-    })?;
+    // Create winit event loop and window manually for fullscreen toggle access
+    use winit::event_loop::EventLoop;
+    use winit::window::WindowBuilder;
+
+    let event_loop = EventLoop::new();
+    let winit_window = WindowBuilder::new()
+        .with_title("Data Walker - 3D")
+        .with_maximized(true)
+        .build(&event_loop)?;
+    winit_window.focus_window();
+
+    // Stash a raw pointer so the render callback can toggle fullscreen.
+    // SAFETY: the winit window lives for the entire render_loop; the pointer
+    // is never used after the loop exits.
+    let winit_ptr = &winit_window as *const winit::window::Window as usize;
+
+    let window = Window::from_winit_window(
+        winit_window,
+        event_loop,
+        SurfaceSettings::default(),
+        true, // maximized
+    )?;
 
     let context = window.gl();
 
@@ -222,6 +238,14 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
     let mut flight_loop = false;             // Enable looping
     let mut flight_loop_mode: u8 = 0;        // 0 = Repeat, 1 = Fwd/Rev (ping-pong)
     let mut show_loop_menu = false;          // Dropdown visibility
+    let mut fullscreen_plot = false;          // ESC toggles panels off for pure plot
+    let mut smooth_cam_pos: Option<Vec3> = None;   // Smoothed camera position
+    let mut smooth_cam_target: Option<Vec3> = None; // Smoothed look target
+
+    // Track which slider has focus for arrow key control
+    #[derive(Clone, Copy, PartialEq)]
+    enum FocusedSlider { None, MaxPoints, PointScale, LineScale, FlightSpeed, FlightProgress }
+    let mut focused_slider = FocusedSlider::None;
 
     // GUI state
     let mut gui = GUI::new(&context);
@@ -239,9 +263,51 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
     window.render_loop(move |mut frame_input| {
         // Handle keyboard events (spacebar for play/pause)
         for event in &frame_input.events {
-            if let three_d::Event::KeyPress { kind, .. } = event {
+            if let three_d::Event::KeyPress { kind, modifiers, .. } = event {
                 if *kind == three_d::Key::Space && flight_mode {
                     flight_playing = !flight_playing;
+                }
+                if *kind == three_d::Key::Escape {
+                    fullscreen_plot = !fullscreen_plot;
+                    // Toggle borderless fullscreen via the winit window handle
+                    // SAFETY: winit_ptr points to the window owned by render_loop's self,
+                    // which is alive for the entire loop.
+                    let ww = unsafe { &*(winit_ptr as *const winit::window::Window) };
+                    if fullscreen_plot {
+                        ww.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                        ww.set_cursor_visible(false);
+                    } else {
+                        ww.set_fullscreen(None);
+                        ww.set_cursor_visible(true);
+                    }
+                }
+                // Arrow keys adjust focused slider; shift = fine control
+                if *kind == three_d::Key::ArrowRight || *kind == three_d::Key::ArrowLeft {
+                    let sign = if *kind == three_d::Key::ArrowRight { 1.0 } else { -1.0 };
+                    let fine = if modifiers.shift { 0.1 } else { 1.0 };
+                    match focused_slider {
+                        FocusedSlider::MaxPoints => {
+                            let step = if modifiers.shift { 10.0 } else { 100.0 };
+                            max_points = (max_points as f32 + sign * step).clamp(100.0, 10000.0) as usize;
+                        }
+                        FocusedSlider::PointScale => {
+                            let step = if modifiers.shift { 0.01 } else { 0.05 };
+                            point_scale = (point_scale + sign * step).clamp(0.1, 1.0);
+                        }
+                        FocusedSlider::LineScale => {
+                            let step = if modifiers.shift { 0.01 } else { 0.05 };
+                            line_scale = (line_scale + sign * step).clamp(0.05, 2.0);
+                        }
+                        FocusedSlider::FlightSpeed => {
+                            let step = if modifiers.shift { 0.1 } else { 1.0 } * fine;
+                            flight_speed = (flight_speed + sign * step).clamp(0.01, 60.0);
+                        }
+                        FocusedSlider::FlightProgress => {
+                            let step = if modifiers.shift { 0.001 } else { 0.01 };
+                            flight_progress = (flight_progress + sign * step).clamp(0.0, 1.0);
+                        }
+                        FocusedSlider::None => {}
+                    }
                 }
             }
         }
@@ -378,16 +444,30 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
 
                     let offset_distance = 15.0;
                     let offset_height = 5.0;
-                    let camera_pos = current_pos - direction * offset_distance + cam_up * offset_height;
+                    let desired_pos = current_pos - direction * offset_distance + cam_up * offset_height;
 
                     // Look target: ahead or behind based on toggle
-                    let look_target = if flight_look_back {
+                    let desired_target = if flight_look_back {
                         current_pos - direction * 10.0
                     } else {
                         next_pos
                     };
 
-                    camera.set_view(camera_pos, look_target, up);
+                    // Exponential smoothing for buttery camera motion
+                    // Smoothing factor: higher = snappier, lower = smoother
+                    let smooth_factor = (8.0 * delta).min(1.0);
+                    let cam_pos = match smooth_cam_pos {
+                        Some(prev) => prev + (desired_pos - prev) * smooth_factor,
+                        None => desired_pos,
+                    };
+                    let cam_target = match smooth_cam_target {
+                        Some(prev) => prev + (desired_target - prev) * smooth_factor,
+                        None => desired_target,
+                    };
+                    smooth_cam_pos = Some(cam_pos);
+                    smooth_cam_target = Some(cam_target);
+
+                    camera.set_view(cam_pos, cam_target, up);
                 }
             }
         }
@@ -543,10 +623,13 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
             }
         }
 
+        // Derive axis/grid extent from tick spacing (show ~10 ticks worth)
+        let axis_extent = if axis_ticks == 0 { 100.0 } else { (axis_ticks as f32) * 10.0 };
+
         // Grid using thin cylinders
         let grid_objects: Vec<Gm<InstancedMesh, ColorMaterial>> = if show_grid {
-            let grid_size = 200.0;
-            let grid_step = 20.0;
+            let grid_size = axis_extent;
+            let grid_step = if axis_ticks == 0 { 20.0 } else { axis_ticks as f32 };
             let grid_color = Srgba::new(60, 60, 80, 255);
 
             let mut instances = Instances::default();
@@ -592,6 +675,7 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
             frame_input.viewport,
             frame_input.device_pixel_ratio,
             |egui_ctx| {
+                if fullscreen_plot { /* skip all panels */ } else {
                 egui::SidePanel::left("walks_panel").min_width(250.0).show(egui_ctx, |ui| {
                     ui.heading("Data Walks");
                     ui.separator();
@@ -604,22 +688,30 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                             .selected_text(format!("{}", selected_base))
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut selected_base, 12, "12");
+                                ui.selectable_value(&mut selected_base, 6, "6");
                                 ui.selectable_value(&mut selected_base, 4, "4");
                             });
                         ui.label("Mapping:");
-                        let mapping_enabled = selected_base == 12;
+                        let mapping_enabled = selected_base == 12 || selected_base == 6;
                         ui.add_enabled_ui(mapping_enabled, |ui| {
                             egui::ComboBox::from_id_salt("mapping")
                                 .selected_text(&selected_mapping)
                                 .show_ui(ui, |ui| {
-                                    for name in config.mappings.keys() {
+                                    let mapping_keys: Vec<String> = if selected_base == 6 {
+                                        config.mappings_base6.keys().cloned().collect()
+                                    } else {
+                                        config.mappings.keys().cloned().collect()
+                                    };
+                                    for name in &mapping_keys {
                                         ui.selectable_value(&mut selected_mapping, name.clone(), name);
                                     }
                                 });
                         });
                     });
 
-                    ui.add(egui::Slider::new(&mut max_points, 100..=10000).text("Max points"));
+                    if ui.add(egui::Slider::new(&mut max_points, 100..=10000).text("Max points")).clicked() {
+                        focused_slider = FocusedSlider::MaxPoints;
+                    }
 
                     ui.horizontal(|ui| {
                         if ui.button("Deselect All").clicked() {
@@ -646,10 +738,14 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                         ui.checkbox(&mut show_lines, "Lines");
                     });
                     if show_points {
-                        ui.add(egui::Slider::new(&mut point_scale, 0.1..=1.0).text("Point scale"));
+                        if ui.add(egui::Slider::new(&mut point_scale, 0.1..=1.0).text("Point scale")).clicked() {
+                            focused_slider = FocusedSlider::PointScale;
+                        }
                     }
                     if show_lines {
-                        ui.add(egui::Slider::new(&mut line_scale, 0.05..=2.0).text("Line scale"));
+                        if ui.add(egui::Slider::new(&mut line_scale, 0.05..=2.0).text("Line scale")).clicked() {
+                            focused_slider = FocusedSlider::LineScale;
+                        }
                     }
                     ui.horizontal(|ui| {
                         ui.label("Ticks:");
@@ -662,6 +758,9 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                                 ui.selectable_value(&mut axis_ticks, 10, "10");
                                 ui.selectable_value(&mut axis_ticks, 20, "20");
                                 ui.selectable_value(&mut axis_ticks, 50, "50");
+                                ui.selectable_value(&mut axis_ticks, 100, "100");
+                                ui.selectable_value(&mut axis_ticks, 1000, "1000");
+                                ui.selectable_value(&mut axis_ticks, 10000, "10000");
                             });
                     });
 
@@ -691,12 +790,16 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
 
                         ui.horizontal(|ui| {
                             ui.label("Speed:");
-                            ui.add(egui::Slider::new(&mut flight_speed, 0.01..=60.0).logarithmic(true).suffix(" Hz"));
+                            if ui.add(egui::Slider::new(&mut flight_speed, 0.01..=60.0).logarithmic(true).suffix(" Hz")).clicked() {
+                                focused_slider = FocusedSlider::FlightSpeed;
+                            }
                         });
 
                         ui.horizontal(|ui| {
                             ui.label("Progress:");
-                            ui.add(egui::Slider::new(&mut flight_progress, 0.0..=1.0));
+                            if ui.add(egui::Slider::new(&mut flight_progress, 0.0..=1.0)).clicked() {
+                                focused_slider = FocusedSlider::FlightProgress;
+                            }
                         });
 
                         ui.horizontal(|ui| {
@@ -737,6 +840,8 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                         if ui.button("Reset to Start").clicked() {
                             flight_progress = if flight_reverse { 1.0 } else { 0.0 };
                             flight_playing = false;
+                            smooth_cam_pos = None;
+                            smooth_cam_target = None;
                         }
                     }
 
@@ -808,6 +913,7 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                         }
                     });
                 });
+                } // end if !fullscreen_plot
 
                 // Axis labels in screen space
                 if show_axes {
@@ -840,10 +946,11 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                     };
 
                     // Axis name labels at ends
+                    let label_offset = axis_extent * 1.05;
                     let axis_label_pos: [(&str, Vec3, egui::Color32); 3] = [
-                        ("X", vec3(105.0, 0.0, 0.0), egui::Color32::from_rgb(220, 50, 50)),
-                        ("Y", vec3(0.0, 105.0, 0.0), egui::Color32::from_rgb(50, 220, 50)),
-                        ("Z", vec3(0.0, 0.0, 105.0), egui::Color32::from_rgb(50, 100, 220)),
+                        ("X", vec3(label_offset, 0.0, 0.0), egui::Color32::from_rgb(220, 50, 50)),
+                        ("Y", vec3(0.0, label_offset, 0.0), egui::Color32::from_rgb(50, 220, 50)),
+                        ("Z", vec3(0.0, 0.0, label_offset), egui::Color32::from_rgb(50, 100, 220)),
                     ];
 
                     for (label, world_pos, color) in &axis_label_pos {
@@ -861,7 +968,7 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                     // Numeric tick labels - directly on axes, no offset
                     if axis_ticks > 0 {
                         let spacing = axis_ticks as f32;
-                        let axis_len = 100.0;
+                        let axis_len = axis_extent;
 
                         // X axis ticks (red)
                         let x_color = egui::Color32::from_rgb(220, 120, 120);
@@ -968,6 +1075,19 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
             },
         );
 
+        // Reset mapping to first valid one when base changes
+        if selected_base != prev_base {
+            if selected_base == 6 {
+                if !config.mappings_base6.contains_key(&selected_mapping) {
+                    selected_mapping = config.mappings_base6.keys().next().cloned().unwrap_or("Split".to_string());
+                }
+            } else if selected_base == 12 {
+                if !config.mappings.contains_key(&selected_mapping) {
+                    selected_mapping = "Identity".to_string();
+                }
+            }
+        }
+
         // Regenerate walks if mapping, base, or max_points changed
         if selected_mapping != prev_mapping || max_points != prev_max_points || selected_base != prev_base {
             prev_mapping = selected_mapping.clone();
@@ -995,7 +1115,7 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
 
         // Render axes
         if show_axes {
-            let axis_len = 100.0;
+            let axis_len = axis_extent;
             let axis_radius = 0.4;
             let axes_data: [(Vec3, Srgba); 3] = [
                 (vec3(1.0, 0.0, 0.0), Srgba::new(220, 50, 50, 255)),   // X = red
@@ -1034,7 +1154,7 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
             let tick_size = 1.5;
             let tick_radius = 0.3;
             let spacing = axis_ticks as f32;
-            let axis_len = 100.0;
+            let axis_len = axis_extent;
             let tick_color = Srgba::new(180, 180, 180, 255);
 
             let mut instances = Instances::default();
@@ -1175,16 +1295,16 @@ fn load_walk_data(
     color: [f32; 3],
 ) -> Option<WalkData> {
     use crate::converters;
-    use crate::walk::walk_base4;
+    use crate::walk::{walk_base4, walk_base6};
 
     // All conversion happens on-the-fly - no pre-computed storage
     let digits = if source.converter.starts_with("math.") {
-        // Math always generates base-12; for base-4, reduce mod 4
+        // Math always generates base-12; reduce mod target base
         let base12 = MathGenerator::from_converter_string(&source.converter)?.generate(max_points);
-        if base == 4 {
-            base12.iter().map(|&d| d % 4).collect()
-        } else {
-            base12
+        match base {
+            4 => base12.iter().map(|&d| d % 4).collect(),
+            6 => base12.iter().map(|&d| d % 6).collect(),
+            _ => base12,
         }
     } else {
         match source.converter.as_str() {
@@ -1268,19 +1388,24 @@ fn load_walk_data(
 
     info!("Loaded {} base-{} digits for {}", digits.len(), base, source.id);
 
-    let points = if base == 4 {
-        walk_base4(&digits, max_points)
-    } else {
-        let mapping = config.mappings.get(mapping_name)
-            .map(|v| {
-                let mut arr = [0u8; 12];
-                for (i, &val) in v.iter().enumerate().take(12) {
-                    arr[i] = val;
-                }
-                arr
-            })
-            .unwrap_or([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
-        walk_base12(&digits, &mapping, max_points)
+    let points = match base {
+        4 => walk_base4(&digits, max_points),
+        6 => {
+            let mapping = config.get_mapping_base6(mapping_name);
+            walk_base6(&digits, &mapping, max_points)
+        }
+        _ => {
+            let mapping = config.mappings.get(mapping_name)
+                .map(|v| {
+                    let mut arr = [0u8; 12];
+                    for (i, &val) in v.iter().enumerate().take(12) {
+                        arr[i] = val;
+                    }
+                    arr
+                })
+                .unwrap_or([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+            walk_base12(&digits, &mapping, max_points)
+        }
     };
     info!("Generated {} walk points for {}", points.len(), source.id);
 

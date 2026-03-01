@@ -186,6 +186,7 @@ pub fn load_dna_raw(path: &Path, base: u32) -> anyhow::Result<Vec<u8>> {
 
     Ok(match base {
         4 => convert_dna_base4(&sequence),
+        6 => convert_dna(&sequence).iter().map(|&d| d % 6).collect(),
         _ => convert_dna(&sequence),
     })
 }
@@ -208,6 +209,7 @@ pub fn load_finance_raw(path: &Path, base: u32) -> anyhow::Result<Vec<u8>> {
 
     Ok(match base {
         4 => convert_finance_base4(&prices),
+        6 => convert_finance(&prices).iter().map(|&d| d % 6).collect(),
         _ => convert_finance(&prices),
     })
 }
@@ -244,6 +246,7 @@ pub fn load_cosmos_raw(path: &Path, base: u32) -> anyhow::Result<Vec<u8>> {
 
     Ok(match base {
         4 => convert_cosmos_base4(&strain_values),
+        6 => convert_cosmos(&strain_values).iter().map(|&d| d % 6).collect(),
         _ => convert_cosmos(&strain_values),
     })
 }
@@ -349,6 +352,7 @@ fn load_mp3_raw(path: &Path, base: u32) -> anyhow::Result<Vec<u8>> {
 
     Ok(match base {
         4 => audio::audio_to_base4(&samples, sample_rate),
+        6 => audio::audio_to_base12(&samples, sample_rate).iter().map(|&d| d % 6).collect(),
         _ => audio::audio_to_base12(&samples, sample_rate),
     })
 }
