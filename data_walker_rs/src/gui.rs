@@ -754,7 +754,18 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                                     let is_available = check_data_exists(&source.id, &source.converter, &source.url);
 
                                     if is_available {
-                                        if ui.checkbox(&mut checked, &source.name).changed() {
+                                        // Show label in the walk's plot color if selected
+                                        let label = if let Some(walk) = walks.get(&source.id) {
+                                            let c = walk.color;
+                                            egui::RichText::new(&source.name).color(egui::Color32::from_rgb(
+                                                (c[0] * 255.0) as u8,
+                                                (c[1] * 255.0) as u8,
+                                                (c[2] * 255.0) as u8,
+                                            ))
+                                        } else {
+                                            egui::RichText::new(&source.name)
+                                        };
+                                        if ui.checkbox(&mut checked, label).changed() {
                                             if checked {
                                                 selected_sources.insert(source.id.clone());
                                                 // Get color from pool for maximum contrast
