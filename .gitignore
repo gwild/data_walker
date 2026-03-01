@@ -6,8 +6,10 @@ data_walker_rs/target/
 venv/
 .venv/
 
-# Claude local settings
-.claude/
+# Claude - local/personal files only
+.claude/settings.local.json
+.claude/*.local.json
+.claude/*.local.md
 
 # OS
 .DS_Store
