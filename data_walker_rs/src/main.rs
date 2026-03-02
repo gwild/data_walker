@@ -74,10 +74,55 @@ enum Commands {
         #[arg(long)]
         all: bool,
     },
+
+    /// Search and download from Freesound
+    Freesound {
+        #[command(subcommand)]
+        action: FreesoundAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum FreesoundAction {
+    /// Search for sounds
+    Search {
+        /// Search query
+        query: String,
+
+        /// Maximum results
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+
+    /// Download a sound by ID
+    Download {
+        /// Freesound sound ID
+        sound_id: u64,
+
+        /// Output source ID (filename without extension)
+        #[arg(short, long)]
+        id: Option<String>,
+
+        /// Add to sources.yaml with this name
+        #[arg(short, long)]
+        name: Option<String>,
+
+        /// Category for sources.yaml
+        #[arg(long, default_value = "audio")]
+        category: String,
+
+        /// Subcategory for sources.yaml
+        #[arg(long)]
+        subcategory: Option<String>,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load .env file (look in current dir and parent)
+    let _ = dotenvy::from_filename(".env")
+        .or_else(|_| dotenvy::from_filename("../.env"));
+
     // Initialize logging first
     logging::init_logging("logs");
     tracing::info!("Data Walker starting up");
@@ -130,6 +175,55 @@ async fn main() -> anyhow::Result<()> {
                 download_source(&config, &id, &data_dir).await?;
             } else {
                 println!("Specify --source, --category, or --all");
+            }
+        }
+
+        Commands::Freesound { action } => {
+            match action {
+                FreesoundAction::Search { query, limit } => {
+                    println!("Searching Freesound for: {}", query);
+                    let results = download::search_freesound(&query, limit).await?;
+                    println!("\nFound {} results:\n", results.len());
+                    println!("{:>8}  {:>6}  {:<30}  {:<20}  {}", "ID", "Dur(s)", "Name", "User", "License");
+                    println!("{}", "-".repeat(100));
+                    for r in results {
+                        let license_short = r.license.rsplit('/').nth(1).unwrap_or(&r.license);
+                        let name_disp = if r.name.len() > 30 {
+                            format!("{}...", &r.name[..27])
+                        } else {
+                            r.name.clone()
+                        };
+                        let user_disp = if r.username.len() > 20 {
+                            format!("{}...", &r.username[..17])
+                        } else {
+                            r.username.clone()
+                        };
+                        println!("{:>8}  {:>6.1}  {:<30}  {:<20}  {}",
+                            r.id, r.duration, name_disp, user_disp, license_short
+                        );
+                    }
+                    println!("\nTo download: cargo run -- freesound download <ID> --id <source_id> --name \"Display Name\"");
+                }
+                FreesoundAction::Download { sound_id, id, name, category, subcategory } => {
+                    let output_id = id.unwrap_or_else(|| format!("freesound_{}", sound_id));
+                    let output_dir = PathBuf::from("data/audio");
+
+                    let path = download::download_freesound(sound_id, &output_id, &output_dir).await?;
+                    println!("Downloaded to: {:?}", path);
+
+                    // Add to sources.yaml if name provided
+                    if let Some(display_name) = name {
+                        let subcat = subcategory.unwrap_or_else(|| "Freesound".to_string());
+                        println!("\nAdd this to sources.yaml:\n");
+                        println!("  - id: {}", output_id);
+                        println!("    name: \"{}\"", display_name);
+                        println!("    category: {}", category);
+                        println!("    subcategory: {}", subcat);
+                        println!("    converter: audio");
+                        println!("    mapping: Optimal");
+                        println!("    url: \"https://freesound.org/s/{}\"", sound_id);
+                    }
+                }
             }
         }
     }

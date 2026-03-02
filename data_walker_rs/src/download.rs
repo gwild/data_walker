@@ -350,6 +350,120 @@ pub async fn download_finance(symbol: &str, output_dir: &PathBuf) -> Result<Path
     Ok(path)
 }
 
+/// Download audio from Freesound API
+/// Requires FREESOUND_API_KEY in .env
+pub async fn download_freesound(sound_id: u64, output_id: &str, output_dir: &PathBuf) -> Result<PathBuf> {
+    let api_key = std::env::var("FREESOUND_API_KEY")
+        .map_err(|_| anyhow::anyhow!("FREESOUND_API_KEY not set in .env"))?;
+
+    tracing::info!("Downloading Freesound #{}: {}", sound_id, output_id);
+
+    // Get sound info
+    let info_url = format!(
+        "https://freesound.org/apiv2/sounds/{}/?token={}",
+        sound_id, api_key
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
+
+    let response = client.get(&info_url)
+        .header("User-Agent", "DataWalker/0.1 (github.com/gwild/data_walker)")
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("Freesound API returned status {}", response.status());
+    }
+
+    let info: serde_json::Value = response.json().await?;
+
+    // Get preview URL (high quality MP3, no OAuth required)
+    let preview_url = info["previews"]["preview-hq-mp3"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("No preview URL found for sound {}", sound_id))?;
+
+    let name = info["name"].as_str().unwrap_or("unknown");
+    let username = info["username"].as_str().unwrap_or("unknown");
+    let license = info["license"].as_str().unwrap_or("unknown");
+
+    tracing::info!("Sound: '{}' by {} ({})", name, username, license);
+    tracing::debug!("Downloading from: {}", preview_url);
+
+    // Download the preview MP3
+    let response = client.get(preview_url)
+        .header("User-Agent", "DataWalker/0.1")
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("Failed to download preview: {}", response.status());
+    }
+
+    let mp3_data = response.bytes().await?;
+    tracing::debug!("Downloaded {} bytes", mp3_data.len());
+
+    // Save MP3
+    std::fs::create_dir_all(output_dir)?;
+    let path = output_dir.join(format!("{}.mp3", output_id));
+    std::fs::write(&path, &mp3_data)?;
+    tracing::info!("Saved to {:?}", path);
+
+    Ok(path)
+}
+
+/// Search Freesound for sounds matching a query
+/// Returns list of (id, name, username, duration, license)
+pub async fn search_freesound(query: &str, max_results: usize) -> Result<Vec<FreesoundResult>> {
+    let api_key = std::env::var("FREESOUND_API_KEY")
+        .map_err(|_| anyhow::anyhow!("FREESOUND_API_KEY not set in .env"))?;
+
+    let search_url = format!(
+        "https://freesound.org/apiv2/search/text/?query={}&token={}&page_size={}&fields=id,name,username,duration,license",
+        urlencoding::encode(query),
+        api_key,
+        max_results
+    );
+
+    let client = reqwest::Client::new();
+    let response = client.get(&search_url)
+        .header("User-Agent", "DataWalker/0.1")
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("Freesound search failed: {}", response.status());
+    }
+
+    let json: serde_json::Value = response.json().await?;
+    let results = json["results"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Invalid search response"))?;
+
+    let mut out = Vec::new();
+    for r in results {
+        out.push(FreesoundResult {
+            id: r["id"].as_u64().unwrap_or(0),
+            name: r["name"].as_str().unwrap_or("").to_string(),
+            username: r["username"].as_str().unwrap_or("").to_string(),
+            duration: r["duration"].as_f64().unwrap_or(0.0),
+            license: r["license"].as_str().unwrap_or("").to_string(),
+        });
+    }
+
+    Ok(out)
+}
+
+#[derive(Debug, Clone)]
+pub struct FreesoundResult {
+    pub id: u64,
+    pub name: String,
+    pub username: String,
+    pub duration: f64,
+    pub license: String,
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

@@ -24,3 +24,4 @@ debug.log
 data_walker_rs/data/
 data_walker_rs/logs/
 data_walker_rs/screenshots/
+.env

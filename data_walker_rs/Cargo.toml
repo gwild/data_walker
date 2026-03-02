@@ -25,6 +25,7 @@ symphonia = { version = "0.5", features = ["mp3"] }  # MP3 decoding
 # Downloads
 reqwest = { version = "0.12", features = ["json", "gzip"] }
 flate2 = "1"
+urlencoding = "2"
 
 # Utilities
 thiserror = "1"
