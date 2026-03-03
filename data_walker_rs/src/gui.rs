@@ -359,6 +359,7 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
             let pos = camera.position();
             let target = camera.target();
             let mut dir = pos - target;
+            let mut up = camera.up();
 
             // Rotation speeds in radians per frame (speed slider is 0-2, so multiply by 0.02)
             let speed_factor = 0.02;
@@ -372,6 +373,10 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                 let new_z = dir.x * sin_a + dir.z * cos_a;
                 dir.x = new_x;
                 dir.z = new_z;
+                let new_ux = up.x * cos_a - up.z * sin_a;
+                let new_uz = up.x * sin_a + up.z * cos_a;
+                up.x = new_ux;
+                up.z = new_uz;
             }
 
             // Rotate around X axis (vertical tilt)
@@ -383,6 +388,10 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                 let new_z = dir.y * sin_a + dir.z * cos_a;
                 dir.y = new_y;
                 dir.z = new_z;
+                let new_uy = up.y * cos_a - up.z * sin_a;
+                let new_uz = up.y * sin_a + up.z * cos_a;
+                up.y = new_uy;
+                up.z = new_uz;
             }
 
             // Rotate around Z axis (roll)
@@ -394,9 +403,13 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                 let new_y = dir.x * sin_a + dir.y * cos_a;
                 dir.x = new_x;
                 dir.y = new_y;
+                let new_ux = up.x * cos_a - up.y * sin_a;
+                let new_uy = up.x * sin_a + up.y * cos_a;
+                up.x = new_ux;
+                up.y = new_uy;
             }
 
-            camera.set_view(target + dir, target, vec3(0.0, 1.0, 0.0));
+            camera.set_view(target + dir, target, up);
         }
 
         // Data Flight camera update
