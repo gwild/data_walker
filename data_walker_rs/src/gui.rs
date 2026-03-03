@@ -222,10 +222,14 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
     let mut point_scale: f32 = 0.5;
     let mut line_scale: f32 = 0.3;
     let mut axis_ticks: u32 = 10;
-    let mut auto_rotate = false;
+    let mut auto_rotate_x = false;
+    let mut auto_rotate_y = false;
+    let mut auto_rotate_z = false;
+    let mut auto_rotate_speed_x: f32 = 0.5;
+    let mut auto_rotate_speed_y: f32 = 0.5;
+    let mut auto_rotate_speed_z: f32 = 0.5;
     let mut screenshot_requested = false;
     let mut screenshot_status: Option<(String, f64)> = None; // (message, expire_time)
-    let mut rotation_angle: f32 = 0.0;
 
     // Data Flight mode
     let mut flight_mode = false;
@@ -351,15 +355,48 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
         }
 
         // Auto-rotate (only when not in flight mode)
-        if auto_rotate && !flight_mode {
-            rotation_angle += 0.01;
+        if (auto_rotate_x || auto_rotate_y || auto_rotate_z) && !flight_mode {
             let pos = camera.position();
             let target = camera.target();
-            let dir = pos - target;
-            let dist = dir.magnitude();
-            let new_x = rotation_angle.cos() * dist;
-            let new_z = rotation_angle.sin() * dist;
-            camera.set_view(vec3(new_x, pos.y, new_z), target, vec3(0.0, 1.0, 0.0));
+            let mut dir = pos - target;
+
+            // Rotation speeds in radians per frame (speed slider is 0-2, so multiply by 0.02)
+            let speed_factor = 0.02;
+
+            // Rotate around Y axis (horizontal rotation)
+            if auto_rotate_y {
+                let angle = auto_rotate_speed_y * speed_factor;
+                let cos_a = angle.cos();
+                let sin_a = angle.sin();
+                let new_x = dir.x * cos_a - dir.z * sin_a;
+                let new_z = dir.x * sin_a + dir.z * cos_a;
+                dir.x = new_x;
+                dir.z = new_z;
+            }
+
+            // Rotate around X axis (vertical tilt)
+            if auto_rotate_x {
+                let angle = auto_rotate_speed_x * speed_factor;
+                let cos_a = angle.cos();
+                let sin_a = angle.sin();
+                let new_y = dir.y * cos_a - dir.z * sin_a;
+                let new_z = dir.y * sin_a + dir.z * cos_a;
+                dir.y = new_y;
+                dir.z = new_z;
+            }
+
+            // Rotate around Z axis (roll)
+            if auto_rotate_z {
+                let angle = auto_rotate_speed_z * speed_factor;
+                let cos_a = angle.cos();
+                let sin_a = angle.sin();
+                let new_x = dir.x * cos_a - dir.y * sin_a;
+                let new_y = dir.x * sin_a + dir.y * cos_a;
+                dir.x = new_x;
+                dir.y = new_y;
+            }
+
+            camera.set_view(target + dir, target, vec3(0.0, 1.0, 0.0));
         }
 
         // Data Flight camera update
@@ -472,27 +509,9 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
             }
         }
 
-        // Handle orbit control - only when cursor is in plot area (not over GUI panels)
-        // Side panel is 250px wide, bottom panel is ~25px
-        let panel_width = 260.0;
-        let bottom_panel_height = 30.0;
-        let in_plot_area = frame_input.events.iter().all(|event| {
-            match event {
-                three_d::Event::MousePress { position, .. } |
-                three_d::Event::MouseRelease { position, .. } |
-                three_d::Event::MouseMotion { position, .. } |
-                three_d::Event::MouseWheel { position, .. } => {
-                    position.x > panel_width &&
-                    position.y < (frame_input.viewport.height as f32 - bottom_panel_height)
-                }
-                _ => true,
-            }
-        });
+        // Track if egui wants pointer input (set after GUI update)
+        let mut egui_wants_pointer = false;
 
-        // Disable orbit control when in flight mode
-        if in_plot_area && !flight_mode {
-            orbit_control.handle_events(&mut camera, &mut frame_input.events);
-        }
         camera.set_viewport(frame_input.viewport);
 
         // Build line geometry for visible walks
@@ -731,8 +750,35 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut show_grid, "Grid");
                         ui.checkbox(&mut show_axes, "Axes");
-                        ui.checkbox(&mut auto_rotate, "Auto-rotate");
                     });
+
+                    // Auto-rotate controls
+                    ui.horizontal(|ui| {
+                        ui.label("Auto-rotate:");
+                        ui.checkbox(&mut auto_rotate_x, "X");
+                        ui.checkbox(&mut auto_rotate_y, "Y");
+                        ui.checkbox(&mut auto_rotate_z, "Z");
+                    });
+                    if auto_rotate_x || auto_rotate_y || auto_rotate_z {
+                        if auto_rotate_x {
+                            ui.horizontal(|ui| {
+                                ui.label("  X:");
+                                ui.add(egui::Slider::new(&mut auto_rotate_speed_x, -2.0..=2.0).show_value(false));
+                            });
+                        }
+                        if auto_rotate_y {
+                            ui.horizontal(|ui| {
+                                ui.label("  Y:");
+                                ui.add(egui::Slider::new(&mut auto_rotate_speed_y, -2.0..=2.0).show_value(false));
+                            });
+                        }
+                        if auto_rotate_z {
+                            ui.horizontal(|ui| {
+                                ui.label("  Z:");
+                                ui.add(egui::Slider::new(&mut auto_rotate_speed_z, -2.0..=2.0).show_value(false));
+                            });
+                        }
+                    }
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut show_points, "Points");
                         ui.checkbox(&mut show_lines, "Lines");
@@ -847,8 +893,13 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
 
                     ui.separator();
 
-                    // Source list
-                    egui::ScrollArea::vertical().show(ui, |ui| {
+                    // Source list - use fixed max height to prevent layout issues
+                    // The controls take ~350px, so leave that much headroom
+                    let max_scroll_height = (ui.ctx().screen_rect().height() - 400.0).max(200.0);
+                    egui::ScrollArea::vertical()
+                        .max_height(max_scroll_height)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
                         for (category, sources) in &by_category {
                             let cat_name = config.categories.get(category).unwrap_or(category);
                             egui::CollapsingHeader::new(cat_name).show(ui, |ui| {
@@ -1072,8 +1123,16 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                             }
                         });
                     });
+
+                // Check if egui wants pointer input (for dropdowns, scroll areas, etc.)
+                egui_wants_pointer = egui_ctx.wants_pointer_input();
             },
         );
+
+        // Handle orbit control AFTER GUI update - only when egui doesn't want pointer and not in flight mode
+        if !egui_wants_pointer && !flight_mode {
+            orbit_control.handle_events(&mut camera, &mut frame_input.events);
+        }
 
         // Reset mapping to first valid one when base changes
         if selected_base != prev_base {

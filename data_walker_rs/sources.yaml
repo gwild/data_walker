@@ -871,3 +871,91 @@ sources:
     converter: audio
     mapping: Optimal
     url: "https://github.com/karolpiczak/ESC-50"
+
+  - id: forest_babbling_brook
+    name: Forest Babbling Brook
+    category: environment
+    subcategory: Nature
+    converter: audio
+    mapping: Optimal
+    url: "https://freesound.org/s/846924"
+
+  - id: coyote
+    name: Coyote
+    category: animals
+    subcategory: Mammals
+    converter: audio
+    mapping: Optimal
+    url: "https://freesound.org/s/86623"
+
+  - id: coyote_2
+    name: Coyote 2
+    category: animals
+    subcategory: Mammals
+    converter: audio
+    mapping: Optimal
+    url: "https://freesound.org/s/86622"
+
+  - id: coyote_3
+    name: Coyote 3
+    category: animals
+    subcategory: Mammals
+    converter: audio
+    mapping: Optimal
+    url: "https://freesound.org/s/86621"
+
+  - id: owls_coyote
+    name: Owls & Coyote
+    category: animals
+    subcategory: Mammals
+    converter: audio
+    mapping: Optimal
+    url: "https://freesound.org/s/582346"
+
+  - id: coyote_howl
+    name: Coyote Howl
+    category: animals
+    subcategory: Mammals
+    converter: audio
+    mapping: Optimal
+    url: "https://freesound.org/s/558725"
+
+  - id: wolf_creek
+    name: Wolf (Cooper Creek)
+    category: animals
+    subcategory: Mammals
+    converter: audio
+    mapping: Optimal
+    url: "https://freesound.org/s/500646"
+
+  - id: wolf_howl
+    name: Wolf Howl
+    category: animals
+    subcategory: Mammals
+    converter: audio
+    mapping: Optimal
+    url: "https://freesound.org/s/81904"
+
+  - id: wolf_howl_2
+    name: Wolf Howl 2
+    category: animals
+    subcategory: Mammals
+    converter: audio
+    mapping: Optimal
+    url: "https://freesound.org/s/370360"
+
+  - id: wolf_howl_3
+    name: Wolf Howl 3
+    category: animals
+    subcategory: Mammals
+    converter: audio
+    mapping: Optimal
+    url: "https://freesound.org/s/267179"
+
+  - id: werewolf_howl
+    name: Werewolf Howl
+    category: animals
+    subcategory: Mammals
+    converter: audio
+    mapping: Optimal
+    url: "https://freesound.org/s/784596"

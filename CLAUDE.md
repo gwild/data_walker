@@ -203,6 +203,27 @@ cargo test
 
 ---
 
+## ABSOLUTE RULE: NEVER SHOW SECRETS
+
+**NEVER display API keys, passwords, tokens, or any secrets in output.**
+
+When checking if a secret exists:
+```bash
+# CORRECT - check existence only
+findstr /c:"API_KEY" .env >nul && echo "Key found" || echo "Key not found"
+
+# WRONG - shows the actual value
+findstr API_KEY .env
+cat .env
+```
+
+### FORBIDDEN:
+- Displaying contents of .env files
+- Showing API key values in any output
+- Logging secrets to console or files
+
+---
+
 ## Lessons Learned
 
 1. **No workarounds** - Fix problems at the source, not with filters
@@ -210,3 +231,4 @@ cargo test
 3. **SSOT** - One config file, one manifest, one truth
 4. **Verify** - "Similar" is not "same"; check the actual output
 5. **Clean data** - Generators output only real data, no baselines or junk
+6. **No secrets in output** - Never display API keys or credentials
