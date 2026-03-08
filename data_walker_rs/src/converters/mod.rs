@@ -13,6 +13,9 @@
 pub mod audio;
 pub mod math;
 
+// Re-export MidiNote for use in audio synthesis
+pub use audio::MidiNote;
+
 use std::path::Path;
 use thiserror::Error;
 
@@ -265,8 +268,22 @@ pub fn load_audio_raw(path: &Path, base: u32) -> anyhow::Result<Vec<u8>> {
     }
 }
 
-/// Load MP3 file and convert to base digits
-fn load_mp3_raw(path: &Path, base: u32) -> anyhow::Result<Vec<u8>> {
+/// Load audio file (WAV or MP3) and extract MIDI notes for accurate synthesis
+pub fn load_audio_midi_notes(path: &Path) -> anyhow::Result<Vec<MidiNote>> {
+    let ext = path.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    match ext.as_str() {
+        "wav" => audio::wav_to_midi_notes(path),
+        "mp3" => load_mp3_midi_notes(path),
+        _ => anyhow::bail!("Unsupported audio format: {}", ext),
+    }
+}
+
+/// Load MP3 file samples (shared helper for base and MIDI extraction)
+fn load_mp3_samples(path: &Path) -> anyhow::Result<(Vec<f32>, u32)> {
     use symphonia::core::codecs::DecoderOptions;
     use symphonia::core::formats::FormatOptions;
     use symphonia::core::io::MediaSourceStream;
@@ -350,11 +367,24 @@ fn load_mp3_raw(path: &Path, base: u32) -> anyhow::Result<Vec<u8>> {
         anyhow::bail!("No audio samples decoded from MP3");
     }
 
+    Ok((samples, sample_rate))
+}
+
+/// Load MP3 file and convert to base digits
+fn load_mp3_raw(path: &Path, base: u32) -> anyhow::Result<Vec<u8>> {
+    let (samples, sample_rate) = load_mp3_samples(path)?;
+
     Ok(match base {
         4 => audio::audio_to_base4(&samples, sample_rate),
         6 => audio::audio_to_base12(&samples, sample_rate).iter().map(|&d| d % 6).collect(),
         _ => audio::audio_to_base12(&samples, sample_rate),
     })
+}
+
+/// Load MP3 file and extract MIDI notes
+fn load_mp3_midi_notes(path: &Path) -> anyhow::Result<Vec<MidiNote>> {
+    let (samples, sample_rate) = load_mp3_samples(path)?;
+    Ok(audio::audio_to_midi_notes(&samples, sample_rate))
 }
 
 #[cfg(test)]

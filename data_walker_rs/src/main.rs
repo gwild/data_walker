@@ -7,6 +7,8 @@
 //! - list: List available sources
 //! - download: Download data from sources
 
+mod audio;
+mod automation;
 mod config;
 mod converters;
 mod download;
@@ -33,7 +35,35 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Launch native GUI viewer
-    Gui,
+    Gui {
+        /// Auto-select sources on startup (comma-separated IDs)
+        #[arg(long)]
+        select: Option<String>,
+
+        /// Auto-enable flight mode
+        #[arg(long)]
+        flight: bool,
+
+        /// Auto-start flight playback
+        #[arg(long)]
+        play: bool,
+
+        /// Quit after N seconds
+        #[arg(long)]
+        quit_after: Option<f64>,
+
+        /// Take screenshot and quit (specify output path)
+        #[arg(long)]
+        screenshot: Option<String>,
+
+        /// Enable IPC server on this port
+        #[arg(long, default_value = "0")]
+        ipc_port: u16,
+
+        /// Log all GUI events as JSON to stdout
+        #[arg(long)]
+        json_events: bool,
+    },
 
     /// Generate math-based walks (no downloads needed)
     GenerateMath {
@@ -79,6 +109,16 @@ enum Commands {
     Freesound {
         #[command(subcommand)]
         action: FreesoundAction,
+    },
+
+    /// Test MIDI note extraction from audio file
+    TestNotes {
+        /// Audio file to analyze (WAV or MP3)
+        file: PathBuf,
+
+        /// Number of notes to display
+        #[arg(short, long, default_value = "50")]
+        count: usize,
     },
 }
 
@@ -127,6 +167,26 @@ async fn main() -> anyhow::Result<()> {
     logging::init_logging("logs");
     tracing::info!("Data Walker starting up");
 
+    // Install panic handler to log crashes with full backtrace
+    std::panic::set_hook(Box::new(|panic_info| {
+        let backtrace = std::backtrace::Backtrace::capture();
+        let location = panic_info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column())).unwrap_or_else(|| "unknown".to_string());
+        let message = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Unknown panic".to_string()
+        };
+        tracing::error!("PANIC at {}: {}", location, message);
+        tracing::error!("Backtrace:\n{}", backtrace);
+        eprintln!("\n=== CRASH DETECTED ===");
+        eprintln!("Location: {}", location);
+        eprintln!("Message: {}", message);
+        eprintln!("Backtrace:\n{}", backtrace);
+        eprintln!("=== Check logs/ for full details ===\n");
+    }));
+
     let cli = Cli::parse();
     tracing::debug!("CLI args parsed: config={:?}", cli.config);
 
@@ -145,11 +205,30 @@ async fn main() -> anyhow::Result<()> {
     let secrets = config::Secrets::load();
 
     match cli.command {
-        Commands::Gui => {
+        Commands::Gui { select, flight, play, quit_after, screenshot, ipc_port, json_events } => {
             // Kill any existing instance first
             kill_existing_instances();
+
+            // Build automation config
+            let auto_config = automation::AutomationConfig {
+                auto_select: select.map(|s| s.split(',').map(|x| x.trim().to_string()).collect()).unwrap_or_default(),
+                auto_flight: flight,
+                auto_play: play,
+                quit_after_secs: quit_after.unwrap_or(0.0),
+                screenshot_and_quit: screenshot,
+                ipc_port,
+                json_events,
+            };
+
+            if !auto_config.auto_select.is_empty() {
+                tracing::info!("Auto-selecting sources: {:?}", auto_config.auto_select);
+            }
+            if auto_config.ipc_port > 0 {
+                tracing::info!("IPC server will listen on port {}", auto_config.ipc_port);
+            }
+
             tracing::info!("Launching native GUI viewer");
-            gui::run_viewer(config)?;
+            gui::run_viewer(config, auto_config)?;
         }
 
         Commands::GenerateMath { output } => {
@@ -225,6 +304,10 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
+        }
+
+        Commands::TestNotes { file, count } => {
+            test_note_extraction(&file, count)?;
         }
     }
 
@@ -594,4 +677,57 @@ fn kill_existing_instances() {
 
     // Small delay to let old process fully exit
     std::thread::sleep(std::time::Duration::from_millis(200));
+}
+
+/// Test MIDI note extraction from an audio file
+fn test_note_extraction(file: &PathBuf, count: usize) -> anyhow::Result<()> {
+    use converters::load_audio_midi_notes;
+
+    println!("Testing note extraction from: {:?}", file);
+    println!();
+
+    let notes = load_audio_midi_notes(file)?;
+
+    println!("Extracted {} notes total, showing first {}:", notes.len(), count.min(notes.len()));
+    println!();
+    println!("{:>4}  {:>4}  {:>6}  {:>8}  {}", "#", "MIDI", "Note", "Freq(Hz)", "Velocity");
+    println!("{}", "-".repeat(42));
+
+    // Count note frequencies for summary
+    let mut note_counts: std::collections::HashMap<u8, usize> = std::collections::HashMap::new();
+
+    for (i, note) in notes.iter().enumerate() {
+        *note_counts.entry(note.note).or_insert(0) += 1;
+
+        if i < count {
+            let freq = 440.0 * 2.0_f32.powf((note.note as f32 - 69.0) / 12.0);
+            println!("{:>4}  {:>4}  {:>6}  {:>8.1}  {:.2}",
+                i + 1, note.note, note.name(), freq, note.velocity);
+        }
+    }
+
+    // Show note distribution
+    println!();
+    println!("Note distribution (top 12):");
+    println!("{}", "-".repeat(30));
+
+    let mut sorted_notes: Vec<_> = note_counts.into_iter().collect();
+    sorted_notes.sort_by(|a, b| b.1.cmp(&a.1));
+
+    for (midi, count) in sorted_notes.iter().take(12) {
+        let note = converters::audio::MidiNote { note: *midi, velocity: 1.0 };
+        let bar_len = (*count as f32 / notes.len() as f32 * 30.0) as usize;
+        let bar = "█".repeat(bar_len);
+        println!("{:>3} {:>4}: {} ({:.1}%)",
+            note.name(), midi, bar, *count as f32 / notes.len() as f32 * 100.0);
+    }
+
+    // For Bach Prelude in C, we expect mostly C, E, G notes
+    println!();
+    println!("For Bach Prelude in C Major, expect predominantly:");
+    println!("  C (MIDI 48, 60, 72, 84) - root");
+    println!("  E (MIDI 52, 64, 76) - major third");
+    println!("  G (MIDI 55, 67, 79) - perfect fifth");
+
+    Ok(())
 }

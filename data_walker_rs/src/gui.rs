@@ -5,13 +5,15 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
-use tracing::{info, warn};
+use tracing::{info, warn, error, debug};
 use three_d::*;
 use three_d::egui;
 
 use crate::config::Config;
 use crate::walk::walk_base12;
 use crate::converters::math::MathGenerator;
+use crate::audio::{AudioEngine, AudioSettings, MixingMode, SynthMethod, SourceType};
+use crate::automation::{AutomationConfig, AutoCommand, GuiState, GuiEvent, WalkInfo, CommandQueue};
 
 /// SpaceMouse axis configuration
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -161,7 +163,7 @@ fn calculate_average_path_position(
 }
 
 /// Run the native 3D GUI viewer using three-d
-pub fn run_viewer(config: Config) -> anyhow::Result<()> {
+pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Result<()> {
     // Create winit event loop and window manually for fullscreen toggle access
     use winit::event_loop::EventLoop;
     use winit::window::WindowBuilder;
@@ -246,6 +248,17 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
     let mut smooth_cam_pos: Option<Vec3> = None;   // Smoothed camera position
     let mut smooth_cam_target: Option<Vec3> = None; // Smoothed look target
 
+    // Audio playback state
+    let audio_engine_result = AudioEngine::new();
+    match &audio_engine_result {
+        Ok(_) => info!("Audio engine successfully initialized"),
+        Err(e) => warn!("Audio engine failed to initialize: {}", e),
+    }
+    let mut audio_engine: Option<AudioEngine> = audio_engine_result.ok();
+    let mut audio_settings = AudioSettings::default();
+    let mut prev_synth_method = audio_settings.synthesis_method;
+    let mut audio_sources_prepared = false;
+
     // Track which slider has focus for arrow key control
     #[derive(Clone, Copy, PartialEq)]
     enum FocusedSlider { None, MaxPoints, PointScale, LineScale, FlightSpeed, FlightProgress }
@@ -253,9 +266,32 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
 
     // GUI state
     let mut gui = GUI::new(&context);
+    let mut first_frame = true;  // Track first frame to reset egui state
 
     // Color pool for dynamic assignment
     let mut color_pool = ColorPool::new();
+
+    // Automation state
+    let cmd_queue = crate::automation::new_command_queue();
+    let mut auto_quit_time: Option<f64> = if auto_config.quit_after_secs > 0.0 {
+        Some(auto_config.quit_after_secs)
+    } else {
+        None
+    };
+    let mut auto_screenshot_pending = auto_config.screenshot_and_quit.clone();
+    let mut frame_count: u64 = 0;
+
+    // Start IPC server if enabled
+    if auto_config.ipc_port > 0 {
+        if let Err(e) = crate::automation::start_ipc_server(auto_config.ipc_port, cmd_queue.clone()) {
+            error!("[AUTO] Failed to start IPC server: {}", e);
+        }
+    }
+
+    // Log startup event if JSON events enabled
+    if auto_config.json_events {
+        crate::automation::log_event(&GuiEvent::Started { timestamp: 0.0 });
+    }
 
     // Pre-build category list
     let mut by_category: BTreeMap<String, Vec<crate::config::Source>> = BTreeMap::new();
@@ -263,15 +299,138 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
         by_category.entry(source.category.clone()).or_default().push(source.clone());
     }
 
+    // Track which auto-select sources haven't been processed yet
+    let mut pending_auto_select: Vec<String> = auto_config.auto_select.clone();
+    let auto_flight_pending = auto_config.auto_flight;
+    let auto_play_pending = auto_config.auto_play;
+
     // Main loop
     window.render_loop(move |mut frame_input| {
+        frame_count += 1;
+        let current_time = frame_input.accumulated_time;
+
+        // Process automation on first frame (auto-select, auto-flight, etc.)
+        if !pending_auto_select.is_empty() {
+            debug!("[AUTO] Processing {} pending auto-select sources", pending_auto_select.len());
+            for source_id in pending_auto_select.drain(..) {
+                if let Some(source) = config.sources.iter().find(|s| s.id == source_id) {
+                    debug!("[AUTO] Auto-selecting source: {}", source_id);
+                    selected_sources.insert(source_id.clone());
+                    let color = color_pool.get_color(&source_id);
+                    if let Some(walk_data) = load_walk_data(source, &config, max_points, &selected_mapping, selected_base, color) {
+                        walks.insert(source_id.clone(), walk_data);
+                    }
+                } else {
+                    warn!("[AUTO] Source not found: {}", source_id);
+                }
+            }
+            // Auto-enable flight mode if requested
+            if auto_flight_pending && !flight_mode {
+                debug!("[AUTO] Auto-enabling flight mode");
+                flight_mode = true;
+            }
+            // Auto-start playback if requested
+            if auto_play_pending && !flight_playing {
+                debug!("[AUTO] Auto-starting playback");
+                flight_playing = true;
+            }
+        }
+
+        // Check auto-quit timer
+        if let Some(quit_time) = auto_quit_time {
+            if current_time >= quit_time {
+                info!("[AUTO] Quit timer expired, exiting");
+                return FrameOutput { exit: true, ..Default::default() };
+            }
+        }
+
+        // Process IPC commands
+        if let Ok(mut queue) = cmd_queue.lock() {
+            for cmd in queue.drain(..) {
+                debug!("[AUTO] Processing IPC command: {:?}", cmd);
+                match cmd {
+                    AutoCommand::SelectSource { id } => {
+                        if let Some(source) = config.sources.iter().find(|s| s.id == id) {
+                            selected_sources.insert(id.clone());
+                            let color = color_pool.get_color(&id);
+                            if let Some(walk_data) = load_walk_data(source, &config, max_points, &selected_mapping, selected_base, color) {
+                                walks.insert(id, walk_data);
+                            }
+                        }
+                    }
+                    AutoCommand::DeselectSource { id } => {
+                        selected_sources.remove(&id);
+                        walks.remove(&id);
+                        color_pool.release_color(&id);
+                    }
+                    AutoCommand::DeselectAll => {
+                        selected_sources.clear();
+                        walks.clear();
+                        color_pool.clear();
+                    }
+                    AutoCommand::SetFlightMode { enabled } => {
+                        flight_mode = enabled;
+                    }
+                    AutoCommand::SetFlightPlaying { playing } => {
+                        flight_playing = playing;
+                    }
+                    AutoCommand::SetFlightProgress { progress } => {
+                        flight_progress = progress.clamp(0.0, 1.0);
+                    }
+                    AutoCommand::SetFlightSpeed { speed } => {
+                        flight_speed = speed.clamp(0.01, 60.0);
+                    }
+                    AutoCommand::SetBase { base } => {
+                        if base == 4 || base == 6 || base == 12 {
+                            selected_base = base;
+                        }
+                    }
+                    AutoCommand::SetMapping { name } => {
+                        selected_mapping = name;
+                    }
+                    AutoCommand::Screenshot { path: _ } => {
+                        screenshot_requested = true;
+                    }
+                    AutoCommand::GetState => {
+                        // State will be logged below
+                    }
+                    AutoCommand::Quit => {
+                        info!("[AUTO] Quit command received");
+                        return FrameOutput { exit: true, ..Default::default() };
+                    }
+                }
+            }
+        }
+
+        // Handle auto-screenshot-and-quit
+        if auto_screenshot_pending.is_some() && frame_count > 10 {
+            // Wait a few frames for scene to render
+            screenshot_requested = true;
+        }
+
         // Handle keyboard events (spacebar for play/pause)
         for event in &frame_input.events {
             if let three_d::Event::KeyPress { kind, modifiers, .. } = event {
+                debug!("[GUI] KeyPress: {:?} (modifiers: shift={}, ctrl={}, alt={})",
+                    kind, modifiers.shift, modifiers.ctrl, modifiers.alt);
                 if *kind == three_d::Key::Space && flight_mode {
+                    debug!("[GUI] Spacebar pressed: toggling flight_playing to {}", !flight_playing);
                     flight_playing = !flight_playing;
+                    // Sync audio play/pause
+                    if audio_settings.enabled {
+                        if let Some(ref mut engine) = audio_engine {
+                            if flight_playing {
+                                debug!("[GUI] Starting audio via spacebar");
+                                engine.play(&audio_settings);
+                            } else {
+                                debug!("[GUI] Pausing audio via spacebar");
+                                engine.pause();
+                            }
+                        }
+                    }
                 }
                 if *kind == three_d::Key::Escape {
+                    debug!("[GUI] Escape pressed: toggling fullscreen to {}", !fullscreen_plot);
                     fullscreen_plot = !fullscreen_plot;
                     // Toggle borderless fullscreen via the winit window handle
                     // SAFETY: winit_ptr points to the window owned by render_loop's self,
@@ -467,6 +626,13 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                         } else {
                             flight_progress = 1.0;
                         }
+                    }
+                }
+
+                // Sync audio to flight progress
+                if audio_settings.enabled {
+                    if let Some(ref mut engine) = audio_engine {
+                        engine.sync_to_progress(flight_progress, &audio_settings);
                     }
                 }
             }
@@ -707,14 +873,26 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
             frame_input.viewport,
             frame_input.device_pixel_ratio,
             |egui_ctx| {
-                if fullscreen_plot { /* skip all panels */ } else {
-                egui::SidePanel::left("walks_panel").min_width(250.0).show(egui_ctx, |ui| {
+                // Reset egui memory on first frame to clear any corrupted state
+                if first_frame {
+                    // Clear ALL egui persistent state to prevent panel issues
+                    egui_ctx.memory_mut(|mem| *mem = Default::default());
+                    first_frame = false;
+                }
+
+                if !fullscreen_plot {
+                egui::SidePanel::left("walks_panel")
+                    .min_width(300.0)
+                    .max_width(300.0)
+                    .resizable(false)
+                    .show(egui_ctx, |ui| {
                     ui.heading("Data Walks");
                     ui.separator();
 
                     // Base and mapping selectors
                     ui.horizontal(|ui| {
                         ui.label("Base:");
+                        let prev_base_val = selected_base;
                         egui::ComboBox::from_id_salt("base")
                             .width(40.0)
                             .selected_text(format!("{}", selected_base))
@@ -723,9 +901,13 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                                 ui.selectable_value(&mut selected_base, 6, "6");
                                 ui.selectable_value(&mut selected_base, 4, "4");
                             });
+                        if selected_base != prev_base_val {
+                            debug!("[GUI] Base changed: {} -> {}", prev_base_val, selected_base);
+                        }
                         ui.label("Mapping:");
                         let mapping_enabled = selected_base == 12 || selected_base == 6;
                         ui.add_enabled_ui(mapping_enabled, |ui| {
+                            let prev_mapping_val = selected_mapping.clone();
                             egui::ComboBox::from_id_salt("mapping")
                                 .selected_text(&selected_mapping)
                                 .show_ui(ui, |ui| {
@@ -738,6 +920,9 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                                         ui.selectable_value(&mut selected_mapping, name.clone(), name);
                                     }
                                 });
+                            if selected_mapping != prev_mapping_val {
+                                debug!("[GUI] Mapping changed: {} -> {}", prev_mapping_val, selected_mapping);
+                            }
                         });
                     });
 
@@ -747,11 +932,18 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
 
                     ui.horizontal(|ui| {
                         if ui.button("Deselect All").clicked() {
+                            debug!("[GUI] Button clicked: Deselect All");
                             selected_sources.clear();
                             walks.clear();
                             color_pool.clear();
+                            // Stop and clear all audio sources
+                            if let Some(ref mut engine) = audio_engine {
+                                debug!("[GUI] Stopping all audio sources");
+                                engine.stop_all();
+                            }
                         }
                         if ui.button("Center View").clicked() {
+                            debug!("[GUI] Button clicked: Center View");
                             camera.set_view(
                                 vec3(0.0, 50.0, 200.0),
                                 vec3(0.0, 0.0, 0.0),
@@ -761,16 +953,26 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                     });
 
                     ui.horizontal(|ui| {
-                        ui.checkbox(&mut show_grid, "Grid");
-                        ui.checkbox(&mut show_axes, "Axes");
+                        if ui.checkbox(&mut show_grid, "Grid").changed() {
+                            debug!("[GUI] Checkbox changed: show_grid = {}", show_grid);
+                        }
+                        if ui.checkbox(&mut show_axes, "Axes").changed() {
+                            debug!("[GUI] Checkbox changed: show_axes = {}", show_axes);
+                        }
                     });
 
                     // Auto-rotate controls
                     ui.horizontal(|ui| {
                         ui.label("Auto-rotate:");
-                        ui.checkbox(&mut auto_rotate_x, "X");
-                        ui.checkbox(&mut auto_rotate_y, "Y");
-                        ui.checkbox(&mut auto_rotate_z, "Z");
+                        if ui.checkbox(&mut auto_rotate_x, "X").changed() {
+                            debug!("[GUI] Checkbox changed: auto_rotate_x = {}", auto_rotate_x);
+                        }
+                        if ui.checkbox(&mut auto_rotate_y, "Y").changed() {
+                            debug!("[GUI] Checkbox changed: auto_rotate_y = {}", auto_rotate_y);
+                        }
+                        if ui.checkbox(&mut auto_rotate_z, "Z").changed() {
+                            debug!("[GUI] Checkbox changed: auto_rotate_z = {}", auto_rotate_z);
+                        }
                     });
                     if auto_rotate_x || auto_rotate_y || auto_rotate_z {
                         if auto_rotate_x {
@@ -793,8 +995,12 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                         }
                     }
                     ui.horizontal(|ui| {
-                        ui.checkbox(&mut show_points, "Points");
-                        ui.checkbox(&mut show_lines, "Lines");
+                        if ui.checkbox(&mut show_points, "Points").changed() {
+                            debug!("[GUI] Checkbox changed: show_points = {}", show_points);
+                        }
+                        if ui.checkbox(&mut show_lines, "Lines").changed() {
+                            debug!("[GUI] Checkbox changed: show_lines = {}", show_lines);
+                        }
                     });
                     if show_points {
                         if ui.add(egui::Slider::new(&mut point_scale, 0.1..=1.0).text("Point scale")).clicked() {
@@ -825,9 +1031,11 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
 
                     ui.horizontal(|ui| {
                         if ui.button("SpaceMouse Config").clicked() {
+                            debug!("[GUI] Button clicked: SpaceMouse Config (toggling to {})", !show_spacemouse_config);
                             show_spacemouse_config = !show_spacemouse_config;
                         }
                         if ui.button("Screenshot").clicked() {
+                            debug!("[GUI] Button clicked: Screenshot");
                             screenshot_requested = true;
                         }
                     });
@@ -835,14 +1043,39 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                     // Data Flight controls
                     ui.separator();
                     ui.heading("Data Flight");
-                    ui.checkbox(&mut flight_mode, "Enable Flight");
+                    if ui.checkbox(&mut flight_mode, "Enable Flight").changed() {
+                        debug!("[GUI] Checkbox changed: flight_mode = {}", flight_mode);
+                        // When disabling flight mode, stop playback and audio
+                        if !flight_mode {
+                            if flight_playing {
+                                debug!("[GUI] Stopping playback because flight_mode disabled");
+                                flight_playing = false;
+                                if let Some(ref mut engine) = audio_engine {
+                                    engine.stop_all();
+                                }
+                            }
+                        }
+                    }
 
                     if flight_mode {
                         // Play/Pause button with spacebar hint
                         ui.horizontal(|ui| {
                             let button_text = if flight_playing { "⏸ Pause" } else { "▶ Play" };
                             if ui.button(button_text).clicked() {
+                                debug!("[GUI] Button clicked: {} (flight_playing -> {})", button_text, !flight_playing);
                                 flight_playing = !flight_playing;
+                                // Sync audio play/pause
+                                if audio_settings.enabled {
+                                    if let Some(ref mut engine) = audio_engine {
+                                        if flight_playing {
+                                            debug!("[GUI] Starting audio playback");
+                                            engine.play(&audio_settings);
+                                        } else {
+                                            debug!("[GUI] Pausing audio playback");
+                                            engine.pause();
+                                        }
+                                    }
+                                }
                             }
                             ui.label("(Space)");
                         });
@@ -862,8 +1095,12 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                         });
 
                         ui.horizontal(|ui| {
-                            ui.checkbox(&mut flight_reverse, "Reverse");
-                            ui.checkbox(&mut flight_look_back, "Look Back");
+                            if ui.checkbox(&mut flight_reverse, "Reverse").changed() {
+                                debug!("[GUI] Checkbox changed: flight_reverse = {}", flight_reverse);
+                            }
+                            if ui.checkbox(&mut flight_look_back, "Look Back").changed() {
+                                debug!("[GUI] Checkbox changed: flight_look_back = {}", flight_look_back);
+                            }
                         });
 
                         // Loop control: checkbox enables, label click opens dropdown
@@ -897,25 +1134,107 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                         }
 
                         if ui.button("Reset to Start").clicked() {
+                            debug!("[GUI] Button clicked: Reset to Start");
                             flight_progress = if flight_reverse { 1.0 } else { 0.0 };
                             flight_playing = false;
                             smooth_cam_pos = None;
                             smooth_cam_target = None;
+                            // Stop audio on reset
+                            if let Some(ref mut engine) = audio_engine {
+                                debug!("[GUI] Stopping all audio on reset");
+                                engine.stop_all();
+                            }
+                        }
+
+                        // Audio controls
+                        ui.separator();
+                        if ui.checkbox(&mut audio_settings.enabled, "Audio").changed() {
+                            debug!("[GUI] Checkbox changed: audio_settings.enabled = {}", audio_settings.enabled);
+                        }
+
+                        if audio_settings.enabled {
+                            ui.horizontal(|ui| {
+                                ui.label("Volume:");
+                                ui.add(egui::Slider::new(&mut audio_settings.master_volume, 0.0..=1.0).show_value(false));
+                            });
+
+                            ui.horizontal(|ui| {
+                                ui.label("Synth:");
+                                egui::ComboBox::from_id_salt("synth_method")
+                                    .width(80.0)
+                                    .selected_text(match audio_settings.synthesis_method {
+                                        SynthMethod::ChromaticNotes => "Chromatic",
+                                        SynthMethod::SineTones => "Sine",
+                                        SynthMethod::Percussion => "Drums",
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut audio_settings.synthesis_method,
+                                            SynthMethod::ChromaticNotes, "Chromatic");
+                                        ui.selectable_value(&mut audio_settings.synthesis_method,
+                                            SynthMethod::SineTones, "Sine");
+                                        ui.selectable_value(&mut audio_settings.synthesis_method,
+                                            SynthMethod::Percussion, "Drums");
+                                    });
+                            });
+
+                            ui.horizontal(|ui| {
+                                ui.label("Mix:");
+                                egui::ComboBox::from_id_salt("mix_mode")
+                                    .width(80.0)
+                                    .selected_text(match audio_settings.mixing_mode {
+                                        MixingMode::Simultaneous => "All",
+                                        MixingMode::CameraFocus => "Focus",
+                                        MixingMode::DistanceBased => "Distance",
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(&mut audio_settings.mixing_mode,
+                                            MixingMode::Simultaneous, "All Equal");
+                                        ui.selectable_value(&mut audio_settings.mixing_mode,
+                                            MixingMode::CameraFocus, "Camera Focus");
+                                        ui.selectable_value(&mut audio_settings.mixing_mode,
+                                            MixingMode::DistanceBased, "Distance");
+                                    });
+                            });
+
+                            // Force synthesis checkbox (per-note association)
+                            if ui.checkbox(&mut audio_settings.force_synthesis, "Synthesize Notes")
+                                .on_hover_text("Generate tones from base-12 digits (one note per walk point)")
+                                .changed() {
+                                debug!("[GUI] Checkbox changed: audio_settings.force_synthesis = {}", audio_settings.force_synthesis);
+                            }
+
+                            // Sync checkbox - works for both synthesis and audio files
+                            if ui.checkbox(&mut audio_settings.sync_to_flight, "Sync to Flight")
+                                .on_hover_text(if audio_settings.force_synthesis {
+                                    "Sync note playback rate to flight speed (one note per walk point)"
+                                } else {
+                                    "Time-stretch audio to match flight duration"
+                                })
+                                .changed() {
+                                debug!("[GUI] Checkbox changed: audio_settings.sync_to_flight = {}", audio_settings.sync_to_flight);
+                            }
                         }
                     }
 
                     ui.separator();
 
-                    // Source list - use fixed max height to prevent layout issues
-                    // The controls take ~350px, so leave that much headroom
-                    let max_scroll_height = (ui.ctx().screen_rect().height() - 400.0).max(200.0);
+                    // Source list - calculate max height based on screen
+                    let screen_height = ui.ctx().screen_rect().height();
+                    let max_scroll_height = (screen_height - 400.0).max(200.0);
+
                     egui::ScrollArea::vertical()
                         .max_height(max_scroll_height)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                         for (category, sources) in &by_category {
                             let cat_name = config.categories.get(category).unwrap_or(category);
-                            egui::CollapsingHeader::new(cat_name).show(ui, |ui| {
+                            let _num_sources = sources.len();
+                            // IMPORTANT: default_open(false) prevents egui from restoring
+                            // expanded state that can cause layout issues on startup
+                            let header = egui::CollapsingHeader::new(cat_name)
+                                .id_salt(category)
+                                .default_open(false);
+                            let _response = header.show(ui, |ui| {
                                 for source in sources {
                                     let mut checked = selected_sources.contains(&source.id);
 
@@ -935,19 +1254,89 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                                             egui::RichText::new(&source.name)
                                         };
                                         if ui.checkbox(&mut checked, label).changed() {
+                                            debug!("[GUI] Source checkbox changed: {} -> {}", source.id, checked);
                                             if checked {
+                                                debug!("[GUI] Selecting source: {}", source.id);
                                                 selected_sources.insert(source.id.clone());
                                                 // Get color from pool for maximum contrast
                                                 let color = color_pool.get_color(&source.id);
+                                                debug!("[GUI] Got color for {}: {:?}", source.id, color);
                                                 // Load walk
-                                                if let Some(walk_data) = load_walk_data(&source, &config, max_points, &selected_mapping, selected_base, color) {
-                                                    walks.insert(source.id.clone(), walk_data);
+                                                debug!("[GUI] Loading walk data for {}", source.id);
+                                                let walk_len = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                                    load_walk_data(&source, &config, max_points, &selected_mapping, selected_base, color)
+                                                })) {
+                                                    Ok(Some(walk_data)) => {
+                                                        let len = walk_data.points.len();
+                                                        debug!("[GUI] Loaded {} walk points for {}", len, source.id);
+                                                        walks.insert(source.id.clone(), walk_data);
+                                                        len
+                                                    }
+                                                    Ok(None) => {
+                                                        warn!("[GUI] load_walk_data returned None for {}", source.id);
+                                                        0
+                                                    }
+                                                    Err(e) => {
+                                                        error!("[GUI] PANIC in load_walk_data for {}: {:?}", source.id, e);
+                                                        0
+                                                    }
+                                                };
+                                                // Prepare audio source
+                                                debug!("[GUI] Preparing audio for source: {}", source.id);
+                                                if let Some(ref mut engine) = audio_engine {
+                                                    // Use synthesis if force_synthesis is enabled, otherwise use audio file
+                                                    let audio_source_type = if audio_settings.force_synthesis {
+                                                        // Load base-12 digits for synthesis
+                                                        debug!("[GUI] Loading base-12 digits for synthesis: {}", source.id);
+                                                        let base12_digits = load_base12_digits(&source);
+                                                        debug!("[GUI] Using synthesis for {} ({} digits)", source.id, base12_digits.len());
+                                                        SourceType::Synthesized { base_digits: base12_digits }
+                                                    } else {
+                                                        debug!("[GUI] Getting audio source type for {}", source.id);
+                                                        get_audio_source_type(&source)
+                                                    };
+                                                    debug!("[GUI] Preparing audio for source: {} (type: {:?})", source.id, audio_source_type);
+
+                                                    // Calculate flight duration for time-stretching
+                                                    let flight_duration = if walk_len > 0 && flight_speed > 0.0 {
+                                                        walk_len as f32 / flight_speed
+                                                    } else {
+                                                        30.0 // Default fallback
+                                                    };
+
+                                                    let result = if audio_settings.sync_to_flight {
+                                                        // Sync enabled: time-stretch audio files OR set synth rate
+                                                        debug!("[GUI] Syncing to flight: {:.1}s (walk: {} pts, speed: {:.1} Hz)", flight_duration, walk_len, flight_speed);
+                                                        engine.prepare_source_stretched(&source.id, audio_source_type, flight_duration)
+                                                    } else {
+                                                        engine.prepare_source(&source.id, audio_source_type)
+                                                    };
+
+                                                    match result {
+                                                        Ok(_) => {
+                                                            debug!("[GUI] Audio source prepared: {}", source.id);
+                                                            // If already playing AND flight mode is on, start the new source immediately
+                                                            if flight_mode && flight_playing && audio_settings.enabled {
+                                                                debug!("[GUI] Auto-starting audio for newly selected source");
+                                                                engine.play(&audio_settings);
+                                                            }
+                                                        }
+                                                        Err(e) => error!("[GUI] Failed to prepare audio source {}: {}", source.id, e),
+                                                    }
+                                                } else {
+                                                    warn!("[GUI] No audio engine available when selecting source {}", source.id);
                                                 }
                                             } else {
+                                                debug!("[GUI] Deselecting source: {}", source.id);
                                                 selected_sources.remove(&source.id);
                                                 walks.remove(&source.id);
                                                 // Release color back to pool
                                                 color_pool.release_color(&source.id);
+                                                // Remove audio source
+                                                if let Some(ref mut engine) = audio_engine {
+                                                    debug!("[GUI] Removing audio source: {}", source.id);
+                                                    engine.remove_source(&source.id);
+                                                }
                                             }
                                         }
                                     } else {
@@ -1129,9 +1518,11 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                         ui.separator();
                         ui.horizontal(|ui| {
                             if ui.button("Save").clicked() {
+                                debug!("[GUI] Button clicked: SpaceMouse Save");
                                 spacemouse_config.save();
                             }
                             if ui.button("Reset").clicked() {
+                                debug!("[GUI] Button clicked: SpaceMouse Reset");
                                 spacemouse_config = SpaceMouseConfig::default();
                             }
                         });
@@ -1162,17 +1553,44 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
 
         // Regenerate walks if mapping, base, or max_points changed
         if selected_mapping != prev_mapping || max_points != prev_max_points || selected_base != prev_base {
+            debug!("[GUI] Regenerating walks: mapping={} (was {}), base={} (was {}), max_points={} (was {})",
+                selected_mapping, prev_mapping, selected_base, prev_base, max_points, prev_max_points);
             prev_mapping = selected_mapping.clone();
             prev_max_points = max_points;
             prev_base = selected_base;
             let source_ids: Vec<String> = selected_sources.iter().cloned().collect();
+            debug!("[GUI] Regenerating {} walks", source_ids.len());
             for sid in &source_ids {
                 if let Some(source) = config.sources.iter().find(|s| &s.id == sid) {
                     // Reuse existing color assignment
                     let color = color_pool.get_color(&sid);
-                    if let Some(walk_data) = load_walk_data(source, &config, max_points, &selected_mapping, selected_base, color) {
-                        walks.insert(sid.clone(), walk_data);
+                    debug!("[GUI] Regenerating walk for {}", sid);
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        load_walk_data(source, &config, max_points, &selected_mapping, selected_base, color)
+                    })) {
+                        Ok(Some(walk_data)) => {
+                            debug!("[GUI] Regenerated {} points for {}", walk_data.points.len(), sid);
+                            walks.insert(sid.clone(), walk_data);
+                        }
+                        Ok(None) => {
+                            warn!("[GUI] Failed to regenerate walk for {}", sid);
+                        }
+                        Err(e) => {
+                            error!("[GUI] PANIC while regenerating walk for {}: {:?}", sid, e);
+                        }
                     }
+                }
+            }
+        }
+
+        // Recreate synth sinks if synth method changed during playback
+        if audio_settings.synthesis_method != prev_synth_method {
+            debug!("[GUI] Synth method changed: {:?} -> {:?}", prev_synth_method, audio_settings.synthesis_method);
+            prev_synth_method = audio_settings.synthesis_method;
+            if flight_playing && audio_settings.enabled {
+                if let Some(ref mut engine) = audio_engine {
+                    debug!("[GUI] Recreating synth sinks for new method");
+                    engine.recreate_synth_sinks(&audio_settings);
                 }
             }
         }
@@ -1292,16 +1710,29 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
         let _ = frame_input.screen().write(|| gui.render());
 
         // Screenshot capture
+        let mut should_quit_after_screenshot = false;
         if screenshot_requested {
             screenshot_requested = false;
             let vp = frame_input.viewport;
             let pixels: Vec<[u8; 4]> = frame_input.screen().read_color();
             let flat: Vec<u8> = pixels.iter().flat_map(|p| p.iter().copied()).collect();
             if let Some(img) = image::RgbaImage::from_raw(vp.width, vp.height, flat) {
-                let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
-                let screenshots_dir = std::path::PathBuf::from("screenshots");
-                let _ = std::fs::create_dir_all(&screenshots_dir);
-                let filename = screenshots_dir.join(format!("data_walker_{}.png", timestamp));
+                // Use custom path if provided via automation, otherwise default
+                let filename = if let Some(ref path) = auto_screenshot_pending {
+                    should_quit_after_screenshot = true;
+                    std::path::PathBuf::from(path)
+                } else {
+                    let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                    let screenshots_dir = std::path::PathBuf::from("screenshots");
+                    let _ = std::fs::create_dir_all(&screenshots_dir);
+                    screenshots_dir.join(format!("data_walker_{}.png", timestamp))
+                };
+
+                // Ensure parent directory exists
+                if let Some(parent) = filename.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+
                 // Get absolute path for display
                 let abs_path = std::env::current_dir()
                     .map(|p| p.join(&filename).display().to_string())
@@ -1320,9 +1751,17 @@ pub fn run_viewer(config: Config) -> anyhow::Result<()> {
                             format!("Failed: {}", e),
                             frame_input.accumulated_time + 4.0,
                         ));
+                        should_quit_after_screenshot = false; // Don't quit on failure
                     }
                 }
             }
+        }
+
+        // Handle auto-quit after screenshot
+        if should_quit_after_screenshot {
+            auto_screenshot_pending = None;
+            info!("[AUTO] Screenshot complete, exiting");
+            return FrameOutput { exit: true, ..Default::default() };
         }
 
         FrameOutput::default()
@@ -1355,6 +1794,72 @@ fn check_data_exists(id: &str, converter: &str, url: &str) -> bool {
         }
         c if c.starts_with("math.") => true, // Math is computed, always available
         _ => false,
+    }
+}
+
+/// Determine the audio source type for a given data source
+fn get_audio_source_type(source: &crate::config::Source) -> SourceType {
+    if source.converter == "audio" {
+        // Check for WAV or MP3 file
+        let wav_path = std::path::PathBuf::from(format!("data/audio/{}.wav", source.id));
+        let mp3_path = std::path::PathBuf::from(format!("data/audio/{}.mp3", source.id));
+
+        let path = if wav_path.exists() {
+            wav_path
+        } else {
+            mp3_path
+        };
+
+        SourceType::AudioFile { path }
+    } else {
+        // For non-audio sources, we'll synthesize from base-12 data
+        // Load the base-12 digits
+        let digits = load_base12_digits(source);
+        SourceType::Synthesized { base_digits: digits }
+    }
+}
+
+/// Load base-12 digits for a source (used for audio synthesis)
+fn load_base12_digits(source: &crate::config::Source) -> Vec<u8> {
+    use crate::converters;
+
+    let max_points = 5000; // Reasonable length for audio
+
+    if source.converter.starts_with("math.") {
+        MathGenerator::from_converter_string(&source.converter)
+            .map(|g| g.generate(max_points))
+            .unwrap_or_default()
+    } else {
+        match source.converter.as_str() {
+            "audio" => {
+                // Load audio file and convert to base-12 via spectrogram
+                let wav_path = std::path::PathBuf::from(format!("data/audio/{}.wav", source.id));
+                let mp3_path = std::path::PathBuf::from(format!("data/audio/{}.mp3", source.id));
+                let path = if wav_path.exists() { wav_path } else { mp3_path };
+                converters::load_audio_raw(&path, 12).unwrap_or_else(|e| {
+                    warn!("Failed to load audio for synthesis: {}", e);
+                    vec![6; 100]
+                })
+            }
+            "dna" => {
+                let accession = source.url.rsplit('/').next().unwrap_or(&source.id);
+                let path = std::path::PathBuf::from(format!("data/dna/{}.fasta", accession.replace(".", "_")));
+                converters::load_dna_raw(&path, 12).unwrap_or_default()
+            }
+            "cosmos" => {
+                let path = std::path::PathBuf::from(format!("data/cosmos/{}.txt.gz", source.id));
+                converters::load_cosmos_raw(&path, 12).unwrap_or_default()
+            }
+            "finance" => {
+                let symbol = source.url.split('/').last().unwrap_or(&source.id)
+                    .replace("%5E", "^")
+                    .replace("^", "")
+                    .replace("-", "_");
+                let path = std::path::PathBuf::from(format!("data/finance/{}.json", symbol));
+                converters::load_finance_raw(&path, 12).unwrap_or_default()
+            }
+            _ => vec![6; 100], // Default pattern
+        }
     }
 }
 

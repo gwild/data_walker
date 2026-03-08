@@ -297,6 +297,28 @@ sources:
     url: "https://www.ncbi.nlm.nih.gov/nuccore/J01859.1"
 
   # ============================================
+  # DNA - Archaea
+  # ============================================
+
+  - id: sukunaarchaeum
+    name: Sukunaarchaeum mirabile
+    category: dna
+    subcategory: Archaea
+    converter: dna
+    mapping: Optimal
+    url: "https://www.ncbi.nlm.nih.gov/nuccore/AP040136"
+    description: "Smallest known archaeal genome (238 kbp) - 2025 discovery"
+
+  - id: nanoarchaeum
+    name: Nanoarchaeum equitans
+    category: dna
+    subcategory: Archaea
+    converter: dna
+    mapping: Optimal
+    url: "https://www.ncbi.nlm.nih.gov/nuccore/NC_005213"
+    description: "Parasitic archaeon with tiny genome (490 kbp)"
+
+  # ============================================
   # DNA - Plants (chloroplast genomes)
   # ============================================
 

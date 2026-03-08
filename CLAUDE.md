@@ -232,3 +232,19 @@ cat .env
 4. **Verify** - "Similar" is not "same"; check the actual output
 5. **Clean data** - Generators output only real data, no baselines or junk
 6. **No secrets in output** - Never display API keys or credentials
+
+---
+
+## Known Issues
+
+### GUI Panel Disappearance Bug
+**Symptom**: When expanding categories (especially Audio) in the source list, the entire left panel with all controls disappears, leaving only the 3D view.
+
+**Root cause**: Unknown - possibly egui state corruption when CollapsingHeader state changes.
+
+**Workarounds tried**:
+- Reset egui memory on first frame
+- Use `exact_width()` / `min_width()` + `max_width()` + `resizable(false)`
+- Use `default_open(false)` to prevent restored state issues
+
+**If this happens**: Press ESC twice to toggle fullscreen mode on/off, which should restore the panel. If that doesn't work, restart the application.
