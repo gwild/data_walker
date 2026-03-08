@@ -257,6 +257,8 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Resu
     let mut audio_engine: Option<AudioEngine> = audio_engine_result.ok();
     let mut audio_settings = AudioSettings::default();
     let mut prev_synth_method = audio_settings.synthesis_method;
+    let mut prev_flight_speed: f32 = flight_speed;
+    let mut prev_sync_to_flight = audio_settings.sync_to_flight;
     let mut audio_sources_prepared = false;
 
     // Track which slider has focus for arrow key control
@@ -1593,6 +1595,48 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Resu
                     engine.recreate_synth_sinks(&audio_settings);
                 }
             }
+        }
+
+        // Re-prepare audio sources if flight_speed or sync_to_flight changed
+        let speed_changed = (flight_speed - prev_flight_speed).abs() > 0.001;
+        let sync_changed = audio_settings.sync_to_flight != prev_sync_to_flight;
+        if (speed_changed || sync_changed) && audio_settings.sync_to_flight && !selected_sources.is_empty() {
+            debug!("[GUI] Flight speed or sync changed: speed {:.2} -> {:.2}, sync {} -> {}",
+                prev_flight_speed, flight_speed, prev_sync_to_flight, audio_settings.sync_to_flight);
+            prev_flight_speed = flight_speed;
+            prev_sync_to_flight = audio_settings.sync_to_flight;
+
+            if let Some(ref mut engine) = audio_engine {
+                // Re-prepare all audio sources with new timing
+                for source_id in &selected_sources {
+                    if let Some(source) = config.sources.iter().find(|s| &s.id == source_id) {
+                        let walk_len = walks.get(source_id).map(|w| w.points.len()).unwrap_or(5000);
+                        let flight_duration = if walk_len > 0 && flight_speed > 0.0 {
+                            walk_len as f32 / flight_speed
+                        } else {
+                            30.0
+                        };
+
+                        let audio_source_type = if audio_settings.force_synthesis {
+                            let base12_digits = load_base12_digits(source);
+                            SourceType::Synthesized { base_digits: base12_digits }
+                        } else {
+                            get_audio_source_type(source)
+                        };
+
+                        debug!("[GUI] Re-preparing audio for {} at new speed (duration: {:.1}s)", source_id, flight_duration);
+                        let _ = engine.prepare_source_stretched(source_id, audio_source_type, flight_duration);
+                    }
+                }
+
+                // Restart playback if it was playing
+                if flight_mode && flight_playing && audio_settings.enabled {
+                    engine.play(&audio_settings);
+                }
+            }
+        } else {
+            prev_flight_speed = flight_speed;
+            prev_sync_to_flight = audio_settings.sync_to_flight;
         }
 
         // Clear and render
