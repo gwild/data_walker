@@ -79,6 +79,8 @@ struct WalkData {
     visible: bool,
     // Point revisit counts: (position, count) - positions rounded to grid
     revisit_counts: std::collections::HashMap<(i32, i32, i32), u32>,
+    // Optional per-point colors (for PDB structure coloring by residue)
+    point_colors: Option<Vec<[f32; 3]>>,
 }
 
 /// Catmull-Rom spline interpolation along a walk's points
@@ -719,6 +721,7 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Resu
 
                 let max_revisits = walk.revisit_counts.values().max().copied().unwrap_or(1) as f32;
                 let ln_max = max_revisits.ln().max(1.0);
+                let has_per_point = walk.point_colors.is_some();
 
                 for i in 0..walk.points.len() - 1 {
                     let p1 = vec3(walk.points[i][0], walk.points[i][1], walk.points[i][2]);
@@ -729,24 +732,26 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Resu
                     let length = dir.magnitude();
 
                     if length > 0.001 {
-                        // Look up visit counts at both endpoints
-                        let key1 = (
-                            walk.points[i][0].round() as i32,
-                            walk.points[i][1].round() as i32,
-                            walk.points[i][2].round() as i32,
-                        );
-                        let key2 = (
-                            walk.points[i + 1][0].round() as i32,
-                            walk.points[i + 1][1].round() as i32,
-                            walk.points[i + 1][2].round() as i32,
-                        );
-                        let count1 = *walk.revisit_counts.get(&key1).unwrap_or(&1) as f32;
-                        let count2 = *walk.revisit_counts.get(&key2).unwrap_or(&1) as f32;
-                        let avg_count = (count1 + count2) * 0.5;
-
-                        // Scale radius by visit count (log scale)
-                        let radius = line_scale
-                            * (0.15 + 0.85 * avg_count.ln().max(0.0) / ln_max);
+                        let radius = if has_per_point {
+                            // PDB structure mode: uniform tube radius
+                            line_scale * 0.4
+                        } else {
+                            // Walk mode: scale radius by visit count (log scale)
+                            let key1 = (
+                                walk.points[i][0].round() as i32,
+                                walk.points[i][1].round() as i32,
+                                walk.points[i][2].round() as i32,
+                            );
+                            let key2 = (
+                                walk.points[i + 1][0].round() as i32,
+                                walk.points[i + 1][1].round() as i32,
+                                walk.points[i + 1][2].round() as i32,
+                            );
+                            let count1 = *walk.revisit_counts.get(&key1).unwrap_or(&1) as f32;
+                            let count2 = *walk.revisit_counts.get(&key2).unwrap_or(&1) as f32;
+                            let avg_count = (count1 + count2) * 0.5;
+                            line_scale * (0.15 + 0.85 * avg_count.ln().max(0.0) / ln_max)
+                        };
 
                         let up = vec3(0.0, 1.0, 0.0);
                         let rotation = if dir.normalize().dot(up).abs() > 0.999 {
@@ -762,8 +767,21 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Resu
                             * Mat4::from_nonuniform_scale(radius, length * 0.5, radius);
 
                         instances.transformations.push(transform);
+
+                        // Use per-point color if available, otherwise walk color
+                        let seg_color = if let Some(ref pc) = walk.point_colors {
+                            let c = pc.get(i).unwrap_or(&walk.color);
+                            Srgba::new(
+                                (c[0] * 255.0) as u8,
+                                (c[1] * 255.0) as u8,
+                                (c[2] * 255.0) as u8,
+                                255,
+                            )
+                        } else {
+                            color
+                        };
                         if let Some(ref mut colors) = instances.colors {
-                            colors.push(color);
+                            colors.push(seg_color);
                         }
                     }
                 }
@@ -778,37 +796,54 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Resu
                 }
             }
 
-            // Points (spheres scaled by revisit count)
+            // Points (spheres scaled by revisit count, or per-atom for PDB structures)
             if show_points {
                 let mut instances = Instances::default();
                 instances.transformations = Vec::new();
                 instances.colors = Some(Vec::new());
 
-                // Get max revisit count for scaling
-                let max_revisits = walk.revisit_counts.values().max().copied().unwrap_or(1) as f32;
+                if walk.point_colors.is_some() {
+                    // PDB structure mode: render a sphere at each Cα atom position
+                    let atom_size = 0.6 * point_scale;
+                    for (idx, p) in walk.points.iter().enumerate() {
+                        let transform = Mat4::from_translation(vec3(p[0], p[1], p[2]))
+                            * Mat4::from_scale(atom_size);
+                        instances.transformations.push(transform);
 
-                // Render a sphere at each unique position
-                for (&(x, y, z), &count) in &walk.revisit_counts {
-                    // Scale sphere size based on revisit count (log scale for better visibility)
-                    let base_size = 0.8 * point_scale;
-                    let scale_factor = 1.0 + (count as f32).ln().max(0.0) / max_revisits.ln().max(1.0) * 2.0;
-                    let size = base_size * scale_factor;
+                        let c = walk.point_colors.as_ref().unwrap()
+                            .get(idx).unwrap_or(&walk.color);
+                        if let Some(ref mut colors) = instances.colors {
+                            colors.push(Srgba::new(
+                                (c[0] * 255.0) as u8,
+                                (c[1] * 255.0) as u8,
+                                (c[2] * 255.0) as u8,
+                                255,
+                            ));
+                        }
+                    }
+                } else {
+                    // Walk mode: render spheres at unique grid positions
+                    let max_revisits = walk.revisit_counts.values().max().copied().unwrap_or(1) as f32;
 
-                    let transform = Mat4::from_translation(vec3(x as f32, y as f32, z as f32))
-                        * Mat4::from_scale(size);
+                    for (&(x, y, z), &count) in &walk.revisit_counts {
+                        let base_size = 0.8 * point_scale;
+                        let scale_factor = 1.0 + (count as f32).ln().max(0.0) / max_revisits.ln().max(1.0) * 2.0;
+                        let size = base_size * scale_factor;
 
-                    instances.transformations.push(transform);
+                        let transform = Mat4::from_translation(vec3(x as f32, y as f32, z as f32))
+                            * Mat4::from_scale(size);
+                        instances.transformations.push(transform);
 
-                    // Color intensity based on revisit count
-                    let intensity = 0.5 + 0.5 * (count as f32 / max_revisits).sqrt();
-                    let point_color = Srgba::new(
-                        ((walk.color[0] * intensity) * 255.0).min(255.0) as u8,
-                        ((walk.color[1] * intensity) * 255.0).min(255.0) as u8,
-                        ((walk.color[2] * intensity) * 255.0).min(255.0) as u8,
-                        255,
-                    );
-                    if let Some(ref mut colors) = instances.colors {
-                        colors.push(point_color);
+                        let intensity = 0.5 + 0.5 * (count as f32 / max_revisits).sqrt();
+                        let point_color = Srgba::new(
+                            ((walk.color[0] * intensity) * 255.0).min(255.0) as u8,
+                            ((walk.color[1] * intensity) * 255.0).min(255.0) as u8,
+                            ((walk.color[2] * intensity) * 255.0).min(255.0) as u8,
+                            255,
+                        );
+                        if let Some(ref mut colors) = instances.colors {
+                            colors.push(point_color);
+                        }
                     }
                 }
 
@@ -1837,6 +1872,11 @@ fn check_data_exists(id: &str, converter: &str, url: &str) -> bool {
             std::path::Path::new(&format!("data/finance/{}.json", symbol)).exists()
         }
         c if c.starts_with("math.") => true, // Math is computed, always available
+        "pdb_backbone" | "pdb_sequence" | "pdb_structure" => {
+            let pdb_id = url.rsplit('/').next().unwrap_or(id)
+                .trim_end_matches(".pdb").to_lowercase();
+            std::path::Path::new(&format!("data/proteins/{}.pdb", pdb_id)).exists()
+        }
         _ => false,
     }
 }
@@ -1917,6 +1957,66 @@ fn load_walk_data(
 ) -> Option<WalkData> {
     use crate::converters;
     use crate::walk::{walk_base4, walk_base6};
+
+    // PDB structure mode: raw Cα coordinates, bypasses walk engine entirely
+    if source.converter == "pdb_structure" {
+        let pdb_id = source.url.rsplit('/').next().unwrap_or(&source.id)
+            .trim_end_matches(".pdb").to_lowercase();
+        let path = std::path::PathBuf::from(format!("data/proteins/{}.pdb", pdb_id));
+
+        if !path.exists() {
+            warn!("No PDB file found for {}: {:?}", source.id, path);
+            return None;
+        }
+
+        match converters::load_pdb_structure(&path) {
+            Ok((points, residues)) => {
+                info!("Loaded PDB structure {} with {} Cα atoms", source.id, points.len());
+
+                // Center the structure around the origin
+                let n = points.len() as f32;
+                let cx = points.iter().map(|p| p[0]).sum::<f32>() / n;
+                let cy = points.iter().map(|p| p[1]).sum::<f32>() / n;
+                let cz = points.iter().map(|p| p[2]).sum::<f32>() / n;
+                let centered: Vec<[f32; 3]> = points.iter()
+                    .map(|p| [p[0] - cx, p[1] - cy, p[2] - cz])
+                    .collect();
+
+                // Per-residue colors
+                let point_colors: Vec<[f32; 3]> = residues.iter()
+                    .map(|r| converters::residue_color(r))
+                    .collect();
+                // Pad if residue count doesn't match point count
+                let point_colors = if point_colors.len() < centered.len() {
+                    let mut pc = point_colors;
+                    pc.resize(centered.len(), [0.5, 0.5, 0.5]);
+                    pc
+                } else {
+                    point_colors
+                };
+
+                // No revisit counting for structure mode - each position is unique
+                let mut revisit_counts = std::collections::HashMap::new();
+                for p in &centered {
+                    let key = (p[0].round() as i32, p[1].round() as i32, p[2].round() as i32);
+                    *revisit_counts.entry(key).or_insert(0) += 1;
+                }
+
+                return Some(WalkData {
+                    name: source.name.clone(),
+                    points: centered,
+                    color,
+                    visible: true,
+                    revisit_counts,
+                    point_colors: Some(point_colors),
+                });
+            }
+            Err(e) => {
+                warn!("Failed to load PDB structure {}: {}", source.id, e);
+                return None;
+            }
+        }
+    }
 
     // All conversion happens on-the-fly - no pre-computed storage
     let digits = if source.converter.starts_with("math.") {
@@ -2003,6 +2103,42 @@ fn load_walk_data(
                     }
                 }
             }
+            "pdb_backbone" => {
+                let pdb_id = source.url.rsplit('/').next().unwrap_or(&source.id)
+                    .trim_end_matches(".pdb").to_lowercase();
+                let path = std::path::PathBuf::from(format!("data/proteins/{}.pdb", pdb_id));
+
+                if !path.exists() {
+                    warn!("No PDB file found for {}: {:?}", source.id, path);
+                    return None;
+                }
+
+                match converters::load_pdb_backbone_raw(&path, base) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        warn!("Failed to convert PDB backbone {}: {}", source.id, e);
+                        return None;
+                    }
+                }
+            }
+            "pdb_sequence" => {
+                let pdb_id = source.url.rsplit('/').next().unwrap_or(&source.id)
+                    .trim_end_matches(".pdb").to_lowercase();
+                let path = std::path::PathBuf::from(format!("data/proteins/{}.pdb", pdb_id));
+
+                if !path.exists() {
+                    warn!("No PDB file found for {}: {:?}", source.id, path);
+                    return None;
+                }
+
+                match converters::load_pdb_sequence_raw(&path, base) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        warn!("Failed to convert PDB sequence {}: {}", source.id, e);
+                        return None;
+                    }
+                }
+            }
             _ => return None,
         }
     };
@@ -2045,6 +2181,7 @@ fn load_walk_data(
         color,
         visible: true,
         revisit_counts,
+        point_colors: None,
     })
 }
 

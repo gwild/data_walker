@@ -171,6 +171,15 @@ pub async fn download_audio(id: &str, url: &str, output_dir: &PathBuf) -> Result
         return download_raw_mp3(id, mp3_url, output_dir).await;
     }
 
+    // Freesound sources - download via API
+    if url.contains("freesound.org/s/") {
+        if let Some(sound_id_str) = url.trim_end_matches('/').rsplit('/').next() {
+            if let Ok(sound_id) = sound_id_str.parse::<u64>() {
+                return download_freesound(sound_id, id, output_dir).await;
+            }
+        }
+    }
+
     anyhow::bail!("Audio source '{}' requires manual download from: {}", id, url)
 }
 
@@ -409,6 +418,39 @@ pub async fn download_freesound(sound_id: u64, output_id: &str, output_dir: &Pat
     let path = output_dir.join(format!("{}.mp3", output_id));
     std::fs::write(&path, &mp3_data)?;
     tracing::info!("Saved to {:?}", path);
+
+    Ok(path)
+}
+
+/// Download protein structure from RCSB PDB - stores RAW .pdb file
+/// PDB REST API: https://files.rcsb.org/download/{PDB_ID}.pdb
+pub async fn download_pdb(pdb_id: &str, output_dir: &PathBuf) -> Result<PathBuf> {
+    let id_lower = pdb_id.to_uppercase();
+    tracing::info!("Downloading PDB structure: {}", id_lower);
+
+    let url = format!("https://files.rcsb.org/download/{}.pdb", id_lower);
+    tracing::debug!("Fetching from: {}", url);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()?;
+
+    let response = client.get(&url)
+        .header("User-Agent", "DataWalker/0.1 (github.com/gwild/data_walker)")
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("RCSB PDB returned status {} for {}", response.status(), id_lower);
+    }
+
+    let pdb_text = response.text().await?;
+    tracing::debug!("Downloaded {} bytes of PDB data", pdb_text.len());
+
+    std::fs::create_dir_all(output_dir)?;
+    let path = output_dir.join(format!("{}.pdb", pdb_id.to_lowercase()));
+    std::fs::write(&path, &pdb_text)?;
+    tracing::info!("Saved raw PDB to {:?}", path);
 
     Ok(path)
 }

@@ -568,6 +568,17 @@ async fn download_source(config: &config::Config, id: &str, data_dir: &PathBuf) 
                 Err(e) => println!("  Failed: {}", e),
             }
         }
+        "pdb" | "pdb_backbone" | "pdb_sequence" | "pdb_structure" => {
+            let proteins_dir = data_dir.join("proteins");
+            std::fs::create_dir_all(&proteins_dir)?;
+            // Extract PDB ID from RCSB URL (e.g., https://files.rcsb.org/download/9NCF.pdb → 9ncf)
+            let pdb_id = source.url.rsplit('/').next().unwrap_or(&source.id)
+                .trim_end_matches(".pdb");
+            match download::download_pdb(pdb_id, &proteins_dir).await {
+                Ok(path) => println!("  Saved raw PDB to {:?}", path),
+                Err(e) => println!("  Failed: {}", e),
+            }
+        }
         other => {
             println!("  Converter '{}' not implemented yet", other);
         }

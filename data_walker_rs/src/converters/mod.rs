@@ -9,6 +9,7 @@
 //! - dna: ACGT base-4 to base-12 from FASTA files
 //! - finance: Price deltas from JSON price arrays
 //! - cosmos: LIGO strain data from .txt.gz files
+//! - pdb: Protein structure backbone coordinates from PDB files
 
 pub mod audio;
 pub mod math;
@@ -387,6 +388,223 @@ fn load_mp3_midi_notes(path: &Path) -> anyhow::Result<Vec<MidiNote>> {
     Ok(audio::audio_to_midi_notes(&samples, sample_rate))
 }
 
+// ============================================================================
+// PDB Protein Structure converters
+// ============================================================================
+
+/// Parse PDB ATOM records and extract C-alpha (backbone) coordinates
+fn parse_pdb_ca_coords(content: &str) -> Vec<[f64; 3]> {
+    let mut coords = Vec::new();
+    for line in content.lines() {
+        if (line.starts_with("ATOM") || line.starts_with("HETATM")) && line.len() >= 54 {
+            if let Some(atom_name) = line.get(12..16) {
+                if atom_name.trim() == "CA" {
+                    if let (Some(x_s), Some(y_s), Some(z_s)) =
+                        (line.get(30..38), line.get(38..46), line.get(46..54))
+                    {
+                        if let (Ok(x), Ok(y), Ok(z)) = (
+                            x_s.trim().parse::<f64>(),
+                            y_s.trim().parse::<f64>(),
+                            z_s.trim().parse::<f64>(),
+                        ) {
+                            coords.push([x, y, z]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    coords
+}
+
+/// Parse amino acid residues from PDB ATOM records (one per residue via CA atoms)
+fn parse_pdb_residues(content: &str) -> Vec<String> {
+    let mut residues = Vec::new();
+    let mut last_res_seq = String::new();
+    for line in content.lines() {
+        if line.starts_with("ATOM") && line.len() >= 26 {
+            if let Some(atom_name) = line.get(12..16) {
+                if atom_name.trim() == "CA" {
+                    if let (Some(res_name), Some(res_seq)) = (line.get(17..20), line.get(22..26)) {
+                        let seq = res_seq.trim().to_string();
+                        if seq != last_res_seq {
+                            residues.push(res_name.trim().to_string());
+                            last_res_seq = seq;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    residues
+}
+
+/// PDB Backbone Converter: sequential Cα direction changes → base-12
+/// Computes direction deltas between consecutive Cα atoms and maps
+/// the dominant axis/direction to base-12 (like a 3D turtle walk of the backbone)
+pub fn convert_pdb_backbone(coords: &[[f64; 3]]) -> Vec<u8> {
+    if coords.len() < 2 {
+        return vec![0];
+    }
+
+    let mut digits = Vec::with_capacity(coords.len() - 1);
+
+    for pair in coords.windows(2) {
+        let dx = pair[1][0] - pair[0][0];
+        let dy = pair[1][1] - pair[0][1];
+        let dz = pair[1][2] - pair[0][2];
+
+        // Find dominant axis and encode as base-12:
+        // 0-5: translations (+X, -X, +Y, -Y, +Z, -Z)
+        // 6-11: encode the magnitude of the secondary axes as rotation hints
+        let abs_dx = dx.abs();
+        let abs_dy = dy.abs();
+        let abs_dz = dz.abs();
+
+        // Primary direction (translation)
+        let primary = if abs_dx >= abs_dy && abs_dx >= abs_dz {
+            if dx >= 0.0 { 0 } else { 1 } // +X or -X
+        } else if abs_dy >= abs_dx && abs_dy >= abs_dz {
+            if dy >= 0.0 { 2 } else { 3 } // +Y or -Y
+        } else {
+            if dz >= 0.0 { 4 } else { 5 } // +Z or -Z
+        };
+
+        digits.push(primary);
+
+        // Secondary: encode rotation based on off-axis components
+        // This gives the walk both translation AND rotation character
+        let total = abs_dx + abs_dy + abs_dz;
+        if total > 0.0 {
+            let ratio = match primary {
+                0 | 1 => (abs_dy + abs_dz) / total, // off-axis fraction
+                2 | 3 => (abs_dx + abs_dz) / total,
+                _ => (abs_dx + abs_dy) / total,
+            };
+            // Map ratio [0, 1) to rotation values [6, 11]
+            let rot = 6 + (ratio * 5.99).floor() as u8;
+            digits.push(rot);
+        }
+    }
+
+    digits
+}
+
+/// PDB Sequence Converter: amino acid type → base-12 by chemical property
+/// Groups 20 standard amino acids into 12 buckets by physicochemical properties
+pub fn convert_pdb_sequence(residues: &[String]) -> Vec<u8> {
+    residues.iter().map(|res| {
+        match res.as_str() {
+            // Nonpolar aliphatic
+            "GLY"         => 0,  // Glycine - smallest
+            "ALA"         => 1,  // Alanine - small hydrophobic
+            "VAL" | "ILE" => 2,  // Branched-chain hydrophobic
+            "LEU"         => 3,  // Leucine - hydrophobic
+            // Nonpolar aromatic
+            "PHE"         => 4,  // Phenylalanine
+            "TRP"         => 5,  // Tryptophan - largest
+            // Polar uncharged
+            "SER" | "THR" => 6,  // Hydroxyl group
+            "ASN" | "GLN" => 7,  // Amide group
+            "CYS" | "MET" => 8,  // Sulfur-containing
+            // Polar charged
+            "ASP" | "GLU" => 9,  // Acidic (negative)
+            "LYS" | "ARG" => 10, // Basic (positive)
+            "HIS"         => 11, // Histidine - can be + or neutral
+            // Special / proline
+            "PRO"         => 0,  // Proline - structurally rigid, map to glycine bucket
+            // Non-standard → middle value
+            _             => 6,
+        }
+    }).collect()
+}
+
+/// Load PDB file - raw Cα coordinates for direct 3D structure rendering
+/// Returns (coords, residue_names) for the backbone trace
+pub fn load_pdb_structure(path: &Path) -> anyhow::Result<(Vec<[f32; 3]>, Vec<String>)> {
+    let content = std::fs::read_to_string(path)?;
+    let coords = parse_pdb_ca_coords(&content);
+    let residues = parse_pdb_residues(&content);
+
+    if coords.len() < 2 {
+        anyhow::bail!("No C-alpha backbone found in PDB file (need >= 2 atoms)");
+    }
+
+    // Convert f64 coords to f32
+    let points: Vec<[f32; 3]> = coords.iter()
+        .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
+        .collect();
+
+    Ok((points, residues))
+}
+
+/// Map amino acid name to a color category (0-11) for structure coloring
+pub fn residue_color(res: &str) -> [f32; 3] {
+    match res {
+        // Nonpolar aliphatic - grays/whites
+        "GLY"         => [0.75, 0.75, 0.75], // light gray
+        "ALA"         => [0.80, 0.80, 0.80], // lighter gray
+        "VAL" | "ILE" => [0.15, 0.60, 0.15], // green
+        "LEU"         => [0.10, 0.50, 0.10], // dark green
+        "PRO"         => [0.86, 0.65, 0.13], // goldenrod
+        // Aromatic - purple/magenta
+        "PHE"         => [0.60, 0.20, 0.80], // purple
+        "TRP"         => [0.70, 0.10, 0.70], // magenta
+        "TYR"         => [0.50, 0.25, 0.70], // violet
+        // Polar uncharged - teal/cyan
+        "SER"         => [0.25, 0.75, 0.75], // teal
+        "THR"         => [0.20, 0.65, 0.65], // dark teal
+        "ASN"         => [0.00, 0.80, 0.80], // cyan
+        "GLN"         => [0.00, 0.65, 0.65], // dark cyan
+        // Sulfur - yellow
+        "CYS"         => [0.90, 0.90, 0.00], // bright yellow
+        "MET"         => [0.80, 0.80, 0.00], // yellow
+        // Charged negative - red
+        "ASP"         => [0.90, 0.15, 0.15], // red
+        "GLU"         => [0.80, 0.10, 0.10], // dark red
+        // Charged positive - blue
+        "LYS"         => [0.20, 0.30, 0.90], // blue
+        "ARG"         => [0.15, 0.25, 0.80], // dark blue
+        "HIS"         => [0.40, 0.50, 0.90], // light blue
+        // Unknown
+        _             => [0.50, 0.50, 0.50], // gray
+    }
+}
+
+/// Load PDB file - backbone mode: Cα direction deltas → base-12
+pub fn load_pdb_backbone_raw(path: &Path, base: u32) -> anyhow::Result<Vec<u8>> {
+    let content = std::fs::read_to_string(path)?;
+    let coords = parse_pdb_ca_coords(&content);
+
+    if coords.len() < 2 {
+        anyhow::bail!("No C-alpha backbone found in PDB file (need >= 2 atoms)");
+    }
+
+    let base12 = convert_pdb_backbone(&coords);
+    Ok(match base {
+        4 => base12.iter().map(|&d| d % 4).collect(),
+        6 => base12.iter().map(|&d| d % 6).collect(),
+        _ => base12,
+    })
+}
+
+/// Load PDB file - sequence mode: amino acid properties → base-12
+pub fn load_pdb_sequence_raw(path: &Path, base: u32) -> anyhow::Result<Vec<u8>> {
+    let content = std::fs::read_to_string(path)?;
+    let residues = parse_pdb_residues(&content);
+
+    if residues.is_empty() {
+        anyhow::bail!("No amino acid residues found in PDB file");
+    }
+
+    let base12 = convert_pdb_sequence(&residues);
+    Ok(match base {
+        4 => base12.iter().map(|&d| d % 4).collect(),
+        6 => base12.iter().map(|&d| d % 6).collect(),
+        _ => base12,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,5 +630,49 @@ mod tests {
         let prices = vec![100.0, 110.0, 105.0, 115.0];
         let base12 = convert_finance(&prices);
         assert_eq!(base12.len(), 3); // n-1 deltas
+    }
+
+    #[test]
+    fn test_pdb_backbone() {
+        let coords = vec![
+            [0.0, 0.0, 0.0],
+            [3.8, 0.0, 0.0],   // +X
+            [3.8, 3.8, 0.0],   // +Y
+            [3.8, 3.8, 3.8],   // +Z
+        ];
+        let digits = convert_pdb_backbone(&coords);
+        assert!(!digits.is_empty());
+        assert!(digits.iter().all(|&d| d < 12));
+        // First move is purely +X, so primary digit should be 0
+        assert_eq!(digits[0], 0);
+    }
+
+    #[test]
+    fn test_pdb_sequence() {
+        let residues = vec!["GLY", "ALA", "LEU", "ASP", "HIS"]
+            .into_iter().map(String::from).collect::<Vec<_>>();
+        let digits = convert_pdb_sequence(&residues);
+        assert_eq!(digits.len(), 5);
+        assert_eq!(digits[0], 0);  // GLY
+        assert_eq!(digits[1], 1);  // ALA
+        assert_eq!(digits[2], 3);  // LEU
+        assert_eq!(digits[3], 9);  // ASP
+        assert_eq!(digits[4], 11); // HIS
+    }
+
+    #[test]
+    fn test_parse_pdb_ca_coords() {
+        let pdb = "\
+ATOM      1  N   ALA A   1       1.000   2.000   3.000  1.00  0.00           N
+ATOM      2  CA  ALA A   1       2.000   3.000   4.000  1.00  0.00           C
+ATOM      3  C   ALA A   1       3.000   4.000   5.000  1.00  0.00           C
+ATOM      4  N   GLY A   2       4.000   5.000   6.000  1.00  0.00           N
+ATOM      5  CA  GLY A   2       5.000   6.000   7.000  1.00  0.00           C
+END
+";
+        let coords = parse_pdb_ca_coords(pdb);
+        assert_eq!(coords.len(), 2);
+        assert_eq!(coords[0], [2.0, 3.0, 4.0]);
+        assert_eq!(coords[1], [5.0, 6.0, 7.0]);
     }
 }

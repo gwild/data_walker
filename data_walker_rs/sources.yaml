@@ -17,6 +17,8 @@ converters:
   math: "Direct base-12 digit expansion"
   finance: "Price delta normalized to 0-11"
   cosmos: "Strain amplitude normalized to 0-11"
+  pdb_backbone: "Protein C-alpha backbone direction deltas to base-12"
+  pdb_sequence: "Amino acid chemical properties to base-12"
 
 categories:
   animals: Animals
@@ -26,6 +28,7 @@ categories:
   environment: Environment
   finance: Finance
   math: Math
+  proteins: Proteins
 
 sources:
   # ============================================
@@ -981,3 +984,89 @@ sources:
     converter: audio
     mapping: Optimal
     url: "https://freesound.org/s/784596"
+
+  # ============================================================================
+  # Proteins - Bacteriophage Bas63 (Felixounavirus) cryo-EM structures
+  # Paper: "Cryo-EM structure of bacteriophage Bas63" (Science Advances, 2025)
+  # DOI: 10.1126/sciadv.adx0790
+  # Source: RCSB Protein Data Bank (https://www.rcsb.org/)
+  # ============================================================================
+
+  # Backbone walks - trace the protein fold through 3D space
+  - id: bas63_capsid_backbone
+    name: "Bas63 Capsid (backbone)"
+    category: proteins
+    subcategory: Phage Bas63
+    converter: pdb_backbone
+    mapping: Optimal
+    url: "https://files.rcsb.org/download/9NCF.pdb"
+
+  - id: bas63_connector_backbone
+    name: "Bas63 Connector (backbone)"
+    category: proteins
+    subcategory: Phage Bas63
+    converter: pdb_backbone
+    mapping: Optimal
+    url: "https://files.rcsb.org/download/9MT4.pdb"
+
+  - id: bas63_tail_backbone
+    name: "Bas63 Tail (backbone)"
+    category: proteins
+    subcategory: Phage Bas63
+    converter: pdb_backbone
+    mapping: Spiral
+    url: "https://files.rcsb.org/download/9MT5.pdb"
+
+  # NOTE: 9NDY (baseplate) not yet released by RCSB as of 2026-03
+
+  # Sequence walks - amino acid chemical properties as base-12
+  - id: bas63_capsid_sequence
+    name: "Bas63 Capsid (sequence)"
+    category: proteins
+    subcategory: Phage Bas63
+    converter: pdb_sequence
+    mapping: Identity
+    url: "https://files.rcsb.org/download/9NCF.pdb"
+
+  - id: bas63_connector_sequence
+    name: "Bas63 Connector (sequence)"
+    category: proteins
+    subcategory: Phage Bas63
+    converter: pdb_sequence
+    mapping: Identity
+    url: "https://files.rcsb.org/download/9MT4.pdb"
+
+  - id: bas63_tail_sequence
+    name: "Bas63 Tail (sequence)"
+    category: proteins
+    subcategory: Phage Bas63
+    converter: pdb_sequence
+    mapping: Identity
+    url: "https://files.rcsb.org/download/9MT5.pdb"
+
+  # NOTE: 9NDY baseplate sequence also pending RCSB release
+
+  # 3D structure views - actual Cα backbone coordinates, colored by residue type
+  - id: bas63_capsid_structure
+    name: "Bas63 Capsid (3D structure)"
+    category: proteins
+    subcategory: Phage Bas63
+    converter: pdb_structure
+    mapping: Identity
+    url: "https://files.rcsb.org/download/9NCF.pdb"
+
+  - id: bas63_connector_structure
+    name: "Bas63 Connector (3D structure)"
+    category: proteins
+    subcategory: Phage Bas63
+    converter: pdb_structure
+    mapping: Identity
+    url: "https://files.rcsb.org/download/9MT4.pdb"
+
+  - id: bas63_tail_structure
+    name: "Bas63 Tail (3D structure)"
+    category: proteins
+    subcategory: Phage Bas63
+    converter: pdb_structure
+    mapping: Identity
+    url: "https://files.rcsb.org/download/9MT5.pdb"
