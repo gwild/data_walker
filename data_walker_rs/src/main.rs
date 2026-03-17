@@ -191,18 +191,17 @@ async fn main() -> anyhow::Result<()> {
     tracing::debug!("CLI args parsed: config={:?}", cli.config);
 
     // Load config
-    let config = if cli.config.exists() {
-        tracing::info!("Loading config from {:?}", cli.config);
-        config::Config::load(&cli.config)?
-    } else {
-        tracing::warn!("Config file not found: {:?}, using defaults", cli.config);
-        default_config()
-    };
+    if !cli.config.exists() {
+        anyhow::bail!("Config file not found: {}", cli.config.display());
+    }
+    tracing::info!("Loading config from {:?}", cli.config);
+    let config = config::Config::load(&cli.config)?;
     tracing::info!("Config loaded: {} sources, {} mappings",
         config.sources.len(), config.mappings.len());
 
     // Load secrets
     let secrets = config::Secrets::load();
+    let data_dir = PathBuf::from(&secrets.data_dir);
 
     match cli.command {
         Commands::Gui { select, flight, play, quit_after, screenshot, ipc_port, json_events } => {
@@ -228,7 +227,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             tracing::info!("Launching native GUI viewer");
-            gui::run_viewer(config, auto_config)?;
+            gui::run_viewer(config, auto_config, data_dir)?;
         }
 
         Commands::GenerateMath { output } => {
@@ -236,7 +235,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Commands::GenerateThumbnails { output, size } => {
-            thumbnail::generate(&config, &output, size)?;
+            thumbnail::generate(&config, &data_dir, &output, size)?;
         }
 
         Commands::List { category } => {
@@ -244,8 +243,6 @@ async fn main() -> anyhow::Result<()> {
         }
 
         Commands::Download { source, category, all } => {
-            let data_dir = PathBuf::from(&secrets.data_dir);
-
             if all {
                 download_all(&config, &data_dir).await?;
             } else if let Some(cat) = category {
@@ -285,7 +282,7 @@ async fn main() -> anyhow::Result<()> {
                 }
                 FreesoundAction::Download { sound_id, id, name, category, subcategory } => {
                     let output_id = id.unwrap_or_else(|| format!("freesound_{}", sound_id));
-                    let output_dir = PathBuf::from("data/audio");
+                    let output_dir = data_dir.join("audio");
 
                     let path = download::download_freesound(sound_id, &output_id, &output_dir).await?;
                     println!("Downloaded to: {:?}", path);
@@ -624,58 +621,6 @@ async fn download_source(config: &config::Config, id: &str, data_dir: &PathBuf) 
     }
 
     Ok(())
-}
-
-/// Default config when no file exists
-fn default_config() -> config::Config {
-    use std::collections::HashMap;
-
-    let mut mappings = HashMap::new();
-    mappings.insert("Identity".to_string(), vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
-    mappings.insert("Optimal".to_string(), vec![0, 1, 2, 3, 4, 5, 6, 7, 10, 9, 8, 11]);
-    mappings.insert("Spiral".to_string(), vec![0, 2, 4, 6, 8, 10, 1, 3, 5, 7, 9, 11]);
-    mappings.insert("Stock-opt".to_string(), vec![1, 0, 2, 4, 10, 5, 6, 9, 8, 7, 3, 11]);
-
-    let mut categories = HashMap::new();
-    categories.insert("math".to_string(), "Math".to_string());
-
-    let sources = vec![
-        config::Source {
-            id: "pi".to_string(),
-            name: "Pi".to_string(),
-            category: "math".to_string(),
-            subcategory: "Constants".to_string(),
-            converter: "math.constant.pi".to_string(),
-            mapping: "Identity".to_string(),
-            url: "computed://mpmath".to_string(),
-        },
-        config::Source {
-            id: "e".to_string(),
-            name: "Euler's Number (e)".to_string(),
-            category: "math".to_string(),
-            subcategory: "Constants".to_string(),
-            converter: "math.constant.e".to_string(),
-            mapping: "Identity".to_string(),
-            url: "computed://mpmath".to_string(),
-        },
-        config::Source {
-            id: "dragon_curve".to_string(),
-            name: "Dragon Curve".to_string(),
-            category: "math".to_string(),
-            subcategory: "Fractals".to_string(),
-            converter: "math.fractal.dragon".to_string(),
-            mapping: "Identity".to_string(),
-            url: "computed://lsystem".to_string(),
-        },
-    ];
-
-    config::Config {
-        mappings,
-        mappings_base6: HashMap::new(),
-        categories,
-        converters: HashMap::new(),
-        sources,
-    }
 }
 
 /// Kill any existing data_walker GUI instances (Windows)

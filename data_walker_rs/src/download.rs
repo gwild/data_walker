@@ -508,9 +508,26 @@ pub struct FreesoundResult {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn test_placeholder() {
-        // Tests moved to converters module
-        assert!(true);
+    use super::*;
+
+    #[tokio::test]
+    async fn test_unknown_audio_source_fails_without_fake_download() {
+        let output_dir = std::env::temp_dir().join(format!(
+            "data_walker_test_{}",
+            std::process::id()
+        ));
+        let expected_path = output_dir.join("unknown_source.mp3");
+        let result = download_audio(
+            "unknown_source",
+            "https://example.com/manual-download-required",
+            &output_dir,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("requires manual download"));
+        assert!(err.contains("example.com/manual-download-required"));
+        assert!(!expected_path.exists());
     }
 }

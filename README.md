@@ -18,14 +18,20 @@ cd data_walker_rs
 # Build
 cargo build --release
 
-# Start the web server (serves gallery at http://localhost:8080)
-cargo run -- serve
+# Launch the native GUI
+cargo run -- gui
+
+# Relaunch GUI cleanly during development
+cargo run --bin launch_gui
 
 # Download data from real sources
 cargo run -- download --all
 
 # Generate math walks only (no network needed)
 cargo run -- generate-math
+
+# Generate thumbnails
+cargo run -- generate-thumbnails
 
 # List available sources
 cargo run -- list
@@ -36,13 +42,17 @@ cargo run -- list --category dna
 
 | Command | Description |
 |---------|-------------|
-| `serve [--port 8080]` | Start HTTP server with REST API + web UI |
 | `gui` | Launch native GUI viewer (egui + three-d) |
+| `launch_gui` | Development wrapper: stop existing GUI, build, and relaunch |
 | `generate-math [--output data/math]` | Generate math walks locally |
+| `generate-thumbnails [--output thumbnails] [--size 512]` | Render thumbnail gallery images |
 | `list [--category <name>]` | List available data sources |
 | `download --source <id>` | Download a single source |
 | `download --category <cat>` | Download all sources in a category |
 | `download --all` | Download everything |
+| `freesound search <query>` | Search Freesound for additional audio sources |
+| `freesound download <ID>` | Download a Freesound clip into the raw audio store |
+| `test-notes <file>` | Inspect extracted note data from an audio file |
 
 ## Data Sources
 
@@ -93,36 +103,22 @@ data_walker/
 │   ├── Cargo.toml          # Dependencies
 │   ├── sources.yaml        # SSOT: all data source definitions
 │   ├── src/
-│   │   ├── main.rs         # CLI entry point (5 subcommands)
+│   │   ├── main.rs         # CLI entry point
 │   │   ├── config.rs       # YAML config loader
 │   │   ├── walk.rs         # 3D turtle walk engine (quaternions)
-│   │   ├── state.rs        # Thread-safe walk cache
-│   │   ├── server.rs       # Axum HTTP server + REST API
 │   │   ├── download.rs     # Real data downloaders (NCBI, Yahoo, GWOSC, Archive.org)
 │   │   ├── gui.rs          # Native GUI (egui + three-d)
+│   │   ├── thumbnail.rs    # Offscreen thumbnail renderer
+│   │   ├── automation.rs   # GUI automation IPC
 │   │   ├── logging.rs      # Rotating file logs
 │   │   └── converters/
 │   │       ├── mod.rs       # DNA, finance, cosmos converters
 │   │       ├── audio.rs     # FFT spectrogram to base-12
 │   │       └── math/        # Constants, fractals, Mandelbrot, sequences
-│   └── web/
-│       ├── index.html       # 3D walk viewer (Three.js)
-│       └── compare.html     # Multi-walk comparison tool
 ├── CLAUDE.md
 ├── README.md
 └── confessions_of_a_liar.md
 ```
-
-## REST API
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /api/config` | Full configuration |
-| `GET /api/walks` | List all walks (metadata) |
-| `GET /api/walks/:id` | Walk data (base-12 digits) |
-| `GET /api/walks/:id/points?mapping=<name>&max_points=<n>` | Computed 3D points |
-| `GET /api/mappings` | Available mappings |
-| `GET /api/categories` | Category list |
 
 ## No Fake Data Policy
 

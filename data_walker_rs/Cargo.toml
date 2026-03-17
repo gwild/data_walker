@@ -51,3 +51,5 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 # SpaceMouse support
 hidapi = "2"
+astro-float = "0.9.5"
+sysinfo = "0.38.4"

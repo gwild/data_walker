@@ -11,11 +11,6 @@ pub mod fractals;
 pub mod mandelbrot;
 pub mod sequences;
 
-pub use constants::*;
-pub use fractals::*;
-pub use mandelbrot::*;
-pub use sequences::*;
-
 /// All available math generators
 #[derive(Debug, Clone)]
 pub enum MathGenerator {
@@ -53,11 +48,21 @@ impl MathGenerator {
             MathGenerator::Phi => constants::phi_base12(n_digits),
             MathGenerator::Ln2 => constants::ln2_base12(n_digits),
 
-            MathGenerator::DragonCurve => fractals::dragon_curve(14),
-            MathGenerator::KochSnowflake => fractals::koch_snowflake(5),
-            MathGenerator::SierpinskiArrowhead => fractals::sierpinski_arrowhead(9),
-            MathGenerator::HilbertCurve => fractals::hilbert_curve(6),
-            MathGenerator::PeanoCurve => fractals::peano_curve(4),
+            MathGenerator::DragonCurve => {
+                generate_fractal_digits(n_digits, 1, fractals::dragon_curve)
+            }
+            MathGenerator::KochSnowflake => {
+                generate_fractal_digits(n_digits, 0, fractals::koch_snowflake)
+            }
+            MathGenerator::SierpinskiArrowhead => {
+                generate_fractal_digits(n_digits, 1, fractals::sierpinski_arrowhead)
+            }
+            MathGenerator::HilbertCurve => {
+                generate_fractal_digits(n_digits, 1, fractals::hilbert_curve)
+            }
+            MathGenerator::PeanoCurve => {
+                generate_fractal_digits(n_digits, 1, fractals::peano_curve)
+            }
 
             MathGenerator::Mandelbrot { c_re, c_im } => {
                 mandelbrot::mandelbrot_orbit(*c_re, *c_im, n_digits)
@@ -112,26 +117,26 @@ impl MathGenerator {
 
             // Mandelbrot named points (interesting locations on the boundary)
             (Some(&"mandelbrot"), Some(&"cardioid")) => {
-                // Main cardioid boundary
-                Some(MathGenerator::Mandelbrot { c_re: 0.25, c_im: 0.5 })
+                // Main cardioid edge
+                Some(MathGenerator::Mandelbrot { c_re: -0.75, c_im: 0.01 })
             }
             (Some(&"mandelbrot"), Some(&"spiral")) => {
                 // Spiral region
-                Some(MathGenerator::Mandelbrot { c_re: -0.75, c_im: 0.1 })
+                Some(MathGenerator::Mandelbrot { c_re: -0.7463, c_im: 0.1102 })
             }
             (Some(&"mandelbrot"), Some(&"antenna")) => {
                 // Near the antenna
-                Some(MathGenerator::Mandelbrot { c_re: -1.75, c_im: 0.0 })
+                Some(MathGenerator::Mandelbrot { c_re: -1.768, c_im: 0.001 })
             }
             (Some(&"mandelbrot"), Some(&"period3")) => {
                 // Period-3 bulb
-                Some(MathGenerator::Mandelbrot { c_re: -0.122, c_im: 0.745 })
+                Some(MathGenerator::Mandelbrot { c_re: -0.1225, c_im: 0.7449 })
             }
 
             // Julia set named points (classic Julia set parameters)
             (Some(&"julia"), Some(&"rabbit")) => {
                 // Douady's rabbit
-                Some(MathGenerator::Julia { c_re: -0.123, c_im: 0.745, z0_re: 0.0, z0_im: 0.0 })
+                Some(MathGenerator::Julia { c_re: -0.123, c_im: 0.745, z0_re: 0.1, z0_im: 0.1 })
             }
             (Some(&"julia"), Some(&"dragon")) => {
                 // Dragon Julia - use non-zero starting point for longer orbit
@@ -139,14 +144,66 @@ impl MathGenerator {
             }
             (Some(&"julia"), Some(&"spiral")) => {
                 // Spiral Julia
-                Some(MathGenerator::Julia { c_re: -0.4, c_im: 0.6, z0_re: 0.0, z0_im: 0.0 })
+                Some(MathGenerator::Julia { c_re: -0.4, c_im: 0.6, z0_re: 0.0, z0_im: 0.1 })
             }
             (Some(&"julia"), Some(&"siegel")) => {
                 // Siegel disk
-                Some(MathGenerator::Julia { c_re: -0.391, c_im: -0.587, z0_re: 0.0, z0_im: 0.0 })
+                Some(MathGenerator::Julia { c_re: -0.391, c_im: -0.587, z0_re: 0.1, z0_im: 0.1 })
             }
 
             _ => None,
         }
+    }
+}
+
+fn generate_fractal_digits(
+    n_digits: usize,
+    start_iteration: u32,
+    generator: fn(u32) -> Vec<u8>,
+) -> Vec<u8> {
+    if n_digits == 0 {
+        return vec![];
+    }
+
+    let mut iteration = start_iteration;
+    let mut digits = generator(iteration);
+
+    while digits.len() < n_digits {
+        iteration += 1;
+        digits = generator(iteration);
+    }
+
+    digits.truncate(n_digits);
+    digits
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MathGenerator;
+
+    #[test]
+    fn test_mandelbrot_cardioid_preset_has_translations() {
+        let generator = MathGenerator::from_converter_string("math.mandelbrot.cardioid")
+            .expect("cardioid preset should exist");
+
+        let digits = generator.generate(256);
+        assert!(!digits.is_empty());
+        assert!(
+            digits.iter().any(|&d| d < 6),
+            "cardioid preset should generate translation digits"
+        );
+    }
+
+    #[test]
+    fn test_julia_rabbit_preset_has_translations() {
+        let generator = MathGenerator::from_converter_string("math.julia.rabbit")
+            .expect("rabbit preset should exist");
+
+        let digits = generator.generate(256);
+        assert!(!digits.is_empty());
+        assert!(
+            digits.iter().any(|&d| d < 6),
+            "rabbit preset should generate translation digits"
+        );
     }
 }

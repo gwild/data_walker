@@ -8,7 +8,7 @@ use std::path::Path;
 use three_d::*;
 use tracing::{info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, DataPaths};
 use crate::converters;
 use crate::converters::math::MathGenerator;
 use crate::walk::{walk_base12, walk_base4};
@@ -17,18 +17,45 @@ use crate::walk::{walk_base12, walk_base4};
 struct WalkRender {
     points: Vec<[f32; 3]>,
     color: [f32; 3],
-    revisit_counts: HashMap<(i32, i32, i32), u32>,
+    revisit_counts: HashMap<(i64, i64, i64), u32>,
+    point_positions: HashMap<(i64, i64, i64), [f32; 3]>,
+}
+
+const POSITION_KEY_SCALE: f32 = 1000.0;
+
+fn point_key(point: [f32; 3]) -> (i64, i64, i64) {
+    (
+        (point[0] * POSITION_KEY_SCALE).round() as i64,
+        (point[1] * POSITION_KEY_SCALE).round() as i64,
+        (point[2] * POSITION_KEY_SCALE).round() as i64,
+    )
+}
+
+fn build_point_visit_maps(
+    points: &[[f32; 3]],
+) -> (HashMap<(i64, i64, i64), u32>, HashMap<(i64, i64, i64), [f32; 3]>) {
+    let mut revisit_counts = HashMap::new();
+    let mut point_positions = HashMap::new();
+
+    for &point in points {
+        let key = point_key(point);
+        *revisit_counts.entry(key).or_insert(0) += 1;
+        point_positions.entry(key).or_insert(point);
+    }
+
+    (revisit_counts, point_positions)
 }
 
 /// Generate thumbnails for all sources with available data
-pub fn generate(config: &Config, output_dir: &Path, size: u32) -> anyhow::Result<()> {
+pub fn generate(config: &Config, data_dir: &Path, output_dir: &Path, size: u32) -> anyhow::Result<()> {
     std::fs::create_dir_all(output_dir)?;
+    let data_paths = DataPaths::new(data_dir.to_path_buf());
 
     // Collect sources that have data available
     let mut sources_to_render: Vec<(crate::config::Source, String)> = Vec::new();
 
     for source in &config.sources {
-        if check_data_exists(&source.id, &source.converter, &source.url) {
+        if check_data_exists(&source.id, &source.converter, &source.url, &data_paths) {
             let filename = format!("{}.png", source.id);
             sources_to_render.push((source.clone(), filename));
         } else {
@@ -91,7 +118,7 @@ pub fn generate(config: &Config, output_dir: &Path, size: u32) -> anyhow::Result
         print!("\r[{}/{}] {}...", current_idx + 1, total, source.name);
 
         // Load walk data
-        let walk = match load_walk_for_thumbnail(source, &config_clone) {
+        let walk = match load_walk_for_thumbnail(source, &config_clone, &data_paths) {
             Some(w) => w,
             None => {
                 warn!("Failed to load walk data for {}", source.id);
@@ -114,7 +141,7 @@ pub fn generate(config: &Config, output_dir: &Path, size: u32) -> anyhow::Result
 
         let mut renderables: Vec<Gm<InstancedMesh, ColorMaterial>> = Vec::new();
 
-        // Lines (cones)
+        // Lines
         if walk.points.len() >= 2 {
             let mut instances = Instances::default();
             instances.transformations = Vec::new();
@@ -128,39 +155,36 @@ pub fn generate(config: &Config, output_dir: &Path, size: u32) -> anyhow::Result
                 let p1 = vec3(walk.points[i][0], walk.points[i][1], walk.points[i][2]);
                 let p2 = vec3(walk.points[i + 1][0], walk.points[i + 1][1], walk.points[i + 1][2]);
 
-                let center = (p1 + p2) * 0.5;
                 let dir = p2 - p1;
                 let length = dir.magnitude();
 
                 if length > 0.001 {
-                    let key1 = (
-                        walk.points[i][0].round() as i32,
-                        walk.points[i][1].round() as i32,
-                        walk.points[i][2].round() as i32,
-                    );
-                    let key2 = (
-                        walk.points[i + 1][0].round() as i32,
-                        walk.points[i + 1][1].round() as i32,
-                        walk.points[i + 1][2].round() as i32,
-                    );
+                    let key1 = point_key(walk.points[i]);
+                    let key2 = point_key(walk.points[i + 1]);
                     let count1 = *walk.revisit_counts.get(&key1).unwrap_or(&1) as f32;
                     let count2 = *walk.revisit_counts.get(&key2).unwrap_or(&1) as f32;
                     let avg_count = (count1 + count2) * 0.5;
 
                     let radius = line_scale * (0.15 + 0.85 * avg_count.ln().max(0.0) / ln_max);
 
-                    let up = vec3(0.0, 1.0, 0.0);
-                    let rotation = if dir.normalize().dot(up).abs() > 0.999 {
-                        Mat4::identity()
+                    // three-d generated cylinder meshes extend along X from 0 to 1.
+                    let x_axis = vec3(1.0, 0.0, 0.0);
+                    let dir_n = dir.normalize();
+                    let rotation = if dir_n.dot(x_axis).abs() > 0.999 {
+                        if dir_n.dot(x_axis) < 0.0 {
+                            Mat4::from_angle_y(radians(std::f32::consts::PI))
+                        } else {
+                            Mat4::identity()
+                        }
                     } else {
-                        let axis = up.cross(dir.normalize()).normalize();
-                        let angle = up.dot(dir.normalize()).acos();
+                        let axis = x_axis.cross(dir_n).normalize();
+                        let angle = x_axis.dot(dir_n).acos();
                         Mat4::from_axis_angle(axis, radians(angle))
                     };
 
-                    let transform = Mat4::from_translation(center)
+                    let transform = Mat4::from_translation(p1)
                         * rotation
-                        * Mat4::from_nonuniform_scale(radius, length * 0.5, radius);
+                        * Mat4::from_nonuniform_scale(length, radius, radius);
 
                     instances.transformations.push(transform);
                     if let Some(ref mut colors) = instances.colors {
@@ -170,9 +194,9 @@ pub fn generate(config: &Config, output_dir: &Path, size: u32) -> anyhow::Result
             }
 
             if !instances.transformations.is_empty() {
-                let cone = CpuMesh::cone(12);
+                let cylinder = CpuMesh::cylinder(8);
                 let instanced = Gm::new(
-                    InstancedMesh::new(&context, &instances, &cone),
+                    InstancedMesh::new(&context, &instances, &cylinder),
                     ColorMaterial::default(),
                 );
                 renderables.push(instanced);
@@ -188,13 +212,18 @@ pub fn generate(config: &Config, output_dir: &Path, size: u32) -> anyhow::Result
             let max_revisits = walk.revisit_counts.values().max().copied().unwrap_or(1) as f32;
             let point_scale: f32 = 0.5;
 
-            for (&(x, y, z), &count) in &walk.revisit_counts {
+            for (key, &count) in &walk.revisit_counts {
+                let position = walk.point_positions.get(key).copied().unwrap_or([
+                    key.0 as f32 / POSITION_KEY_SCALE,
+                    key.1 as f32 / POSITION_KEY_SCALE,
+                    key.2 as f32 / POSITION_KEY_SCALE,
+                ]);
                 let base_size = 0.8 * point_scale;
                 let scale_factor =
                     1.0 + (count as f32).ln().max(0.0) / max_revisits.ln().max(1.0) * 2.0;
                 let size = base_size * scale_factor;
 
-                let transform = Mat4::from_translation(vec3(x as f32, y as f32, z as f32))
+                let transform = Mat4::from_translation(vec3(position[0], position[1], position[2]))
                     * Mat4::from_scale(size);
 
                 instances.transformations.push(transform);
@@ -295,7 +324,11 @@ fn auto_fit_camera(points: &[[f32; 3]], camera: &mut Camera) {
 }
 
 /// Load walk data for a single source (same logic as gui.rs load_walk_data)
-fn load_walk_for_thumbnail(source: &crate::config::Source, config: &Config) -> Option<WalkRender> {
+fn load_walk_for_thumbnail(
+    source: &crate::config::Source,
+    config: &Config,
+    data_paths: &DataPaths,
+) -> Option<WalkRender> {
     let base: u32 = 12; // Always use base-12 for thumbnails
     let max_points: usize = 5000;
 
@@ -304,67 +337,92 @@ fn load_walk_for_thumbnail(source: &crate::config::Source, config: &Config) -> O
     } else {
         match source.converter.as_str() {
             "audio" => {
-                let wav_path = std::path::PathBuf::from(format!("data/audio/{}.wav", source.id));
-                let mp3_path = std::path::PathBuf::from(format!("data/audio/{}.mp3", source.id));
-                let path = if wav_path.exists() {
-                    wav_path
-                } else if mp3_path.exists() {
-                    mp3_path
-                } else {
-                    return None;
-                };
+                let path = data_paths.audio_file(&source.id)?;
                 converters::load_audio_raw(&path, base).ok()?
             }
             "dna" => {
-                let accession = source.url.rsplit('/').next().unwrap_or(&source.id);
-                let path = std::path::PathBuf::from(format!(
-                    "data/dna/{}.fasta",
-                    accession.replace(".", "_")
-                ));
+                let path = data_paths.dna_file(&source.url, &source.id);
                 if !path.exists() {
                     return None;
                 }
                 converters::load_dna_raw(&path, base).ok()?
             }
             "cosmos" => {
-                let path =
-                    std::path::PathBuf::from(format!("data/cosmos/{}.txt.gz", source.id));
+                let path = data_paths.cosmos_file(&source.id);
                 if !path.exists() {
                     return None;
                 }
                 converters::load_cosmos_raw(&path, base).ok()?
             }
             "finance" => {
-                let symbol = source
-                    .url
-                    .split('/')
-                    .last()
-                    .unwrap_or(&source.id)
-                    .replace("%5E", "^")
-                    .replace("^", "")
-                    .replace("-", "_");
-                let path = std::path::PathBuf::from(format!("data/finance/{}.json", symbol));
+                let path = data_paths.finance_file(&source.url, &source.id);
                 if !path.exists() {
                     return None;
                 }
                 converters::load_finance_raw(&path, base).ok()?
+            }
+            "pdb_backbone" => {
+                let path = data_paths.protein_file(&source.url, &source.id);
+                if !path.exists() {
+                    return None;
+                }
+                converters::load_pdb_backbone_raw(&path, base).ok()?
+            }
+            "pdb_sequence" => {
+                let path = data_paths.protein_file(&source.url, &source.id);
+                if !path.exists() {
+                    return None;
+                }
+                converters::load_pdb_sequence_raw(&path, base).ok()?
+            }
+            "pdb_structure" => {
+                let path = data_paths.protein_file(&source.url, &source.id);
+                if !path.exists() {
+                    return None;
+                }
+                let (points, _) = converters::load_pdb_structure(&path).ok()?;
+
+                let n = points.len() as f32;
+                if n == 0.0 {
+                    return None;
+                }
+
+                let cx = points.iter().map(|p| p[0]).sum::<f32>() / n;
+                let cy = points.iter().map(|p| p[1]).sum::<f32>() / n;
+                let cz = points.iter().map(|p| p[2]).sum::<f32>() / n;
+                let centered: Vec<[f32; 3]> = points
+                    .iter()
+                    .map(|p| [p[0] - cx, p[1] - cy, p[2] - cz])
+                    .collect();
+
+                let (revisit_counts, point_positions) = build_point_visit_maps(&centered);
+
+                let hash = source
+                    .id
+                    .bytes()
+                    .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
+                let hue = (hash % 360) as f32 / 360.0;
+                let color = hsv_to_rgb(hue, 0.7, 0.9);
+
+                return Some(WalkRender {
+                    points: centered,
+                    color,
+                    revisit_counts,
+                    point_positions,
+                });
             }
             _ => return None,
         }
     };
 
     // Get mapping from source's default
-    let mapping = config
-        .mappings
-        .get(&source.mapping)
-        .map(|v| {
-            let mut arr = [0u8; 12];
-            for (i, &val) in v.iter().enumerate().take(12) {
-                arr[i] = val;
-            }
-            arr
-        })
-        .unwrap_or([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    let mapping = match config.get_mapping(&source.mapping) {
+        Ok(mapping) => mapping,
+        Err(e) => {
+            warn!("Skipping {} due to invalid mapping '{}': {}", source.id, source.mapping, e);
+            return None;
+        }
+    };
 
     let points = if base == 4 {
         walk_base4(&digits, max_points)
@@ -372,16 +430,7 @@ fn load_walk_for_thumbnail(source: &crate::config::Source, config: &Config) -> O
         walk_base12(&digits, &mapping, max_points)
     };
 
-    // Compute revisit counts
-    let mut revisit_counts: HashMap<(i32, i32, i32), u32> = HashMap::new();
-    for p in &points {
-        let key = (
-            p[0].round() as i32,
-            p[1].round() as i32,
-            p[2].round() as i32,
-        );
-        *revisit_counts.entry(key).or_insert(0) += 1;
-    }
+    let (revisit_counts, point_positions) = build_point_visit_maps(&points);
 
     // Color from hash
     let hash = source
@@ -395,32 +444,18 @@ fn load_walk_for_thumbnail(source: &crate::config::Source, config: &Config) -> O
         points,
         color,
         revisit_counts,
+        point_positions,
     })
 }
 
 /// Check if raw data exists for a source
-fn check_data_exists(id: &str, converter: &str, url: &str) -> bool {
+fn check_data_exists(id: &str, converter: &str, url: &str, data_paths: &DataPaths) -> bool {
     match converter {
-        "audio" => {
-            std::path::Path::new(&format!("data/audio/{}.wav", id)).exists()
-                || std::path::Path::new(&format!("data/audio/{}.mp3", id)).exists()
-        }
-        "dna" => {
-            let accession = url.rsplit('/').next().unwrap_or(id);
-            std::path::Path::new(&format!("data/dna/{}.fasta", accession.replace(".", "_")))
-                .exists()
-        }
-        "cosmos" => std::path::Path::new(&format!("data/cosmos/{}.txt.gz", id)).exists(),
-        "finance" => {
-            let symbol = url
-                .split('/')
-                .last()
-                .unwrap_or(id)
-                .replace("%5E", "^")
-                .replace("^", "")
-                .replace("-", "_");
-            std::path::Path::new(&format!("data/finance/{}.json", symbol)).exists()
-        }
+        "audio" => data_paths.audio_file(id).is_some(),
+        "dna" => data_paths.dna_file(url, id).exists(),
+        "cosmos" => data_paths.cosmos_file(id).exists(),
+        "finance" => data_paths.finance_file(url, id).exists(),
+        "pdb_backbone" | "pdb_sequence" | "pdb_structure" => data_paths.protein_file(url, id).exists(),
         c if c.starts_with("math.") => true,
         _ => false,
     }

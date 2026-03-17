@@ -235,10 +235,12 @@ mod tests {
         let mapping = named_mapping("Identity");
         let path = walk_base12(&base12, &mapping, 1000);
 
-        // After 15 degree rotation, +X direction changes
-        assert_eq!(path.len(), 2);
-        // First point is still at origin (rotation doesn't move)
-        assert!((path[0][0]).abs() < 0.001);
+        // Rotation steps do not emit points; only the translated destination remains.
+        assert_eq!(path.len(), 1);
+        let distance =
+            (path[0][0] * path[0][0] + path[0][1] * path[0][1] + path[0][2] * path[0][2])
+                .sqrt();
+        assert!((distance - 1.0).abs() < 0.001);
     }
 
     #[test]

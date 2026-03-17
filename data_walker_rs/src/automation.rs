@@ -6,12 +6,11 @@
 //! - State reporting for test validation
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Automation settings from CLI
 #[derive(Clone, Debug, Default)]
@@ -115,14 +114,23 @@ pub enum GuiEvent {
 
 /// Shared command queue for IPC -> GUI communication
 pub type CommandQueue = Arc<Mutex<Vec<AutoCommand>>>;
+pub type SharedGuiState = Arc<Mutex<GuiState>>;
 
 /// Create a new command queue
 pub fn new_command_queue() -> CommandQueue {
     Arc::new(Mutex::new(Vec::new()))
 }
 
+pub fn new_shared_state() -> SharedGuiState {
+    Arc::new(Mutex::new(GuiState::default()))
+}
+
 /// Start IPC server on given port
-pub fn start_ipc_server(port: u16, cmd_queue: CommandQueue) -> std::io::Result<()> {
+pub fn start_ipc_server(
+    port: u16,
+    cmd_queue: CommandQueue,
+    shared_state: SharedGuiState,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port))?;
     info!("[IPC] Server listening on port {}", port);
 
@@ -131,7 +139,8 @@ pub fn start_ipc_server(port: u16, cmd_queue: CommandQueue) -> std::io::Result<(
             match stream {
                 Ok(stream) => {
                     let queue = cmd_queue.clone();
-                    thread::spawn(move || handle_ipc_client(stream, queue));
+                    let state = shared_state.clone();
+                    thread::spawn(move || handle_ipc_client(stream, queue, state));
                 }
                 Err(e) => {
                     error!("[IPC] Accept error: {}", e);
@@ -143,7 +152,11 @@ pub fn start_ipc_server(port: u16, cmd_queue: CommandQueue) -> std::io::Result<(
     Ok(())
 }
 
-fn handle_ipc_client(mut stream: TcpStream, cmd_queue: CommandQueue) {
+fn handle_ipc_client(
+    mut stream: TcpStream,
+    cmd_queue: CommandQueue,
+    shared_state: SharedGuiState,
+) {
     let peer = stream.peer_addr().ok();
     debug!("[IPC] Client connected: {:?}", peer);
 
@@ -155,13 +168,23 @@ fn handle_ipc_client(mut stream: TcpStream, cmd_queue: CommandQueue) {
                 debug!("[IPC] Received: {}", json);
                 match serde_json::from_str::<AutoCommand>(&json) {
                     Ok(cmd) => {
-                        if let Ok(mut queue) = cmd_queue.lock() {
-                            queue.push(cmd.clone());
+                        if matches!(cmd, AutoCommand::GetState) {
+                            let response = match shared_state.lock() {
+                                Ok(state) => AutoResponse::State(state.clone()),
+                                Err(e) => AutoResponse::Error {
+                                    message: format!("State lock error: {}", e),
+                                },
+                            };
+                            let _ = writeln!(stream, "{}", serde_json::to_string(&response).unwrap());
+                        } else {
+                            if let Ok(mut queue) = cmd_queue.lock() {
+                                queue.push(cmd.clone());
+                            }
+                            let response = AutoResponse::Ok {
+                                message: format!("Queued: {:?}", cmd)
+                            };
+                            let _ = writeln!(stream, "{}", serde_json::to_string(&response).unwrap());
                         }
-                        let response = AutoResponse::Ok {
-                            message: format!("Queued: {:?}", cmd)
-                        };
-                        let _ = writeln!(stream, "{}", serde_json::to_string(&response).unwrap());
                     }
                     Err(e) => {
                         let response = AutoResponse::Error {
@@ -186,11 +209,6 @@ pub fn log_event(event: &GuiEvent) {
     if let Ok(json) = serde_json::to_string(event) {
         println!("GUI_EVENT: {}", json);
     }
-}
-
-/// Helper to create timestamped events
-pub fn event_timestamp(accumulated_time: f64) -> f64 {
-    accumulated_time
 }
 
 #[cfg(test)]
@@ -222,5 +240,17 @@ mod tests {
         let json = serde_json::to_string(&state).unwrap();
         assert!(json.contains("pi"));
         assert!(json.contains("0.5"));
+    }
+
+    #[test]
+    fn test_state_response_serialization() {
+        let response = AutoResponse::State(GuiState {
+            selected_sources: vec!["pi".to_string()],
+            selected_mapping: "Identity".to_string(),
+            ..Default::default()
+        });
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"status\":\"state\""));
+        assert!(json.contains("Identity"));
     }
 }

@@ -9,11 +9,11 @@ use tracing::{info, warn, error, debug};
 use three_d::*;
 use three_d::egui;
 
-use crate::config::Config;
+use crate::config::{Config, DataPaths};
 use crate::walk::walk_base12;
 use crate::converters::math::MathGenerator;
 use crate::audio::{AudioEngine, AudioSettings, MixingMode, SynthMethod, SourceType};
-use crate::automation::{AutomationConfig, AutoCommand, GuiState, GuiEvent, WalkInfo, CommandQueue};
+use crate::automation::{AutomationConfig, AutoCommand, GuiState, GuiEvent, WalkInfo};
 
 /// SpaceMouse axis configuration
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -77,10 +77,40 @@ struct WalkData {
     points: Vec<[f32; 3]>,
     color: [f32; 3],
     visible: bool,
-    // Point revisit counts: (position, count) - positions rounded to grid
-    revisit_counts: std::collections::HashMap<(i32, i32, i32), u32>,
+    // Point revisit counts keyed by quantized position to absorb float jitter.
+    revisit_counts: std::collections::HashMap<(i64, i64, i64), u32>,
+    // Representative render position for each quantized key.
+    point_positions: std::collections::HashMap<(i64, i64, i64), [f32; 3]>,
     // Optional per-point colors (for PDB structure coloring by residue)
     point_colors: Option<Vec<[f32; 3]>>,
+}
+
+const POSITION_KEY_SCALE: f32 = 1000.0;
+
+fn point_key(point: [f32; 3]) -> (i64, i64, i64) {
+    (
+        (point[0] * POSITION_KEY_SCALE).round() as i64,
+        (point[1] * POSITION_KEY_SCALE).round() as i64,
+        (point[2] * POSITION_KEY_SCALE).round() as i64,
+    )
+}
+
+fn build_point_visit_maps(
+    points: &[[f32; 3]],
+) -> (
+    std::collections::HashMap<(i64, i64, i64), u32>,
+    std::collections::HashMap<(i64, i64, i64), [f32; 3]>,
+) {
+    let mut revisit_counts = std::collections::HashMap::new();
+    let mut point_positions = std::collections::HashMap::new();
+
+    for &point in points {
+        let key = point_key(point);
+        *revisit_counts.entry(key).or_insert(0) += 1;
+        point_positions.entry(key).or_insert(point);
+    }
+
+    (revisit_counts, point_positions)
 }
 
 /// Catmull-Rom spline interpolation along a walk's points
@@ -164,8 +194,59 @@ fn calculate_average_path_position(
     Some((current_sum / count, ahead_sum / count))
 }
 
+fn update_shared_gui_state(
+    shared_state: &Arc<Mutex<GuiState>>,
+    walks: &BTreeMap<String, WalkData>,
+    selected_sources: &std::collections::HashSet<String>,
+    flight_mode: bool,
+    flight_playing: bool,
+    flight_progress: f32,
+    flight_speed: f32,
+    selected_base: u32,
+    selected_mapping: &str,
+    camera: &Camera,
+    frame_count: u64,
+    uptime_secs: f64,
+) {
+    let mut selected_ids: Vec<String> = selected_sources.iter().cloned().collect();
+    selected_ids.sort();
+
+    let mut loaded_walks: Vec<WalkInfo> = walks
+        .iter()
+        .map(|(id, walk)| WalkInfo {
+            id: id.clone(),
+            name: walk.name.clone(),
+            num_points: walk.points.len(),
+            color: walk.color,
+        })
+        .collect();
+    loaded_walks.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let camera_position = camera.position();
+    let camera_target = camera.target();
+
+    let state = GuiState {
+        selected_sources: selected_ids,
+        loaded_walks,
+        flight_mode,
+        flight_playing,
+        flight_progress,
+        flight_speed,
+        selected_base,
+        selected_mapping: selected_mapping.to_string(),
+        camera_position: [camera_position.x, camera_position.y, camera_position.z],
+        camera_target: [camera_target.x, camera_target.y, camera_target.z],
+        frame_count,
+        uptime_secs,
+    };
+
+    if let Ok(mut guard) = shared_state.lock() {
+        *guard = state;
+    }
+}
+
 /// Run the native 3D GUI viewer using three-d
-pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Result<()> {
+pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathBuf) -> anyhow::Result<()> {
     // Create winit event loop and window manually for fullscreen toggle access
     use winit::event_loop::EventLoop;
     use winit::window::WindowBuilder;
@@ -258,10 +339,10 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Resu
     }
     let mut audio_engine: Option<AudioEngine> = audio_engine_result.ok();
     let mut audio_settings = AudioSettings::default();
+    let data_paths = DataPaths::new(data_dir);
     let mut prev_synth_method = audio_settings.synthesis_method;
     let mut prev_flight_speed: f32 = flight_speed;
     let mut prev_sync_to_flight = audio_settings.sync_to_flight;
-    let mut audio_sources_prepared = false;
 
     // Track which slider has focus for arrow key control
     #[derive(Clone, Copy, PartialEq)]
@@ -277,7 +358,8 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Resu
 
     // Automation state
     let cmd_queue = crate::automation::new_command_queue();
-    let mut auto_quit_time: Option<f64> = if auto_config.quit_after_secs > 0.0 {
+    let shared_state = crate::automation::new_shared_state();
+    let auto_quit_time: Option<f64> = if auto_config.quit_after_secs > 0.0 {
         Some(auto_config.quit_after_secs)
     } else {
         None
@@ -287,7 +369,11 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Resu
 
     // Start IPC server if enabled
     if auto_config.ipc_port > 0 {
-        if let Err(e) = crate::automation::start_ipc_server(auto_config.ipc_port, cmd_queue.clone()) {
+        if let Err(e) = crate::automation::start_ipc_server(
+            auto_config.ipc_port,
+            cmd_queue.clone(),
+            shared_state.clone(),
+        ) {
             error!("[AUTO] Failed to start IPC server: {}", e);
         }
     }
@@ -321,7 +407,7 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Resu
                     debug!("[AUTO] Auto-selecting source: {}", source_id);
                     selected_sources.insert(source_id.clone());
                     let color = color_pool.get_color(&source_id);
-                    if let Some(walk_data) = load_walk_data(source, &config, max_points, &selected_mapping, selected_base, color) {
+                    if let Some(walk_data) = load_walk_data(source, &config, &data_paths, max_points, &selected_mapping, selected_base, color) {
                         walks.insert(source_id.clone(), walk_data);
                     }
                 } else {
@@ -357,7 +443,7 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Resu
                         if let Some(source) = config.sources.iter().find(|s| s.id == id) {
                             selected_sources.insert(id.clone());
                             let color = color_pool.get_color(&id);
-                            if let Some(walk_data) = load_walk_data(source, &config, max_points, &selected_mapping, selected_base, color) {
+                            if let Some(walk_data) = load_walk_data(source, &config, &data_paths, max_points, &selected_mapping, selected_base, color) {
                                 walks.insert(id, walk_data);
                             }
                         }
@@ -411,6 +497,21 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Resu
             // Wait a few frames for scene to render
             screenshot_requested = true;
         }
+
+        update_shared_gui_state(
+            &shared_state,
+            &walks,
+            &selected_sources,
+            flight_mode,
+            flight_playing,
+            flight_progress,
+            flight_speed,
+            selected_base,
+            &selected_mapping,
+            &camera,
+            frame_count,
+            current_time,
+        );
 
         // Handle keyboard events (spacebar for play/pause)
         for event in &frame_input.events {
@@ -736,16 +837,8 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Resu
                             line_scale * 0.4
                         } else {
                             // Walk mode: scale radius by visit count (log scale)
-                            let key1 = (
-                                walk.points[i][0].round() as i32,
-                                walk.points[i][1].round() as i32,
-                                walk.points[i][2].round() as i32,
-                            );
-                            let key2 = (
-                                walk.points[i + 1][0].round() as i32,
-                                walk.points[i + 1][1].round() as i32,
-                                walk.points[i + 1][2].round() as i32,
-                            );
+                            let key1 = point_key(walk.points[i]);
+                            let key2 = point_key(walk.points[i + 1]);
                             let count1 = *walk.revisit_counts.get(&key1).unwrap_or(&1) as f32;
                             let count2 = *walk.revisit_counts.get(&key2).unwrap_or(&1) as f32;
                             let avg_count = (count1 + count2) * 0.5;
@@ -827,15 +920,20 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Resu
                         }
                     }
                 } else {
-                    // Walk mode: render spheres at unique grid positions
+                    // Walk mode: render spheres at the actual walk positions.
                     let max_revisits = walk.revisit_counts.values().max().copied().unwrap_or(1) as f32;
 
-                    for (&(x, y, z), &count) in &walk.revisit_counts {
+                    for (key, &count) in &walk.revisit_counts {
+                        let position = walk.point_positions.get(key).copied().unwrap_or([
+                            key.0 as f32 / POSITION_KEY_SCALE,
+                            key.1 as f32 / POSITION_KEY_SCALE,
+                            key.2 as f32 / POSITION_KEY_SCALE,
+                        ]);
                         let base_size = 0.8 * point_scale;
                         let scale_factor = 1.0 + (count as f32).ln().max(0.0) / max_revisits.ln().max(1.0) * 2.0;
                         let size = base_size * scale_factor;
 
-                        let transform = Mat4::from_translation(vec3(x as f32, y as f32, z as f32))
+                        let transform = Mat4::from_translation(vec3(position[0], position[1], position[2]))
                             * Mat4::from_scale(size);
                         instances.transformations.push(transform);
 
@@ -1281,7 +1379,7 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Resu
                                     let mut checked = selected_sources.contains(&source.id);
 
                                     // Check if data is available (raw files for downloaded data, or math sources)
-                                    let is_available = check_data_exists(&source.id, &source.converter, &source.url);
+                                    let is_available = check_data_exists(&source.id, &source.converter, &source.url, &data_paths);
 
                                     if is_available {
                                         // Show label in the walk's plot color if selected
@@ -1306,7 +1404,7 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Resu
                                                 // Load walk
                                                 debug!("[GUI] Loading walk data for {}", source.id);
                                                 let walk_len = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                                    load_walk_data(&source, &config, max_points, &selected_mapping, selected_base, color)
+                                                    load_walk_data(&source, &config, &data_paths, max_points, &selected_mapping, selected_base, color)
                                                 })) {
                                                     Ok(Some(walk_data)) => {
                                                         let len = walk_data.points.len();
@@ -1328,14 +1426,26 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Resu
                                                 if let Some(ref mut engine) = audio_engine {
                                                     // Use synthesis if force_synthesis is enabled, otherwise use audio file
                                                     let audio_source_type = if audio_settings.force_synthesis {
-                                                        // Load base-12 digits for synthesis
                                                         debug!("[GUI] Loading base-12 digits for synthesis: {}", source.id);
-                                                        let base12_digits = load_base12_digits(&source);
-                                                        debug!("[GUI] Using synthesis for {} ({} digits)", source.id, base12_digits.len());
-                                                        SourceType::Synthesized { base_digits: base12_digits }
+                                                        match load_base12_digits(&source, &data_paths) {
+                                                            Ok(base12_digits) => {
+                                                                debug!("[GUI] Using synthesis for {} ({} digits)", source.id, base12_digits.len());
+                                                                SourceType::Synthesized { base_digits: base12_digits }
+                                                            }
+                                                            Err(e) => {
+                                                                warn!("[GUI] Skipping audio prep for {}: {}", source.id, e);
+                                                                continue;
+                                                            }
+                                                        }
                                                     } else {
                                                         debug!("[GUI] Getting audio source type for {}", source.id);
-                                                        get_audio_source_type(&source)
+                                                        match get_audio_source_type(&source, &data_paths) {
+                                                            Ok(source_type) => source_type,
+                                                            Err(e) => {
+                                                                warn!("[GUI] Skipping audio prep for {}: {}", source.id, e);
+                                                                continue;
+                                                            }
+                                                        }
                                                     };
                                                     debug!("[GUI] Preparing audio for source: {} (type: {:?})", source.id, audio_source_type);
 
@@ -1608,7 +1718,7 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Resu
                     let color = color_pool.get_color(&sid);
                     debug!("[GUI] Regenerating walk for {}", sid);
                     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        load_walk_data(source, &config, max_points, &selected_mapping, selected_base, color)
+                        load_walk_data(source, &config, &data_paths, max_points, &selected_mapping, selected_base, color)
                     })) {
                         Ok(Some(walk_data)) => {
                             debug!("[GUI] Regenerated {} points for {}", walk_data.points.len(), sid);
@@ -1658,10 +1768,21 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Resu
                         };
 
                         let audio_source_type = if audio_settings.force_synthesis {
-                            let base12_digits = load_base12_digits(source);
-                            SourceType::Synthesized { base_digits: base12_digits }
+                            match load_base12_digits(source, &data_paths) {
+                                Ok(base12_digits) => SourceType::Synthesized { base_digits: base12_digits },
+                                Err(e) => {
+                                    warn!("[GUI] Skipping audio re-prepare for {}: {}", source_id, e);
+                                    continue;
+                                }
+                            }
                         } else {
-                            get_audio_source_type(source)
+                            match get_audio_source_type(source, &data_paths) {
+                                Ok(source_type) => source_type,
+                                Err(e) => {
+                                    warn!("[GUI] Skipping audio re-prepare for {}: {}", source_id, e);
+                                    continue;
+                                }
+                            }
                         };
 
                         debug!("[GUI] Re-preparing audio for {} at new speed (duration: {:.1}s)", source_id, flight_duration);
@@ -1854,100 +1975,90 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Resu
     Ok(())
 }
 
-fn check_data_exists(id: &str, converter: &str, url: &str) -> bool {
+fn check_data_exists(id: &str, converter: &str, url: &str, data_paths: &DataPaths) -> bool {
     match converter {
-        "audio" => {
-            // Check for WAV or MP3
-            std::path::Path::new(&format!("data/audio/{}.wav", id)).exists() ||
-            std::path::Path::new(&format!("data/audio/{}.mp3", id)).exists()
-        }
-        "dna" => {
-            // Extract accession from URL
-            let accession = url.rsplit('/').next().unwrap_or(id);
-            std::path::Path::new(&format!("data/dna/{}.fasta", accession.replace(".", "_"))).exists()
-        }
-        "cosmos" => {
-            std::path::Path::new(&format!("data/cosmos/{}.txt.gz", id)).exists()
-        }
-        "finance" => {
-            let symbol = url.split('/').last().unwrap_or(id)
-                .replace("%5E", "^")
-                .replace("^", "")
-                .replace("-", "_");
-            std::path::Path::new(&format!("data/finance/{}.json", symbol)).exists()
-        }
+        "audio" => data_paths.audio_file(id).is_some(),
+        "dna" => data_paths.dna_file(url, id).exists(),
+        "cosmos" => data_paths.cosmos_file(id).exists(),
+        "finance" => data_paths.finance_file(url, id).exists(),
         c if c.starts_with("math.") => true, // Math is computed, always available
-        "pdb_backbone" | "pdb_sequence" | "pdb_structure" => {
-            let pdb_id = url.rsplit('/').next().unwrap_or(id)
-                .trim_end_matches(".pdb").to_lowercase();
-            std::path::Path::new(&format!("data/proteins/{}.pdb", pdb_id)).exists()
-        }
+        "pdb_backbone" | "pdb_sequence" | "pdb_structure" => data_paths.protein_file(url, id).exists(),
         _ => false,
     }
 }
 
 /// Determine the audio source type for a given data source
-fn get_audio_source_type(source: &crate::config::Source) -> SourceType {
+fn get_audio_source_type(
+    source: &crate::config::Source,
+    data_paths: &DataPaths,
+) -> anyhow::Result<SourceType> {
     if source.converter == "audio" {
-        // Check for WAV or MP3 file
-        let wav_path = std::path::PathBuf::from(format!("data/audio/{}.wav", source.id));
-        let mp3_path = std::path::PathBuf::from(format!("data/audio/{}.mp3", source.id));
+        let path = data_paths
+            .audio_file(&source.id)
+            .ok_or_else(|| anyhow::anyhow!("No audio file found for {}", source.id))?;
 
-        let path = if wav_path.exists() {
-            wav_path
-        } else {
-            mp3_path
-        };
-
-        SourceType::AudioFile { path }
+        Ok(SourceType::AudioFile { path })
     } else {
-        // For non-audio sources, we'll synthesize from base-12 data
-        // Load the base-12 digits
-        let digits = load_base12_digits(source);
-        SourceType::Synthesized { base_digits: digits }
+        let digits = load_base12_digits(source, data_paths)?;
+        Ok(SourceType::Synthesized { base_digits: digits })
     }
 }
 
 /// Load base-12 digits for a source (used for audio synthesis)
-fn load_base12_digits(source: &crate::config::Source) -> Vec<u8> {
+fn load_base12_digits(
+    source: &crate::config::Source,
+    data_paths: &DataPaths,
+) -> anyhow::Result<Vec<u8>> {
     use crate::converters;
 
     let max_points = 5000; // Reasonable length for audio
 
     if source.converter.starts_with("math.") {
-        MathGenerator::from_converter_string(&source.converter)
-            .map(|g| g.generate(max_points))
-            .unwrap_or_default()
+        let generator = MathGenerator::from_converter_string(&source.converter)
+            .ok_or_else(|| anyhow::anyhow!("Unknown math converter '{}'", source.converter))?;
+        Ok(generator.generate(max_points))
     } else {
         match source.converter.as_str() {
             "audio" => {
-                // Load audio file and convert to base-12 via spectrogram
-                let wav_path = std::path::PathBuf::from(format!("data/audio/{}.wav", source.id));
-                let mp3_path = std::path::PathBuf::from(format!("data/audio/{}.mp3", source.id));
-                let path = if wav_path.exists() { wav_path } else { mp3_path };
-                converters::load_audio_raw(&path, 12).unwrap_or_else(|e| {
-                    warn!("Failed to load audio for synthesis: {}", e);
-                    vec![6; 100]
-                })
+                let path = data_paths
+                    .audio_file(&source.id)
+                    .ok_or_else(|| anyhow::anyhow!("No audio file found for {}", source.id))?;
+                converters::load_audio_raw(&path, 12)
+                    .map_err(|e| anyhow::anyhow!("Failed to load audio for synthesis {}: {}", source.id, e))
             }
             "dna" => {
-                let accession = source.url.rsplit('/').next().unwrap_or(&source.id);
-                let path = std::path::PathBuf::from(format!("data/dna/{}.fasta", accession.replace(".", "_")));
-                converters::load_dna_raw(&path, 12).unwrap_or_default()
+                let path = data_paths.dna_file(&source.url, &source.id);
+                converters::load_dna_raw(&path, 12)
+                    .map_err(|e| anyhow::anyhow!("Failed to load DNA for synthesis {}: {}", source.id, e))
             }
             "cosmos" => {
-                let path = std::path::PathBuf::from(format!("data/cosmos/{}.txt.gz", source.id));
-                converters::load_cosmos_raw(&path, 12).unwrap_or_default()
+                let path = data_paths.cosmos_file(&source.id);
+                converters::load_cosmos_raw(&path, 12)
+                    .map_err(|e| anyhow::anyhow!("Failed to load cosmos data for synthesis {}: {}", source.id, e))
             }
             "finance" => {
-                let symbol = source.url.split('/').last().unwrap_or(&source.id)
-                    .replace("%5E", "^")
-                    .replace("^", "")
-                    .replace("-", "_");
-                let path = std::path::PathBuf::from(format!("data/finance/{}.json", symbol));
-                converters::load_finance_raw(&path, 12).unwrap_or_default()
+                let path = data_paths.finance_file(&source.url, &source.id);
+                converters::load_finance_raw(&path, 12)
+                    .map_err(|e| anyhow::anyhow!("Failed to load finance data for synthesis {}: {}", source.id, e))
             }
-            _ => vec![6; 100], // Default pattern
+            "pdb_backbone" => {
+                let path = data_paths.protein_file(&source.url, &source.id);
+                converters::load_pdb_backbone_raw(&path, 12)
+                    .map_err(|e| anyhow::anyhow!("Failed to load PDB backbone for synthesis {}: {}", source.id, e))
+            }
+            "pdb_sequence" => {
+                let path = data_paths.protein_file(&source.url, &source.id);
+                converters::load_pdb_sequence_raw(&path, 12)
+                    .map_err(|e| anyhow::anyhow!("Failed to load PDB sequence for synthesis {}: {}", source.id, e))
+            }
+            "pdb_structure" => Err(anyhow::anyhow!(
+                "Converter '{}' does not produce base-12 digits for synthesis",
+                source.converter
+            )),
+            _ => Err(anyhow::anyhow!(
+                "Unsupported converter '{}' for audio synthesis",
+                source.converter
+            )),
         }
     }
 }
@@ -1955,6 +2066,7 @@ fn load_base12_digits(source: &crate::config::Source) -> Vec<u8> {
 fn load_walk_data(
     source: &crate::config::Source,
     config: &Config,
+    data_paths: &DataPaths,
     max_points: usize,
     mapping_name: &str,
     base: u32,
@@ -1965,9 +2077,7 @@ fn load_walk_data(
 
     // PDB structure mode: raw Cα coordinates, bypasses walk engine entirely
     if source.converter == "pdb_structure" {
-        let pdb_id = source.url.rsplit('/').next().unwrap_or(&source.id)
-            .trim_end_matches(".pdb").to_lowercase();
-        let path = std::path::PathBuf::from(format!("data/proteins/{}.pdb", pdb_id));
+        let path = data_paths.protein_file(&source.url, &source.id);
 
         if !path.exists() {
             warn!("No PDB file found for {}: {:?}", source.id, path);
@@ -2001,11 +2111,7 @@ fn load_walk_data(
                 };
 
                 // No revisit counting for structure mode - each position is unique
-                let mut revisit_counts = std::collections::HashMap::new();
-                for p in &centered {
-                    let key = (p[0].round() as i32, p[1].round() as i32, p[2].round() as i32);
-                    *revisit_counts.entry(key).or_insert(0) += 1;
-                }
+                let (revisit_counts, point_positions) = build_point_visit_maps(&centered);
 
                 return Some(WalkData {
                     name: source.name.clone(),
@@ -2013,6 +2119,7 @@ fn load_walk_data(
                     color,
                     visible: true,
                     revisit_counts,
+                    point_positions,
                     point_colors: Some(point_colors),
                 });
             }
@@ -2035,16 +2142,12 @@ fn load_walk_data(
     } else {
         match source.converter.as_str() {
             "audio" => {
-                let wav_path = std::path::PathBuf::from(format!("data/audio/{}.wav", source.id));
-                let mp3_path = std::path::PathBuf::from(format!("data/audio/{}.mp3", source.id));
-
-                let path = if wav_path.exists() {
-                    wav_path
-                } else if mp3_path.exists() {
-                    mp3_path
-                } else {
-                    warn!("No audio file found for {}", source.id);
-                    return None;
+                let path = match data_paths.audio_file(&source.id) {
+                    Some(path) => path,
+                    None => {
+                        warn!("No audio file found for {}", source.id);
+                        return None;
+                    }
                 };
 
                 match converters::load_audio_raw(&path, base) {
@@ -2056,8 +2159,7 @@ fn load_walk_data(
                 }
             }
             "dna" => {
-                let accession = source.url.rsplit('/').next().unwrap_or(&source.id);
-                let path = std::path::PathBuf::from(format!("data/dna/{}.fasta", accession.replace(".", "_")));
+                let path = data_paths.dna_file(&source.url, &source.id);
 
                 if !path.exists() {
                     warn!("No FASTA file found for {}: {:?}", source.id, path);
@@ -2073,7 +2175,7 @@ fn load_walk_data(
                 }
             }
             "cosmos" => {
-                let path = std::path::PathBuf::from(format!("data/cosmos/{}.txt.gz", source.id));
+                let path = data_paths.cosmos_file(&source.id);
 
                 if !path.exists() {
                     warn!("No cosmos file found for {}: {:?}", source.id, path);
@@ -2089,11 +2191,7 @@ fn load_walk_data(
                 }
             }
             "finance" => {
-                let symbol = source.url.split('/').last().unwrap_or(&source.id)
-                    .replace("%5E", "^")
-                    .replace("^", "")
-                    .replace("-", "_");
-                let path = std::path::PathBuf::from(format!("data/finance/{}.json", symbol));
+                let path = data_paths.finance_file(&source.url, &source.id);
 
                 if !path.exists() {
                     warn!("No finance file found for {}: {:?}", source.id, path);
@@ -2109,9 +2207,7 @@ fn load_walk_data(
                 }
             }
             "pdb_backbone" => {
-                let pdb_id = source.url.rsplit('/').next().unwrap_or(&source.id)
-                    .trim_end_matches(".pdb").to_lowercase();
-                let path = std::path::PathBuf::from(format!("data/proteins/{}.pdb", pdb_id));
+                let path = data_paths.protein_file(&source.url, &source.id);
 
                 if !path.exists() {
                     warn!("No PDB file found for {}: {:?}", source.id, path);
@@ -2127,9 +2223,7 @@ fn load_walk_data(
                 }
             }
             "pdb_sequence" => {
-                let pdb_id = source.url.rsplit('/').next().unwrap_or(&source.id)
-                    .trim_end_matches(".pdb").to_lowercase();
-                let path = std::path::PathBuf::from(format!("data/proteins/{}.pdb", pdb_id));
+                let path = data_paths.protein_file(&source.url, &source.id);
 
                 if !path.exists() {
                     warn!("No PDB file found for {}: {:?}", source.id, path);
@@ -2153,30 +2247,29 @@ fn load_walk_data(
     let points = match base {
         4 => walk_base4(&digits, max_points),
         6 => {
-            let mapping = config.get_mapping_base6(mapping_name);
+            let mapping = match config.get_mapping_base6(mapping_name) {
+                Ok(mapping) => mapping,
+                Err(e) => {
+                    warn!("Failed to load base-6 mapping '{}' for {}: {}", mapping_name, source.id, e);
+                    return None;
+                }
+            };
             walk_base6(&digits, &mapping, max_points)
         }
         _ => {
-            let mapping = config.mappings.get(mapping_name)
-                .map(|v| {
-                    let mut arr = [0u8; 12];
-                    for (i, &val) in v.iter().enumerate().take(12) {
-                        arr[i] = val;
-                    }
-                    arr
-                })
-                .unwrap_or([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+            let mapping = match config.get_mapping(mapping_name) {
+                Ok(mapping) => mapping,
+                Err(e) => {
+                    warn!("Failed to load mapping '{}' for {}: {}", mapping_name, source.id, e);
+                    return None;
+                }
+            };
             walk_base12(&digits, &mapping, max_points)
         }
     };
     info!("Generated {} walk points for {}", points.len(), source.id);
 
-    // Compute revisit counts - round positions to integer grid
-    let mut revisit_counts: std::collections::HashMap<(i32, i32, i32), u32> = std::collections::HashMap::new();
-    for p in &points {
-        let key = (p[0].round() as i32, p[1].round() as i32, p[2].round() as i32);
-        *revisit_counts.entry(key).or_insert(0) += 1;
-    }
+    let (revisit_counts, point_positions) = build_point_visit_maps(&points);
     let max_revisits = revisit_counts.values().max().copied().unwrap_or(1);
     info!("Max revisits for {}: {} at {} unique positions", source.id, max_revisits, revisit_counts.len());
 
@@ -2186,6 +2279,7 @@ fn load_walk_data(
         color,
         visible: true,
         revisit_counts,
+        point_positions,
         point_colors: None,
     })
 }
@@ -2267,22 +2361,6 @@ fn init_spacemouse() -> Option<Arc<Mutex<SpaceMouseState>>> {
     Some(state)
 }
 
-fn hsv_to_rgb(h: f32, s: f32, v: f32) -> [f32; 3] {
-    let c = v * s;
-    let x = c * (1.0 - ((h * 6.0) % 2.0 - 1.0).abs());
-    let m = v - c;
-
-    let (r, g, b) = match (h * 6.0) as u32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-
-    [r + m, g + m, b + m]
-}
 
 /// Maximally distinct color palette based on Glasbey algorithm principles.
 /// Colors are pre-computed to maximize minimum perceptual distance in CIELAB space.
