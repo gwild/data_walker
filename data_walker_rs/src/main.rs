@@ -363,6 +363,7 @@ async fn download_all(config: &config::Config, data_dir: &PathBuf) -> anyhow::Re
     let mut finance_sources = vec![];
     let mut audio_sources = vec![];
     let mut cosmos_sources = vec![];
+    let mut protein_sources = vec![];
     let mut skipped = vec![];
 
     for source in &config.sources {
@@ -376,6 +377,8 @@ async fn download_all(config: &config::Config, data_dir: &PathBuf) -> anyhow::Re
             audio_sources.push(source);
         } else if source.converter == "cosmos" {
             cosmos_sources.push(source);
+        } else if source.converter.starts_with("pdb_") {
+            protein_sources.push(source);
         } else {
             skipped.push(source);
         }
@@ -480,6 +483,42 @@ async fn download_all(config: &config::Config, data_dir: &PathBuf) -> anyhow::Re
             match download::download_cosmos(&source.id, &source.url, &cosmos_dir).await {
                 Ok(path) => {
                     println!("  [OK] {} -> {:?}", source.name, path);
+                }
+                Err(e) => {
+                    println!("  [FAIL] {}: {}", source.name, e);
+                }
+            }
+
+            // Rate limit
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        }
+        println!();
+    }
+
+    // Download Proteins from RCSB PDB - stores raw .pdb files
+    // Multiple sources can share the same PDB file (backbone, sequence, structure views)
+    if !protein_sources.is_empty() {
+        println!("=== PROTEINS ({} sources) ===", protein_sources.len());
+        let proteins_dir = data_dir.join("proteins");
+        std::fs::create_dir_all(&proteins_dir)?;
+
+        // Deduplicate by PDB ID since multiple converters share the same file
+        let mut downloaded_pdb_ids = std::collections::HashSet::new();
+
+        for source in &protein_sources {
+            let pdb_id = source.url.rsplit('/').next().unwrap_or(&source.id)
+                .trim_end_matches(".pdb")
+                .to_lowercase();
+
+            if downloaded_pdb_ids.contains(&pdb_id) {
+                println!("  [OK] {} (already downloaded {}.pdb)", source.name, pdb_id);
+                continue;
+            }
+
+            match download::download_pdb(&pdb_id, &proteins_dir).await {
+                Ok(path) => {
+                    println!("  [OK] {} -> {:?}", source.name, path);
+                    downloaded_pdb_ids.insert(pdb_id);
                 }
                 Err(e) => {
                     println!("  [FAIL] {}: {}", source.name, e);
