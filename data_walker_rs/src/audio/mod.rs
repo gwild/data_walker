@@ -34,8 +34,8 @@ pub struct AudioSettings {
     pub master_volume: f32,
     pub synthesis_method: SynthMethod,
     pub mixing_mode: MixingMode,
-    pub sync_to_flight: bool,  // Time-stretch audio to match flight duration
-    pub force_synthesis: bool, // Use synthesis instead of audio files (for per-note association)
+    pub sync_to_flight: bool,  // Lock playback duration to the current flight duration
+    pub force_synthesis: bool, // Prefer generated notes/drums over source audio when available
 }
 
 impl Default for AudioSettings {
@@ -45,8 +45,8 @@ impl Default for AudioSettings {
             master_volume: 0.7,
             synthesis_method: SynthMethod::default(),
             mixing_mode: MixingMode::default(),
-            sync_to_flight: false,  // Default OFF - time-stretching can freeze UI for large files
-            force_synthesis: true,  // Default ON - use chromatic tones for clear per-note association
+            sync_to_flight: false,  // Default OFF - playback runs at its natural speed
+            force_synthesis: true,  // Default ON - generated audio follows walk points directly
         }
     }
 }
@@ -186,6 +186,41 @@ impl AudioEngine {
         });
 
         info!("Prepared time-stretched audio source: {} (duration: {:.1}s)", source_id, duration);
+        Ok(())
+    }
+
+    /// Prepare an audio file source from already-stretched samples.
+    pub fn prepare_pre_stretched_file_source(
+        &mut self,
+        source_id: &str,
+        path: PathBuf,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        channels: u16,
+    ) -> anyhow::Result<()> {
+        self.remove_source(source_id);
+
+        let sink = Sink::try_new(&self.stream_handle)?;
+        let source = StretchedSource::new(samples, sample_rate, channels);
+        let duration = source.duration().as_secs_f32();
+        sink.append(source);
+        sink.pause();
+
+        self.sources.insert(source_id.to_string(), AudioSource {
+            source_id: source_id.to_string(),
+            source_type: SourceType::AudioFile { path },
+            sink: Some(sink),
+            duration_secs: duration,
+            volume: 1.0,
+            last_seek_progress: 0.0,
+            synth_rate: None,
+        });
+
+        info!(
+            "Prepared pre-stretched audio source: {} (duration: {:.1}s)",
+            source_id,
+            duration
+        );
         Ok(())
     }
 

@@ -3,8 +3,8 @@
 //! Proper 3D visualization with orbit camera and SpaceMouse support
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use tracing::{info, warn, error, debug};
 use three_d::*;
 use three_d::egui;
@@ -83,6 +83,36 @@ struct WalkData {
     point_positions: std::collections::HashMap<(i64, i64, i64), [f32; 3]>,
     // Optional per-point colors (for PDB structure coloring by residue)
     point_colors: Option<Vec<[f32; 3]>>,
+}
+
+struct PendingWalkLoad {
+    request_id: u64,
+    source_name: String,
+}
+
+struct WalkLoadResult {
+    request_id: u64,
+    source: crate::config::Source,
+    walk_data: Option<WalkData>,
+    prepare_audio: bool,
+}
+
+struct PendingAudioPrep {
+    request_id: u64,
+    source_name: String,
+}
+
+struct AudioPrepResult {
+    request_id: u64,
+    source: crate::config::Source,
+    result: anyhow::Result<PreparedAudioFile>,
+}
+
+struct PreparedAudioFile {
+    path: PathBuf,
+    samples: Vec<f32>,
+    sample_rate: u32,
+    channels: u16,
 }
 
 const POSITION_KEY_SCALE: f32 = 1000.0;
@@ -315,6 +345,12 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
     let mut auto_rotate_speed_z: f32 = 0.5;
     let mut screenshot_requested = false;
     let mut screenshot_status: Option<(String, f64)> = None; // (message, expire_time)
+    let (walk_load_tx, walk_load_rx) = std::sync::mpsc::channel::<WalkLoadResult>();
+    let mut pending_walk_loads: BTreeMap<String, PendingWalkLoad> = BTreeMap::new();
+    let mut next_walk_load_request_id: u64 = 1;
+    let (audio_prep_tx, audio_prep_rx) = std::sync::mpsc::channel::<AudioPrepResult>();
+    let mut pending_audio_preps: BTreeMap<String, PendingAudioPrep> = BTreeMap::new();
+    let mut next_audio_prep_request_id: u64 = 1;
 
     // Data Flight mode
     let mut flight_mode = false;
@@ -340,6 +376,8 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
     let mut audio_engine: Option<AudioEngine> = audio_engine_result.ok();
     let mut audio_settings = AudioSettings::default();
     let data_paths = DataPaths::new(data_dir);
+    let mut prev_audio_enabled = audio_settings.enabled;
+    let mut prev_force_synthesis = audio_settings.force_synthesis;
     let mut prev_synth_method = audio_settings.synthesis_method;
     let mut prev_flight_speed: f32 = flight_speed;
     let mut prev_sync_to_flight = audio_settings.sync_to_flight;
@@ -407,9 +445,19 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                     debug!("[AUTO] Auto-selecting source: {}", source_id);
                     selected_sources.insert(source_id.clone());
                     let color = color_pool.get_color(&source_id);
-                    if let Some(walk_data) = load_walk_data(source, &config, &data_paths, max_points, &selected_mapping, selected_base, color) {
-                        walks.insert(source_id.clone(), walk_data);
-                    }
+                    queue_walk_load(
+                        &walk_load_tx,
+                        &mut pending_walk_loads,
+                        &mut next_walk_load_request_id,
+                        source.clone(),
+                        &config,
+                        &data_paths,
+                        max_points,
+                        &selected_mapping,
+                        selected_base,
+                        color,
+                        true,
+                    );
                 } else {
                     warn!("[AUTO] Source not found: {}", source_id);
                 }
@@ -443,19 +491,33 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                         if let Some(source) = config.sources.iter().find(|s| s.id == id) {
                             selected_sources.insert(id.clone());
                             let color = color_pool.get_color(&id);
-                            if let Some(walk_data) = load_walk_data(source, &config, &data_paths, max_points, &selected_mapping, selected_base, color) {
-                                walks.insert(id, walk_data);
-                            }
+                            queue_walk_load(
+                                &walk_load_tx,
+                                &mut pending_walk_loads,
+                                &mut next_walk_load_request_id,
+                                source.clone(),
+                                &config,
+                                &data_paths,
+                                max_points,
+                                &selected_mapping,
+                                selected_base,
+                                color,
+                                true,
+                            );
                         }
                     }
                     AutoCommand::DeselectSource { id } => {
                         selected_sources.remove(&id);
                         walks.remove(&id);
+                        pending_walk_loads.remove(&id);
+                        pending_audio_preps.remove(&id);
                         color_pool.release_color(&id);
                     }
                     AutoCommand::DeselectAll => {
                         selected_sources.clear();
                         walks.clear();
+                        pending_walk_loads.clear();
+                        pending_audio_preps.clear();
                         color_pool.clear();
                     }
                     AutoCommand::SetFlightMode { enabled } => {
@@ -488,6 +550,101 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                         info!("[AUTO] Quit command received");
                         return FrameOutput { exit: true, ..Default::default() };
                     }
+                }
+            }
+        }
+
+        while let Ok(result) = walk_load_rx.try_recv() {
+            let Some(pending) = pending_walk_loads.get(&result.source.id) else {
+                continue;
+            };
+            if pending.request_id != result.request_id {
+                continue;
+            }
+            pending_walk_loads.remove(&result.source.id);
+
+            if !selected_sources.contains(&result.source.id) {
+                continue;
+            }
+
+            match result.walk_data {
+                Some(walk_data) => {
+                    let walk_len = walk_data.points.len();
+                    debug!(
+                        "[GUI] Loaded {} walk points for {}",
+                        walk_len,
+                        result.source.id
+                    );
+                    if result.prepare_audio {
+                        if let Some(engine) = audio_engine.as_mut() {
+                            prepare_audio_for_source(
+                                &result.source,
+                                &data_paths,
+                                engine,
+                                &audio_settings,
+                                selected_base,
+                                flight_mode,
+                                flight_playing,
+                                flight_speed,
+                                &walk_data.points,
+                                walk_len,
+                                &audio_prep_tx,
+                                &mut pending_audio_preps,
+                                &mut next_audio_prep_request_id,
+                            );
+                        } else {
+                            warn!("[GUI] No audio engine available when selecting source {}", result.source.id);
+                        }
+                    }
+                    walks.insert(result.source.id.clone(), walk_data);
+                }
+                None => {
+                    warn!("[GUI] load_walk_data returned None for {}", result.source.id);
+                }
+            }
+        }
+
+        while let Ok(result) = audio_prep_rx.try_recv() {
+            let Some(pending) = pending_audio_preps.get(&result.source.id) else {
+                continue;
+            };
+            if pending.request_id != result.request_id {
+                continue;
+            }
+            pending_audio_preps.remove(&result.source.id);
+
+            if !selected_sources.contains(&result.source.id) || !audio_settings.enabled {
+                continue;
+            }
+
+            match result.result {
+                Ok(prepared) => {
+                    if let Some(engine) = audio_engine.as_mut() {
+                        match engine.prepare_pre_stretched_file_source(
+                            &result.source.id,
+                            prepared.path,
+                            prepared.samples,
+                            prepared.sample_rate,
+                            prepared.channels,
+                        ) {
+                            Ok(_) => {
+                                debug!("[GUI] Background audio prep complete for {}", result.source.id);
+                                if flight_mode && flight_playing {
+                                    engine.play(&audio_settings);
+                                }
+                            }
+                            Err(e) => error!(
+                                "[GUI] Failed to install stretched audio source {}: {}",
+                                result.source.id,
+                                e
+                            ),
+                        }
+                    } else {
+                        warn!("[GUI] No audio engine available when installing {}", result.source.id);
+                    }
+                }
+                Err(e) => {
+                    error!("[GUI] Background audio prep failed for {}: {}", result.source.id, e);
                 }
             }
         }
@@ -1336,9 +1493,9 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                                     });
                             });
 
-                            // Force synthesis checkbox (per-note association)
-                            if ui.checkbox(&mut audio_settings.force_synthesis, "Synthesize Notes")
-                                .on_hover_text("Generate tones from base-12 digits (one note per walk point)")
+                            // Generated audio checkbox: synthesize notes/drums instead of source audio when possible
+                            if ui.checkbox(&mut audio_settings.force_synthesis, "Use Generated Audio")
+                                .on_hover_text("Use generated notes/drums instead of the source audio file when possible")
                                 .changed() {
                                 debug!("[GUI] Checkbox changed: audio_settings.force_synthesis = {}", audio_settings.force_synthesis);
                             }
@@ -1346,9 +1503,9 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                             // Sync checkbox - works for both synthesis and audio files
                             if ui.checkbox(&mut audio_settings.sync_to_flight, "Sync to Flight")
                                 .on_hover_text(if audio_settings.force_synthesis {
-                                    "Sync note playback rate to flight speed (one note per walk point)"
+                                    "Sync generated note/drum playback to flight speed (one sound per walk point)"
                                 } else {
-                                    "Time-stretch audio to match flight duration"
+                                    "Time-stretch source audio to match flight duration"
                                 })
                                 .changed() {
                                 debug!("[GUI] Checkbox changed: audio_settings.sync_to_flight = {}", audio_settings.sync_to_flight);
@@ -1401,87 +1558,26 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                                                 // Get color from pool for maximum contrast
                                                 let color = color_pool.get_color(&source.id);
                                                 debug!("[GUI] Got color for {}: {:?}", source.id, color);
-                                                // Load walk
-                                                debug!("[GUI] Loading walk data for {}", source.id);
-                                                let walk_len = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                                    load_walk_data(&source, &config, &data_paths, max_points, &selected_mapping, selected_base, color)
-                                                })) {
-                                                    Ok(Some(walk_data)) => {
-                                                        let len = walk_data.points.len();
-                                                        debug!("[GUI] Loaded {} walk points for {}", len, source.id);
-                                                        walks.insert(source.id.clone(), walk_data);
-                                                        len
-                                                    }
-                                                    Ok(None) => {
-                                                        warn!("[GUI] load_walk_data returned None for {}", source.id);
-                                                        0
-                                                    }
-                                                    Err(e) => {
-                                                        error!("[GUI] PANIC in load_walk_data for {}: {:?}", source.id, e);
-                                                        0
-                                                    }
-                                                };
-                                                // Prepare audio source
-                                                debug!("[GUI] Preparing audio for source: {}", source.id);
-                                                if let Some(ref mut engine) = audio_engine {
-                                                    // Use synthesis if force_synthesis is enabled, otherwise use audio file
-                                                    let audio_source_type = if audio_settings.force_synthesis {
-                                                        debug!("[GUI] Loading base-12 digits for synthesis: {}", source.id);
-                                                        match load_base12_digits(&source, &data_paths) {
-                                                            Ok(base12_digits) => {
-                                                                debug!("[GUI] Using synthesis for {} ({} digits)", source.id, base12_digits.len());
-                                                                SourceType::Synthesized { base_digits: base12_digits }
-                                                            }
-                                                            Err(e) => {
-                                                                warn!("[GUI] Skipping audio prep for {}: {}", source.id, e);
-                                                                continue;
-                                                            }
-                                                        }
-                                                    } else {
-                                                        debug!("[GUI] Getting audio source type for {}", source.id);
-                                                        match get_audio_source_type(&source, &data_paths) {
-                                                            Ok(source_type) => source_type,
-                                                            Err(e) => {
-                                                                warn!("[GUI] Skipping audio prep for {}: {}", source.id, e);
-                                                                continue;
-                                                            }
-                                                        }
-                                                    };
-                                                    debug!("[GUI] Preparing audio for source: {} (type: {:?})", source.id, audio_source_type);
-
-                                                    // Calculate flight duration for time-stretching
-                                                    let flight_duration = if walk_len > 0 && flight_speed > 0.0 {
-                                                        walk_len as f32 / flight_speed
-                                                    } else {
-                                                        30.0 // Default fallback
-                                                    };
-
-                                                    let result = if audio_settings.sync_to_flight {
-                                                        // Sync enabled: time-stretch audio files OR set synth rate
-                                                        debug!("[GUI] Syncing to flight: {:.1}s (walk: {} pts, speed: {:.1} Hz)", flight_duration, walk_len, flight_speed);
-                                                        engine.prepare_source_stretched(&source.id, audio_source_type, flight_duration)
-                                                    } else {
-                                                        engine.prepare_source(&source.id, audio_source_type)
-                                                    };
-
-                                                    match result {
-                                                        Ok(_) => {
-                                                            debug!("[GUI] Audio source prepared: {}", source.id);
-                                                            // If already playing AND flight mode is on, start the new source immediately
-                                                            if flight_mode && flight_playing && audio_settings.enabled {
-                                                                debug!("[GUI] Auto-starting audio for newly selected source");
-                                                                engine.play(&audio_settings);
-                                                            }
-                                                        }
-                                                        Err(e) => error!("[GUI] Failed to prepare audio source {}: {}", source.id, e),
-                                                    }
-                                                } else {
-                                                    warn!("[GUI] No audio engine available when selecting source {}", source.id);
-                                                }
+                                                debug!("[GUI] Queueing walk data load for {}", source.id);
+                                                queue_walk_load(
+                                                    &walk_load_tx,
+                                                    &mut pending_walk_loads,
+                                                    &mut next_walk_load_request_id,
+                                                    source.clone(),
+                                                    &config,
+                                                    &data_paths,
+                                                    max_points,
+                                                    &selected_mapping,
+                                                    selected_base,
+                                                    color,
+                                                    true,
+                                                );
                                             } else {
                                                 debug!("[GUI] Deselecting source: {}", source.id);
                                                 selected_sources.remove(&source.id);
                                                 walks.remove(&source.id);
+                                                pending_walk_loads.remove(&source.id);
+                                                pending_audio_preps.remove(&source.id);
                                                 // Release color back to pool
                                                 color_pool.release_color(&source.id);
                                                 // Remove audio source
@@ -1501,9 +1597,78 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                     });
                 });
 
+                if audio_settings.enabled != prev_audio_enabled {
+                    debug!(
+                        "[GUI] Audio enabled changed: {} -> {}",
+                        prev_audio_enabled,
+                        audio_settings.enabled
+                    );
+                    if audio_settings.enabled {
+                        refresh_selected_audio_sources(
+                            &selected_sources,
+                            &walks,
+                            &config,
+                            &data_paths,
+                            audio_engine.as_mut(),
+                            &audio_settings,
+                            selected_base,
+                            flight_mode,
+                            flight_playing,
+                            flight_speed,
+                            &audio_prep_tx,
+                            &mut pending_audio_preps,
+                            &mut next_audio_prep_request_id,
+                        );
+                    } else if let Some(ref mut engine) = audio_engine {
+                        pending_audio_preps.clear();
+                        engine.stop_all();
+                    }
+                    prev_audio_enabled = audio_settings.enabled;
+                }
+
+                if audio_settings.force_synthesis != prev_force_synthesis {
+                    debug!(
+                        "[GUI] Force synthesis changed: {} -> {}",
+                        prev_force_synthesis,
+                        audio_settings.force_synthesis
+                    );
+                    refresh_selected_audio_sources(
+                        &selected_sources,
+                        &walks,
+                        &config,
+                        &data_paths,
+                        audio_engine.as_mut(),
+                        &audio_settings,
+                        selected_base,
+                        flight_mode,
+                        flight_playing,
+                        flight_speed,
+                        &audio_prep_tx,
+                        &mut pending_audio_preps,
+                        &mut next_audio_prep_request_id,
+                    );
+                    prev_force_synthesis = audio_settings.force_synthesis;
+                }
+
                 // Bottom panel
                 egui::TopBottomPanel::bottom("status").show(egui_ctx, |ui| {
                     ui.horizontal(|ui| {
+                        if !pending_walk_loads.is_empty() {
+                            ui.add(egui::Spinner::new());
+                            ui.label(format!(
+                                "Loading {}",
+                                format_pending_walks(&pending_walk_loads)
+                            ));
+                            ui.separator();
+                        }
+                        if !pending_audio_preps.is_empty() {
+                            ui.add(egui::Spinner::new());
+                            ui.label(format!(
+                                "Preparing audio {}",
+                                format_pending_audio(&pending_audio_preps)
+                            ));
+                            ui.separator();
+                        }
                         // Show screenshot status if active
                         if let Some((ref msg, expire_time)) = screenshot_status {
                             if frame_input.accumulated_time < expire_time {
@@ -1717,20 +1882,19 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                     // Reuse existing color assignment
                     let color = color_pool.get_color(&sid);
                     debug!("[GUI] Regenerating walk for {}", sid);
-                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        load_walk_data(source, &config, &data_paths, max_points, &selected_mapping, selected_base, color)
-                    })) {
-                        Ok(Some(walk_data)) => {
-                            debug!("[GUI] Regenerated {} points for {}", walk_data.points.len(), sid);
-                            walks.insert(sid.clone(), walk_data);
-                        }
-                        Ok(None) => {
-                            warn!("[GUI] Failed to regenerate walk for {}", sid);
-                        }
-                        Err(e) => {
-                            error!("[GUI] PANIC while regenerating walk for {}: {:?}", sid, e);
-                        }
-                    }
+                    queue_walk_load(
+                        &walk_load_tx,
+                        &mut pending_walk_loads,
+                        &mut next_walk_load_request_id,
+                        source.clone(),
+                        &config,
+                        &data_paths,
+                        max_points,
+                        &selected_mapping,
+                        selected_base,
+                        color,
+                        true,
+                    );
                 }
             }
         }
@@ -1750,51 +1914,26 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
         // Re-prepare audio sources if flight_speed or sync_to_flight changed
         let speed_changed = (flight_speed - prev_flight_speed).abs() > 0.001;
         let sync_changed = audio_settings.sync_to_flight != prev_sync_to_flight;
-        if (speed_changed || sync_changed) && audio_settings.sync_to_flight && !selected_sources.is_empty() {
+        if ((speed_changed && audio_settings.sync_to_flight) || sync_changed) && !selected_sources.is_empty() {
             debug!("[GUI] Flight speed or sync changed: speed {:.2} -> {:.2}, sync {} -> {}",
                 prev_flight_speed, flight_speed, prev_sync_to_flight, audio_settings.sync_to_flight);
             prev_flight_speed = flight_speed;
             prev_sync_to_flight = audio_settings.sync_to_flight;
-
-            if let Some(ref mut engine) = audio_engine {
-                // Re-prepare all audio sources with new timing
-                for source_id in &selected_sources {
-                    if let Some(source) = config.sources.iter().find(|s| &s.id == source_id) {
-                        let walk_len = walks.get(source_id).map(|w| w.points.len()).unwrap_or(5000);
-                        let flight_duration = if walk_len > 0 && flight_speed > 0.0 {
-                            walk_len as f32 / flight_speed
-                        } else {
-                            30.0
-                        };
-
-                        let audio_source_type = if audio_settings.force_synthesis {
-                            match load_base12_digits(source, &data_paths) {
-                                Ok(base12_digits) => SourceType::Synthesized { base_digits: base12_digits },
-                                Err(e) => {
-                                    warn!("[GUI] Skipping audio re-prepare for {}: {}", source_id, e);
-                                    continue;
-                                }
-                            }
-                        } else {
-                            match get_audio_source_type(source, &data_paths) {
-                                Ok(source_type) => source_type,
-                                Err(e) => {
-                                    warn!("[GUI] Skipping audio re-prepare for {}: {}", source_id, e);
-                                    continue;
-                                }
-                            }
-                        };
-
-                        debug!("[GUI] Re-preparing audio for {} at new speed (duration: {:.1}s)", source_id, flight_duration);
-                        let _ = engine.prepare_source_stretched(source_id, audio_source_type, flight_duration);
-                    }
-                }
-
-                // Restart playback if it was playing
-                if flight_mode && flight_playing && audio_settings.enabled {
-                    engine.play(&audio_settings);
-                }
-            }
+            refresh_selected_audio_sources(
+                &selected_sources,
+                &walks,
+                &config,
+                &data_paths,
+                audio_engine.as_mut(),
+                &audio_settings,
+                selected_base,
+                flight_mode,
+                flight_playing,
+                flight_speed,
+                &audio_prep_tx,
+                &mut pending_audio_preps,
+                &mut next_audio_prep_request_id,
+            );
         } else {
             prev_flight_speed = flight_speed;
             prev_sync_to_flight = audio_settings.sync_to_flight;
@@ -2061,6 +2200,354 @@ fn load_base12_digits(
             )),
         }
     }
+}
+
+fn queue_walk_load(
+    walk_load_tx: &std::sync::mpsc::Sender<WalkLoadResult>,
+    pending_walk_loads: &mut BTreeMap<String, PendingWalkLoad>,
+    next_walk_load_request_id: &mut u64,
+    source: crate::config::Source,
+    config: &Config,
+    data_paths: &DataPaths,
+    max_points: usize,
+    mapping_name: &str,
+    base: u32,
+    color: [f32; 3],
+    prepare_audio: bool,
+) {
+    let request_id = *next_walk_load_request_id;
+    *next_walk_load_request_id += 1;
+    pending_walk_loads.insert(
+        source.id.clone(),
+        PendingWalkLoad {
+            request_id,
+            source_name: source.name.clone(),
+        },
+    );
+
+    let tx = walk_load_tx.clone();
+    let config = config.clone();
+    let data_paths = data_paths.clone();
+    let mapping_name = mapping_name.to_string();
+
+    std::thread::spawn(move || {
+        let walk_data = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            load_walk_data(
+                &source,
+                &config,
+                &data_paths,
+                max_points,
+                &mapping_name,
+                base,
+                color,
+            )
+        })) {
+            Ok(walk_data) => walk_data,
+            Err(e) => {
+                error!("[GUI] PANIC in load_walk_data for {}: {:?}", source.id, e);
+                None
+            }
+        };
+
+        if tx
+            .send(WalkLoadResult {
+                request_id,
+                source,
+                walk_data,
+                prepare_audio,
+            })
+            .is_err()
+        {
+            debug!("[GUI] Walk load receiver dropped");
+        }
+    });
+}
+
+fn prepare_audio_for_source(
+    source: &crate::config::Source,
+    data_paths: &DataPaths,
+    engine: &mut AudioEngine,
+    audio_settings: &AudioSettings,
+    selected_base: u32,
+    flight_mode: bool,
+    flight_playing: bool,
+    flight_speed: f32,
+    walk_points: &[[f32; 3]],
+    walk_len: usize,
+    audio_prep_tx: &std::sync::mpsc::Sender<AudioPrepResult>,
+    pending_audio_preps: &mut BTreeMap<String, PendingAudioPrep>,
+    next_audio_prep_request_id: &mut u64,
+) {
+    debug!("[GUI] Preparing audio for source: {}", source.id);
+    let audio_source_type = if audio_settings.force_synthesis {
+        let notes = walk_points_to_midi_notes(walk_points, selected_base);
+        debug!(
+            "[GUI] Using synthesized walk notes for {} ({} points, base {})",
+            source.id,
+            notes.len(),
+            selected_base
+        );
+        SourceType::MidiNotes { notes }
+    } else {
+        debug!("[GUI] Getting audio source type for {}", source.id);
+        match get_audio_source_type(source, data_paths) {
+            Ok(source_type) => source_type,
+            Err(e) => {
+                warn!("[GUI] Skipping audio prep for {}: {}", source.id, e);
+                return;
+            }
+        }
+    };
+    debug!(
+        "[GUI] Preparing audio for source: {} (type: {:?})",
+        source.id,
+        audio_source_type
+    );
+
+    let flight_duration = if walk_len > 0 && flight_speed > 0.0 {
+        walk_len as f32 / flight_speed
+    } else {
+        30.0
+    };
+
+    pending_audio_preps.remove(&source.id);
+
+    let result = if audio_settings.sync_to_flight {
+        if let SourceType::AudioFile { path } = &audio_source_type {
+            debug!(
+                "[GUI] Queueing background audio stretch for {} to {:.1}s",
+                source.id,
+                flight_duration
+            );
+            queue_audio_file_prep(
+                audio_prep_tx,
+                pending_audio_preps,
+                next_audio_prep_request_id,
+                source.clone(),
+                path.clone(),
+                flight_duration,
+            );
+            return;
+        }
+        debug!(
+            "[GUI] Syncing to flight: {:.1}s (walk: {} pts, speed: {:.1} Hz)",
+            flight_duration,
+            walk_len,
+            flight_speed
+        );
+        engine.prepare_source_stretched(&source.id, audio_source_type, flight_duration)
+    } else {
+        engine.prepare_source(&source.id, audio_source_type)
+    };
+
+    match result {
+        Ok(_) => {
+            debug!("[GUI] Audio source prepared: {}", source.id);
+            if flight_mode && flight_playing && audio_settings.enabled {
+                debug!("[GUI] Auto-starting audio for newly selected source");
+                engine.play(audio_settings);
+            }
+        }
+        Err(e) => error!("[GUI] Failed to prepare audio source {}: {}", source.id, e),
+    }
+}
+
+fn refresh_selected_audio_sources(
+    selected_sources: &std::collections::HashSet<String>,
+    walks: &BTreeMap<String, WalkData>,
+    config: &Config,
+    data_paths: &DataPaths,
+    audio_engine: Option<&mut AudioEngine>,
+    audio_settings: &AudioSettings,
+    selected_base: u32,
+    flight_mode: bool,
+    flight_playing: bool,
+    flight_speed: f32,
+    audio_prep_tx: &std::sync::mpsc::Sender<AudioPrepResult>,
+    pending_audio_preps: &mut BTreeMap<String, PendingAudioPrep>,
+    next_audio_prep_request_id: &mut u64,
+) {
+    let Some(engine) = audio_engine else {
+        if !selected_sources.is_empty() {
+            warn!("[GUI] No audio engine available while refreshing audio sources");
+        }
+        return;
+    };
+
+    for source_id in selected_sources {
+        let Some(source) = config.sources.iter().find(|s| &s.id == source_id) else {
+            continue;
+        };
+        let walk_len = walks.get(source_id).map(|w| w.points.len()).unwrap_or(0);
+        prepare_audio_for_source(
+            source,
+            data_paths,
+            engine,
+            audio_settings,
+            selected_base,
+            flight_mode,
+            flight_playing,
+            flight_speed,
+            walks.get(source_id).map(|w| w.points.as_slice()).unwrap_or(&[]),
+            walk_len,
+            audio_prep_tx,
+            pending_audio_preps,
+            next_audio_prep_request_id,
+        );
+    }
+}
+
+fn queue_audio_file_prep(
+    audio_prep_tx: &std::sync::mpsc::Sender<AudioPrepResult>,
+    pending_audio_preps: &mut BTreeMap<String, PendingAudioPrep>,
+    next_audio_prep_request_id: &mut u64,
+    source: crate::config::Source,
+    path: PathBuf,
+    target_duration_secs: f32,
+) {
+    let request_id = *next_audio_prep_request_id;
+    *next_audio_prep_request_id += 1;
+    pending_audio_preps.insert(
+        source.id.clone(),
+        PendingAudioPrep {
+            request_id,
+            source_name: source.name.clone(),
+        },
+    );
+
+    let tx = audio_prep_tx.clone();
+    std::thread::spawn(move || {
+        let result = crate::audio::load_and_stretch(&path, target_duration_secs).map(
+            |(samples, sample_rate, channels)| PreparedAudioFile {
+                path,
+                samples,
+                sample_rate,
+                channels,
+            },
+        );
+
+        if tx
+            .send(AudioPrepResult {
+                request_id,
+                source,
+                result,
+            })
+            .is_err()
+        {
+            debug!("[GUI] Audio prep receiver dropped");
+        }
+    });
+}
+
+fn walk_points_to_midi_notes(
+    points: &[[f32; 3]],
+    base: u32,
+) -> Vec<crate::converters::audio::MidiNote> {
+    use crate::converters::audio::MidiNote;
+
+    if points.is_empty() {
+        return vec![MidiNote { note: 60, velocity: 0.8 }];
+    }
+
+    let mut notes = Vec::with_capacity(points.len());
+    let mut previous_point = [0.0_f32, 0.0, 0.0];
+    let mut previous_dir: Option<u8> = None;
+
+    for &point in points {
+        let dx = point[0] - previous_point[0];
+        let dy = point[1] - previous_point[1];
+        let dz = point[2] - previous_point[2];
+
+        let dir = if base == 4 {
+            if dx.abs() >= dy.abs() {
+                if dx >= 0.0 { 0 } else { 1 }
+            } else if dy >= 0.0 {
+                2
+            } else {
+                3
+            }
+        } else {
+            let ax = dx.abs();
+            let ay = dy.abs();
+            let az = dz.abs();
+            if ax >= ay && ax >= az {
+                if dx >= 0.0 { 0 } else { 1 }
+            } else if ay >= ax && ay >= az {
+                if dy >= 0.0 { 2 } else { 3 }
+            } else if dz >= 0.0 {
+                4
+            } else {
+                5
+            }
+        };
+
+        let class = match base {
+            4 => dir % 4,
+            6 => dir % 6,
+            _ => {
+                let turned = previous_dir.map(|prev| prev != dir).unwrap_or(false);
+                dir + if turned { 6 } else { 0 }
+            }
+        };
+
+        notes.push(MidiNote {
+            note: 60 + class,
+            velocity: 0.85,
+        });
+
+        previous_dir = Some(dir);
+        previous_point = point;
+    }
+
+    notes
+}
+
+fn format_pending_audio(pending_audio_preps: &BTreeMap<String, PendingAudioPrep>) -> String {
+    if pending_audio_preps.is_empty() {
+        return "sources".to_string();
+    }
+
+    let count = pending_audio_preps.len();
+    let mut names = pending_audio_preps
+        .values()
+        .map(|pending| pending.source_name.as_str());
+
+    if count == 1 {
+        let name = names.next().unwrap_or("source");
+        return format!("1 source: {}", name);
+    }
+
+    let first = names.next().unwrap_or("source");
+    let second = names.next().unwrap_or("source");
+    if count == 2 {
+        return format!("2 sources: {}, {}", first, second);
+    }
+
+    format!("{} sources: {}, {}...", count, first, second)
+}
+
+fn format_pending_walks(pending_walk_loads: &BTreeMap<String, PendingWalkLoad>) -> String {
+    if pending_walk_loads.is_empty() {
+        return "walks".to_string();
+    }
+
+    let count = pending_walk_loads.len();
+    let mut names = pending_walk_loads
+        .values()
+        .map(|pending| pending.source_name.as_str());
+
+    if count == 1 {
+        let name = names.next().unwrap_or("walk");
+        return format!("1 walk: {}", name);
+    }
+
+    let first = names.next().unwrap_or("walk");
+    let second = names.next().unwrap_or("walk");
+    if count == 2 {
+        return format!("2 walks: {}, {}", first, second);
+    }
+
+    format!("{} walks: {}, {}...", count, first, second)
 }
 
 fn load_walk_data(

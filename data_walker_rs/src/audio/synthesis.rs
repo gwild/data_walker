@@ -89,6 +89,10 @@ impl MidiSynthSource {
         (self.sample_index % self.samples_per_note as usize) as f32 / self.samples_per_note as f32
     }
 
+    fn note_sample_index(&self) -> usize {
+        self.sample_index % self.samples_per_note as usize
+    }
+
     /// Generate accurate chromatic note at correct octave
     fn generate_chromatic(&mut self) -> f32 {
         let note = self.current_note();
@@ -133,37 +137,197 @@ impl MidiSynthSource {
     /// Generate percussion sound based on note
     fn generate_percussion(&mut self) -> f32 {
         let note = self.current_note();
-        let progress = self.note_progress();
+        let note_sample_index = self.note_sample_index();
+        let t = note_sample_index as f32 / SAMPLE_RATE as f32;
+        let accent = note.velocity.clamp(0.0, 1.0);
+        let drum = note.note % 12;
 
-        // Only trigger sound at start of note
-        if progress > 0.3 {
+        match drum {
+            0 => self.generate_kick(t, accent),
+            1 => self.generate_low_tom(t, accent),
+            2 => self.generate_snare(note_sample_index, t, accent),
+            3 => self.generate_rim(note_sample_index, t, accent),
+            4 => self.generate_closed_hat(note_sample_index, t, accent),
+            5 => self.generate_open_hat(note_sample_index, t, accent),
+            6 => self.generate_clap(note_sample_index, t, accent),
+            7 => self.generate_mid_tom(t, accent),
+            8 => self.generate_high_tom(t, accent),
+            9 => self.generate_shaker(note_sample_index, t, accent),
+            10 => self.generate_cowbell(t, accent),
+            _ => self.generate_crash(note_sample_index, t, accent),
+        }
+    }
+
+    fn generate_kick(&self, t: f32, accent: f32) -> f32 {
+        if t > 0.22 {
             return 0.0;
         }
 
-        let t = progress / 0.3;
-        let decay = (-t * 15.0).exp();
+        let amp_env = (-t * 18.0).exp();
+        let pitch_env = (-t * 28.0).exp();
+        let freq = 42.0 + 130.0 * pitch_env;
+        let body = (2.0 * std::f32::consts::PI * freq * t).sin();
+        let click = (2.0 * std::f32::consts::PI * 1800.0 * t).sin() * (-t * 220.0).exp();
 
-        // Map note to drum type (every 4 semitones = different drum)
-        match (note.note / 4) % 3 {
-            0 => {
-                // Kick: low frequency with pitch bend
-                let freq = 60.0 * (1.0 + t * 5.0).min(2.0);
-                let phase = 2.0 * std::f32::consts::PI * freq * t;
-                phase.sin() * decay * note.velocity * 0.5
-            }
-            1 => {
-                // Snare: noise burst
-                let noise = (self.sample_index as f32 * 12345.67).sin()
-                    * (self.sample_index as f32 * 7654.32).cos();
-                noise * decay * note.velocity * 0.3
-            }
-            _ => {
-                // Hi-hat: high frequency noise
-                let noise = (self.sample_index as f32 * 54321.0).sin();
-                noise * (-t * 30.0).exp() * note.velocity * 0.2
-            }
-        }
+        (body * 0.9 + click * 0.18) * amp_env * accent * 0.75
     }
+
+    fn generate_tom(&self, t: f32, accent: f32, base_freq: f32, decay_rate: f32) -> f32 {
+        if t > 0.24 {
+            return 0.0;
+        }
+
+        let amp_env = (-t * decay_rate).exp();
+        let pitch_env = (-t * 18.0).exp();
+        let freq = base_freq + base_freq * 0.55 * pitch_env;
+        let body = (2.0 * std::f32::consts::PI * freq * t).sin();
+        let overtone = (2.0 * std::f32::consts::PI * freq * 1.92 * t).sin() * 0.22;
+        let click = (2.0 * std::f32::consts::PI * 2400.0 * t).sin() * (-t * 260.0).exp() * 0.08;
+
+        (body + overtone + click) * amp_env * accent * 0.62
+    }
+
+    fn generate_low_tom(&self, t: f32, accent: f32) -> f32 {
+        self.generate_tom(t, accent, 92.0, 13.0)
+    }
+
+    fn generate_mid_tom(&self, t: f32, accent: f32) -> f32 {
+        self.generate_tom(t, accent, 138.0, 15.0)
+    }
+
+    fn generate_high_tom(&self, t: f32, accent: f32) -> f32 {
+        self.generate_tom(t, accent, 198.0, 17.0)
+    }
+
+    fn generate_snare(&self, note_sample_index: usize, t: f32, accent: f32) -> f32 {
+        if t > 0.18 {
+            return 0.0;
+        }
+
+        let noise = shaped_noise(note_sample_index, 0x51A3C7D2);
+        let noise_env = (-t * 24.0).exp();
+        let body_env = (-t * 16.0).exp();
+        let body = (2.0 * std::f32::consts::PI * 190.0 * t).sin()
+            + 0.35 * (2.0 * std::f32::consts::PI * 330.0 * t).sin();
+        let snap = (2.0 * std::f32::consts::PI * 3200.0 * t).sin() * (-t * 260.0).exp();
+
+        (noise * noise_env * 0.7 + body * body_env * 0.32 + snap * 0.08) * accent * 0.7
+    }
+
+    fn generate_rim(&self, note_sample_index: usize, t: f32, accent: f32) -> f32 {
+        if t > 0.05 {
+            return 0.0;
+        }
+
+        let wood = (
+            (2.0 * std::f32::consts::PI * 1760.0 * t).sin()
+                + (2.0 * std::f32::consts::PI * 2480.0 * t).sin() * 0.6
+        ) * (-t * 85.0).exp();
+        let click = shaped_noise(note_sample_index, 0x19C3A56D) * (-t * 180.0).exp() * 0.25;
+
+        (wood + click) * accent * 0.52
+    }
+
+    fn generate_hat_voice(
+        &self,
+        note_sample_index: usize,
+        t: f32,
+        accent: f32,
+        decay_rate: f32,
+        gain: f32,
+    ) -> f32 {
+        if t > 0.28 {
+            return 0.0;
+        }
+
+        let noise_a = shaped_noise(note_sample_index, 0xA341316C);
+        let noise_b = shaped_noise(note_sample_index, 0xC8013EA4);
+        let metallic = (
+            (2.0 * std::f32::consts::PI * 4020.0 * t).sin()
+                + (2.0 * std::f32::consts::PI * 5300.0 * t).sin() * 0.6
+                + (2.0 * std::f32::consts::PI * 7180.0 * t).sin() * 0.35
+        ) * 0.18;
+        let noise = (noise_a - noise_b * 0.85).clamp(-1.0, 1.0);
+        let env = (-t * decay_rate).exp();
+
+        (noise * 0.82 + metallic) * env * accent * gain
+    }
+
+    fn generate_closed_hat(&self, note_sample_index: usize, t: f32, accent: f32) -> f32 {
+        if t > 0.08 {
+            return 0.0;
+        }
+
+        self.generate_hat_voice(note_sample_index, t, accent, 52.0, 0.42)
+    }
+
+    fn generate_open_hat(&self, note_sample_index: usize, t: f32, accent: f32) -> f32 {
+        self.generate_hat_voice(note_sample_index, t, accent, 15.0, 0.32)
+    }
+
+    fn generate_clap(&self, note_sample_index: usize, t: f32, accent: f32) -> f32 {
+        if t > 0.20 {
+            return 0.0;
+        }
+
+        let pulse = if t < 0.012 || (t > 0.026 && t < 0.040) || (t > 0.055 && t < 0.080) {
+            1.0
+        } else {
+            0.0
+        };
+        let tail = shaped_noise(note_sample_index, 0x7F4A7C15) * (-t * 16.0).exp() * 0.35;
+        let burst = shaped_noise(note_sample_index, 0xB992DDFA) * pulse * 0.8;
+
+        (burst + tail) * accent * 0.58
+    }
+
+    fn generate_shaker(&self, note_sample_index: usize, t: f32, accent: f32) -> f32 {
+        if t > 0.12 {
+            return 0.0;
+        }
+
+        let grains = shaped_noise(note_sample_index, 0xC47E3B71) * shaped_noise(note_sample_index, 0x91E10DA5);
+        let env = (-t * 34.0).exp();
+        let sparkle = (2.0 * std::f32::consts::PI * 8400.0 * t).sin() * (-t * 90.0).exp() * 0.08;
+
+        (grains * 0.85 + sparkle) * env * accent * 0.34
+    }
+
+    fn generate_cowbell(&self, t: f32, accent: f32) -> f32 {
+        if t > 0.18 {
+            return 0.0;
+        }
+
+        let env = (-t * 13.0).exp();
+        let tone_a = (2.0 * std::f32::consts::PI * 587.0 * t).sin();
+        let tone_b = (2.0 * std::f32::consts::PI * 845.0 * t).sin() * 0.8;
+        let tone_c = (2.0 * std::f32::consts::PI * 1180.0 * t).sin() * 0.28;
+
+        (tone_a + tone_b + tone_c) * env * accent * 0.34
+    }
+
+    fn generate_crash(&self, note_sample_index: usize, t: f32, accent: f32) -> f32 {
+        if t > 0.65 {
+            return 0.0;
+        }
+
+        let wash = self.generate_hat_voice(note_sample_index, t, accent, 4.8, 0.26);
+        let broadband = shaped_noise(note_sample_index, 0xDA2F7C39) * (-t * 6.0).exp() * 0.18;
+        let clang = (
+            (2.0 * std::f32::consts::PI * 3120.0 * t).sin()
+                + (2.0 * std::f32::consts::PI * 4650.0 * t).sin() * 0.45
+        ) * (-t * 10.0).exp() * 0.10;
+
+        (wash + broadband + clang) * accent
+    }
+}
+
+fn shaped_noise(sample_index: usize, seed: u32) -> f32 {
+    let mut x = seed ^ sample_index as u32;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    (x as f32 / u32::MAX as f32) * 2.0 - 1.0
 }
 
 impl Iterator for MidiSynthSource {
