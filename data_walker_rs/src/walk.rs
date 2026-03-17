@@ -79,20 +79,20 @@ pub fn walk_base12(base12: &[u8], mapping: &[u8; 12], max_points: usize) -> Vec<
         let d = mapping[(digit % 12) as usize] as usize;
 
         if d < 6 {
-            // Translation
+            // Translation - move and emit point
             let dir = q_rotate_vec(rot, LOCAL_DIRS[d]);
             pos[0] += dir[0];
             pos[1] += dir[1];
             pos[2] += dir[2];
+            path.push(pos);
         } else {
-            // Rotation
+            // Rotation - change orientation only, no point emitted
+            // Lines will connect the previous translation to the next one directly
             let axis_idx = d - 6;
             let sign = if axis_idx % 2 == 0 { 1.0 } else { -1.0 };
             let q = q_from_axis_angle(ROT_AXES[axis_idx], ANGLE * sign);
             rot = q_mul(q, rot);
         }
-
-        path.push(pos);
     }
 
     // Subsample if too many points

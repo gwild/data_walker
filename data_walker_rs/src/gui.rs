@@ -727,7 +727,6 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Resu
                     let p1 = vec3(walk.points[i][0], walk.points[i][1], walk.points[i][2]);
                     let p2 = vec3(walk.points[i + 1][0], walk.points[i + 1][1], walk.points[i + 1][2]);
 
-                    let center = (p1 + p2) * 0.5;
                     let dir = p2 - p1;
                     let length = dir.magnitude();
 
@@ -750,21 +749,27 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Resu
                             let count1 = *walk.revisit_counts.get(&key1).unwrap_or(&1) as f32;
                             let count2 = *walk.revisit_counts.get(&key2).unwrap_or(&1) as f32;
                             let avg_count = (count1 + count2) * 0.5;
-                            line_scale * (0.15 + 0.85 * avg_count.ln().max(0.0) / ln_max)
+                            line_scale * (0.3 + 0.7 * avg_count.ln().max(0.0) / ln_max)
                         };
 
-                        let up = vec3(0.0, 1.0, 0.0);
-                        let rotation = if dir.normalize().dot(up).abs() > 0.999 {
-                            Mat4::identity()
+                        // three-d meshes extend along X from 0 to 1, radius 1 in Y/Z
+                        let x_axis = vec3(1.0, 0.0, 0.0);
+                        let dir_n = dir.normalize();
+                        let rotation = if dir_n.dot(x_axis).abs() > 0.999 {
+                            if dir_n.dot(x_axis) < 0.0 {
+                                Mat4::from_angle_y(radians(std::f32::consts::PI))
+                            } else {
+                                Mat4::identity()
+                            }
                         } else {
-                            let axis = up.cross(dir.normalize()).normalize();
-                            let angle = up.dot(dir.normalize()).acos();
+                            let axis = x_axis.cross(dir_n).normalize();
+                            let angle = x_axis.dot(dir_n).acos();
                             Mat4::from_axis_angle(axis, radians(angle))
                         };
 
-                        let transform = Mat4::from_translation(center)
+                        let transform = Mat4::from_translation(p1)
                             * rotation
-                            * Mat4::from_nonuniform_scale(radius, length * 0.5, radius);
+                            * Mat4::from_nonuniform_scale(length, radius, radius);
 
                         instances.transformations.push(transform);
 
@@ -787,9 +792,9 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig) -> anyhow::Resu
                 }
 
                 if !instances.transformations.is_empty() {
-                    let cone = CpuMesh::cone(12);
+                    let cylinder = CpuMesh::cylinder(8);
                     let instanced = Gm::new(
-                        InstancedMesh::new(&context, &instances, &cone),
+                        InstancedMesh::new(&context, &instances, &cylinder),
                         ColorMaterial::default(),
                     );
                     walk_lines.push(instanced);
