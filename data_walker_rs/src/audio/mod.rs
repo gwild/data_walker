@@ -10,10 +10,11 @@ mod timestretch;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::time::Instant;
 use rodio::{OutputStream, OutputStreamHandle, Sink};
 use tracing::{info, warn, debug};
 
-pub use synthesis::{SynthMethod, create_midi_synth_sink};
+pub use synthesis::SynthMethod;
 pub use timestretch::{load_and_stretch, StretchedSource};
 
 use crate::converters::audio::MidiNote;
@@ -67,10 +68,12 @@ struct AudioSource {
     source_id: String,
     source_type: SourceType,
     sink: Option<Sink>,
+    active_hit_sinks: Vec<Sink>,
     duration_secs: f32,
     volume: f32,
-    last_seek_progress: f32,  // Track last seek position to avoid constant seeking
     synth_rate: Option<f32>,  // Notes per second for synced synthesis (None = default 10/sec)
+    last_triggered_step: Option<usize>,
+    last_synced_step: Option<usize>,
 }
 
 /// Main audio playback engine
@@ -82,6 +85,10 @@ pub struct AudioEngine {
     sources: HashMap<String, AudioSource>,
     // Shared stop flag for synthesis threads
     stop_flag: Arc<AtomicBool>,
+    debug_window_started_at: Instant,
+    debug_triggered_hits_in_window: usize,
+    debug_sync_calls_in_window: usize,
+    debug_seek_events_in_window: usize,
 }
 
 impl AudioEngine {
@@ -94,6 +101,10 @@ impl AudioEngine {
             stream_handle,
             sources: HashMap::new(),
             stop_flag: Arc::new(AtomicBool::new(false)),
+            debug_window_started_at: Instant::now(),
+            debug_triggered_hits_in_window: 0,
+            debug_sync_calls_in_window: 0,
+            debug_seek_events_in_window: 0,
         })
     }
 
@@ -124,68 +135,75 @@ impl AudioEngine {
             source_id: source_id.to_string(),
             source_type,
             sink,
+            active_hit_sinks: Vec::new(),
             duration_secs: duration,
             volume: 1.0,
-            last_seek_progress: 0.0,
             synth_rate: None,
+            last_triggered_step: None,
+            last_synced_step: None,
         });
 
         debug!("Prepared audio source: {} (duration: {:.1}s)", source_id, duration);
         Ok(())
     }
 
-    /// Prepare an audio source with time-stretching to match flight duration
-    pub fn prepare_source_stretched(
+    /// Prepare a generated source so its note/drum trigger rate matches
+    /// the flight point rate directly.
+    pub fn prepare_source_synced_to_points(
         &mut self,
         source_id: &str,
         source_type: SourceType,
-        target_duration_secs: f32,
+        points_per_second: f32,
     ) -> anyhow::Result<()> {
-        // Remove existing source if any
+        if points_per_second <= 0.0 {
+            anyhow::bail!("points_per_second must be > 0 for synced generated audio");
+        }
+
         self.remove_source(source_id);
 
-        let (sink, duration, synth_rate) = match &source_type {
-            SourceType::AudioFile { path } => {
-                // Load and time-stretch the audio
-                info!("Loading and time-stretching {:?} to {:.1}s", path, target_duration_secs);
-                let (samples, sample_rate, channels) = load_and_stretch(path, target_duration_secs)?;
-
-                // Create a sink with the stretched audio
-                let sink = Sink::try_new(&self.stream_handle)?;
-                let source = StretchedSource::new(samples, sample_rate, channels);
-                let duration = source.duration().as_secs_f32();
-                sink.append(source);
-                sink.pause(); // Start paused
-
-                (Some(sink), duration, None)
-            }
+        let (duration, synth_rate) = match &source_type {
             SourceType::Synthesized { base_digits } => {
-                // For synthesized, calculate playback rate based on target duration
-                let synth_rate = base_digits.len() as f32 / target_duration_secs;
-                info!("Synth rate for flight sync: {:.1} notes/sec (target {:.1}s for {} digits)",
-                    synth_rate, target_duration_secs, base_digits.len());
-                (None, target_duration_secs, Some(synth_rate))
+                let duration = base_digits.len() as f32 / points_per_second;
+                info!(
+                    "Generated synth synced to flight: {:.3} notes/sec for {} digits (duration: {:.1}s)",
+                    points_per_second,
+                    base_digits.len(),
+                    duration
+                );
+                (duration, points_per_second)
             }
             SourceType::MidiNotes { notes } => {
-                // For MIDI notes, calculate playback rate based on target duration
-                let synth_rate = notes.len() as f32 / target_duration_secs;
-                info!("MIDI synth rate for flight sync: {:.1} notes/sec (target {:.1}s for {} notes)",
-                    synth_rate, target_duration_secs, notes.len());
-                (None, target_duration_secs, Some(synth_rate))
+                let duration = notes.len() as f32 / points_per_second;
+                info!(
+                    "Generated MIDI synced to flight: {:.3} notes/sec for {} notes (duration: {:.1}s)",
+                    points_per_second,
+                    notes.len(),
+                    duration
+                );
+                (duration, points_per_second)
+            }
+            SourceType::AudioFile { .. } => {
+                anyhow::bail!("prepare_source_synced_to_points does not support audio files");
             }
         };
 
         self.sources.insert(source_id.to_string(), AudioSource {
             source_id: source_id.to_string(),
             source_type,
-            sink,
+            sink: None,
+            active_hit_sinks: Vec::new(),
             duration_secs: duration,
             volume: 1.0,
-            last_seek_progress: 0.0,
-            synth_rate,
+            synth_rate: Some(synth_rate),
+            last_triggered_step: None,
+            last_synced_step: None,
         });
 
-        info!("Prepared time-stretched audio source: {} (duration: {:.1}s)", source_id, duration);
+        info!(
+            "Prepared generated audio source synced to points: {} ({:.3} Hz)",
+            source_id,
+            synth_rate
+        );
         Ok(())
     }
 
@@ -210,10 +228,12 @@ impl AudioEngine {
             source_id: source_id.to_string(),
             source_type: SourceType::AudioFile { path },
             sink: Some(sink),
+            active_hit_sinks: Vec::new(),
             duration_secs: duration,
             volume: 1.0,
-            last_seek_progress: 0.0,
             synth_rate: None,
+            last_triggered_step: None,
+            last_synced_step: None,
         });
 
         info!(
@@ -226,8 +246,11 @@ impl AudioEngine {
 
     /// Remove an audio source
     pub fn remove_source(&mut self, source_id: &str) {
-        if let Some(source) = self.sources.remove(source_id) {
-            if let Some(sink) = source.sink {
+        if let Some(mut source) = self.sources.remove(source_id) {
+            if let Some(sink) = source.sink.take() {
+                sink.stop();
+            }
+            for sink in source.active_hit_sinks.drain(..) {
                 sink.stop();
             }
             debug!("Removed audio source: {}", source_id);
@@ -238,11 +261,26 @@ impl AudioEngine {
     pub fn play(&mut self, settings: &AudioSettings) {
         info!("AudioEngine::play() called with {} sources", self.sources.len());
         for source in self.sources.values_mut() {
+            for sink in &source.active_hit_sinks {
+                sink.set_volume(settings.master_volume * source.volume);
+                sink.play();
+            }
+
             if let Some(ref sink) = source.sink {
                 info!("Playing audio source: {} (volume: {:.2})", source.source_id, settings.master_volume * source.volume);
                 sink.set_volume(settings.master_volume * source.volume);
                 sink.play();
             } else {
+                if settings.sync_to_flight
+                    && settings.synthesis_method == SynthMethod::Percussion
+                    && matches!(source.source_type, SourceType::MidiNotes { .. })
+                    && source.synth_rate.is_some()
+                {
+                    source.last_triggered_step = None;
+                    source.last_synced_step = None;
+                    continue;
+                }
+
                 // Create synthesis sink based on source type and synth_rate
                 let sink_result = match (&source.source_type, source.synth_rate) {
                     (SourceType::Synthesized { base_digits }, Some(rate)) => {
@@ -301,6 +339,9 @@ impl AudioEngine {
     pub fn pause(&self) {
         info!("AudioEngine::pause() called");
         for source in self.sources.values() {
+            for sink in &source.active_hit_sinks {
+                sink.pause();
+            }
             if let Some(ref sink) = source.sink {
                 info!("Pausing audio source: {}", source.source_id);
                 sink.pause();
@@ -315,108 +356,140 @@ impl AudioEngine {
             if let Some(sink) = source.sink.take() {
                 sink.stop();
             }
+            for sink in source.active_hit_sinks.drain(..) {
+                sink.stop();
+            }
+            source.last_triggered_step = None;
+            source.last_synced_step = None;
         }
         self.stop_flag.store(false, Ordering::SeqCst);
     }
 
-    /// Sync playback position to flight progress (0.0-1.0)
-    /// Only seeks when there's significant drift to avoid corrupting audio decoding
-    pub fn sync_to_progress(&mut self, progress: f32, settings: &AudioSettings) {
-        // Threshold: only seek if drift is more than 2 seconds worth of progress
-        const SEEK_THRESHOLD: f32 = 0.05; // 5% of total duration
+    /// Sync playback to the current flight step.
+    pub fn sync_to_step(&mut self, flight_step: usize, total_steps: usize, settings: &AudioSettings) {
+        self.debug_sync_calls_in_window += 1;
 
         for source in self.sources.values_mut() {
-            if let Some(ref sink) = source.sink {
-                // Only update volume, don't constantly seek
+            source.active_hit_sinks.retain(|sink| !sink.empty());
+            for sink in &source.active_hit_sinks {
                 sink.set_volume(settings.master_volume * source.volume);
+            }
 
-                // Check if we need to seek (large drift or initial sync)
-                let drift = (progress - source.last_seek_progress).abs();
-                if drift > SEEK_THRESHOLD {
+            if settings.sync_to_flight
+                && settings.synthesis_method == SynthMethod::Percussion
+                && source.synth_rate.is_some()
+            {
+                if let SourceType::MidiNotes { notes } = &source.source_type {
+                    if notes.is_empty() {
+                        source.last_synced_step = Some(flight_step);
+                        continue;
+                    }
+
+                    let target_step = flight_step.min(notes.len().saturating_sub(1));
+
+                    match source.last_triggered_step {
+                        None => {
+                            if let Ok(sink) = synthesis::create_one_shot_midi_sink(
+                                &self.stream_handle,
+                                notes[target_step],
+                                settings.synthesis_method,
+                                self.stop_flag.clone(),
+                            ) {
+                                sink.set_volume(settings.master_volume * source.volume);
+                                sink.play();
+                                source.active_hit_sinks.push(sink);
+                                self.debug_triggered_hits_in_window += 1;
+                            }
+                        }
+                        Some(last_step) if target_step > last_step => {
+                            for step in (last_step + 1)..=target_step {
+                                if let Ok(sink) = synthesis::create_one_shot_midi_sink(
+                                    &self.stream_handle,
+                                    notes[step],
+                                    settings.synthesis_method,
+                                    self.stop_flag.clone(),
+                                ) {
+                                    sink.set_volume(settings.master_volume * source.volume);
+                                    sink.play();
+                                    source.active_hit_sinks.push(sink);
+                                    self.debug_triggered_hits_in_window += 1;
+                                }
+                            }
+                        }
+                        Some(last_step) if target_step < last_step => {
+                            for step in (target_step..last_step).rev() {
+                                if let Ok(sink) = synthesis::create_one_shot_midi_sink(
+                                    &self.stream_handle,
+                                    notes[step],
+                                    settings.synthesis_method,
+                                    self.stop_flag.clone(),
+                                ) {
+                                    sink.set_volume(settings.master_volume * source.volume);
+                                    sink.play();
+                                    source.active_hit_sinks.push(sink);
+                                    self.debug_triggered_hits_in_window += 1;
+                                }
+                            }
+                        }
+                        Some(_) => {}
+                    }
+
+                    source.last_triggered_step = Some(target_step);
+                    source.last_synced_step = Some(flight_step);
+                    continue;
+                }
+            }
+
+            if let Some(ref sink) = source.sink {
+                sink.set_volume(settings.master_volume * source.volume);
+                let should_seek = match source.last_synced_step {
+                    None => true,
+                    Some(last_step) => last_step.abs_diff(flight_step) > 1,
+                };
+
+                if should_seek {
+                    let denom = total_steps.saturating_sub(1).max(1) as f32;
                     let target_position = std::time::Duration::from_secs_f32(
-                        progress * source.duration_secs
+                        (flight_step.min(total_steps.saturating_sub(1)) as f32 / denom) * source.duration_secs
                     );
-                    info!(
-                        "Seeking {}: drift={:.1}%, target={:.2}s",
-                        source.source_id, drift * 100.0, target_position.as_secs_f32()
-                    );
-                    let _ = sink.try_seek(target_position);
-                    source.last_seek_progress = progress;
-                }
-            }
-        }
-    }
-
-    /// Update volumes based on mixing mode and camera position
-    pub fn update_mixing(
-        &mut self,
-        settings: &AudioSettings,
-        camera_pos: [f32; 3],
-        walk_positions: &HashMap<String, [f32; 3]>,
-    ) {
-        match settings.mixing_mode {
-            MixingMode::Simultaneous => {
-                // All sources at equal volume
-                let num_sources = self.sources.len().max(1) as f32;
-                let per_source_volume = 1.0 / num_sources.sqrt();
-                for source in self.sources.values_mut() {
-                    source.volume = per_source_volume;
-                }
-            }
-            MixingMode::CameraFocus => {
-                // Find closest source, make it loudest
-                let mut closest_id = None;
-                let mut closest_dist = f32::MAX;
-
-                for (id, pos) in walk_positions {
-                    let dx = pos[0] - camera_pos[0];
-                    let dy = pos[1] - camera_pos[1];
-                    let dz = pos[2] - camera_pos[2];
-                    let dist = (dx * dx + dy * dy + dz * dz).sqrt();
-                    if dist < closest_dist {
-                        closest_dist = dist;
-                        closest_id = Some(id.clone());
+                    match sink.try_seek(target_position) {
+                        Ok(()) => {
+                            source.last_synced_step = Some(flight_step);
+                            self.debug_seek_events_in_window += 1;
+                        }
+                        Err(error) => {
+                            warn!(
+                                "Seek failed for {} at step {} ({:.2}s): {}",
+                                source.source_id,
+                                flight_step,
+                                target_position.as_secs_f32(),
+                                error
+                            );
+                        }
                     }
-                }
-
-                for source in self.sources.values_mut() {
-                    source.volume = if Some(&source.source_id) == closest_id.as_ref() {
-                        1.0
-                    } else {
-                        0.2 // Background volume for non-focused
-                    };
-                }
-            }
-            MixingMode::DistanceBased => {
-                // Volume inversely proportional to distance
-                for source in self.sources.values_mut() {
-                    if let Some(pos) = walk_positions.get(&source.source_id) {
-                        let dx = pos[0] - camera_pos[0];
-                        let dy = pos[1] - camera_pos[1];
-                        let dz = pos[2] - camera_pos[2];
-                        let dist = (dx * dx + dy * dy + dz * dz).sqrt().max(1.0);
-                        source.volume = (50.0 / dist).min(1.0);
-                    }
+                } else {
+                    source.last_synced_step = Some(flight_step);
                 }
             }
         }
 
-        // Apply updated volumes
-        for source in self.sources.values() {
-            if let Some(ref sink) = source.sink {
-                sink.set_volume(settings.master_volume * source.volume);
-            }
+        let window_elapsed = self.debug_window_started_at.elapsed().as_secs_f32();
+        if window_elapsed >= 1.0 {
+            debug!(
+                "[AUDIO][SYNC] elapsed={:.2}s step={} total_steps={} sync_calls={} seek_events={} drum_hits={} hits_per_sec={:.2}",
+                window_elapsed,
+                flight_step,
+                total_steps,
+                self.debug_sync_calls_in_window,
+                self.debug_seek_events_in_window,
+                self.debug_triggered_hits_in_window,
+                self.debug_triggered_hits_in_window as f32 / window_elapsed,
+            );
+            self.debug_window_started_at = Instant::now();
+            self.debug_triggered_hits_in_window = 0;
+            self.debug_sync_calls_in_window = 0;
+            self.debug_seek_events_in_window = 0;
         }
-    }
-
-    /// Check if any sources are loaded
-    pub fn has_sources(&self) -> bool {
-        !self.sources.is_empty()
-    }
-
-    /// Get source duration for a given source ID
-    pub fn get_duration(&self, source_id: &str) -> Option<f32> {
-        self.sources.get(source_id).map(|s| s.duration_secs)
     }
 
     /// Recreate synthesized audio sinks with a new synth method

@@ -106,6 +106,7 @@ pub fn logistic_map(r: f64, x0: f64, length: usize) -> Vec<u8> {
 
 /// Collatz sequence (3n+1 problem)
 /// Maps each value mod 12
+#[cfg(test)]
 pub fn collatz_sequence(start: u64, length: usize) -> Vec<u8> {
     if length == 0 {
         return vec![];
@@ -130,6 +131,7 @@ pub fn collatz_sequence(start: u64, length: usize) -> Vec<u8> {
 
 /// Recaman sequence
 /// a(n) = a(n-1) - n if positive and not already in sequence, else a(n-1) + n
+#[cfg(test)]
 pub fn recaman_sequence(length: usize) -> Vec<u8> {
     if length == 0 {
         return vec![];
@@ -157,34 +159,6 @@ pub fn recaman_sequence(length: usize) -> Vec<u8> {
     seq.into_iter()
         .map(|v| (v.unsigned_abs() % 12) as u8)
         .collect()
-}
-
-/// Look-and-say sequence (Conway)
-/// 1, 11, 21, 1211, 111221, ...
-pub fn look_and_say(iterations: u32) -> Vec<u8> {
-    let mut s = vec![1u8];
-
-    for _ in 0..iterations {
-        let mut next = Vec::with_capacity(s.len() * 2);
-        let mut i = 0;
-
-        while i < s.len() {
-            let digit = s[i];
-            let mut count = 1u8;
-
-            while i + (count as usize) < s.len() && s[i + count as usize] == digit {
-                count += 1;
-            }
-
-            next.push(count % 12);
-            next.push(digit % 12);
-            i += count as usize;
-        }
-
-        s = next;
-    }
-
-    s
 }
 
 #[cfg(test)]

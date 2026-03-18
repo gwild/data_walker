@@ -73,42 +73,6 @@ pub fn julia_orbit(c_re: f64, c_im: f64, z0_re: f64, z0_im: f64, max_iter: usize
     orbit
 }
 
-/// Predefined interesting Mandelbrot points
-pub struct MandelbrotPoint {
-    pub name: &'static str,
-    pub c_re: f64,
-    pub c_im: f64,
-}
-
-pub const MANDELBROT_POINTS: &[MandelbrotPoint] = &[
-    MandelbrotPoint { name: "cardioid", c_re: -0.75, c_im: 0.01 },
-    MandelbrotPoint { name: "spiral", c_re: -0.7463, c_im: 0.1102 },
-    MandelbrotPoint { name: "seahorse", c_re: -0.75, c_im: 0.1 },
-    MandelbrotPoint { name: "antenna", c_re: -1.768, c_im: 0.001 },
-    MandelbrotPoint { name: "period3", c_re: -0.1225, c_im: 0.7449 },
-    MandelbrotPoint { name: "elephant", c_re: 0.275, c_im: 0.0 },
-    MandelbrotPoint { name: "double_spiral", c_re: -0.925, c_im: 0.266 },
-    MandelbrotPoint { name: "triple_spiral", c_re: -0.1011, c_im: 0.9563 },
-];
-
-/// Predefined interesting Julia set parameters
-pub struct JuliaPoint {
-    pub name: &'static str,
-    pub c_re: f64,
-    pub c_im: f64,
-    pub z0_re: f64,
-    pub z0_im: f64,
-}
-
-pub const JULIA_POINTS: &[JuliaPoint] = &[
-    JuliaPoint { name: "rabbit", c_re: -0.123, c_im: 0.745, z0_re: 0.1, z0_im: 0.1 },
-    JuliaPoint { name: "dendrite", c_re: 0.0, c_im: 1.0, z0_re: 0.01, z0_im: 0.01 },
-    JuliaPoint { name: "dragon", c_re: -0.8, c_im: 0.156, z0_re: 0.1, z0_im: 0.0 },
-    JuliaPoint { name: "spiral_julia", c_re: -0.4, c_im: 0.6, z0_re: 0.0, z0_im: 0.1 },
-    JuliaPoint { name: "siegel", c_re: -0.391, c_im: -0.587, z0_re: 0.1, z0_im: 0.1 },
-    JuliaPoint { name: "san_marco", c_re: -0.75, c_im: 0.0, z0_re: 0.1, z0_im: 0.1 },
-];
-
 #[cfg(test)]
 mod tests {
     use super::*;

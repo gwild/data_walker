@@ -218,7 +218,7 @@ fn find_best_match(
     nominal_pos: usize,
     search_range: usize,
     frame_size: usize,
-    channels: usize,
+    _channels: usize,
 ) -> usize {
     let mut best_pos = nominal_pos;
     let mut best_score = f32::MIN;

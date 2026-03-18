@@ -205,6 +205,7 @@ pub fn walk_base6(base6: &[u8], mapping: &[u8; 6], max_points: usize) -> Vec<[f3
 }
 
 /// Get mapping by name
+#[cfg(test)]
 pub fn named_mapping(name: &str) -> [u8; 12] {
     match name {
         "Identity" => [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],

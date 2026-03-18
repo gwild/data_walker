@@ -380,7 +380,7 @@ fn load_walk_for_thumbnail(
                 if !path.exists() {
                     return None;
                 }
-                let (points, _) = converters::load_pdb_structure(&path).ok()?;
+                let (points, _, _) = converters::load_pdb_structure(&path).ok()?;
 
                 let n = points.len() as f32;
                 if n == 0.0 {

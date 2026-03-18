@@ -72,6 +72,19 @@ All data is downloaded from real, documented sources:
 
 ## How It Works
 
+### Flight and Audio Rules
+- Flight position is the control value for traversal. Automation and GUI state use point position, not percentage.
+- Flight speed in Hz is the timing source of truth for flight playback and synced generated audio.
+- Flight/audio sync is enforced through `data_walker_rs/src/rules.rs`.
+- The Rust crate denies `dead_code`, `unused_imports`, and `unused_variables` at compile time.
+
+### Verification
+From `data_walker_rs/`:
+```bash
+cargo check
+cargo check --all-targets
+```
+
 ### Base-12 Conversion
 Each data source is converted to values 0-11:
 - **Audio**: Dominant frequency bins from FFT spectrogram

@@ -39,9 +39,7 @@ pub struct Source {
 /// Secrets loaded from .env
 #[derive(Debug, Clone, Default)]
 pub struct Secrets {
-    pub yahoo_api_key: Option<String>,
     pub data_dir: String,
-    pub port: u16,
 }
 
 impl Config {
@@ -96,15 +94,6 @@ impl Config {
         Ok(arr)
     }
 
-    /// Get source by ID
-    pub fn get_source(&self, id: &str) -> Option<&Source> {
-        self.sources.iter().find(|s| s.id == id)
-    }
-
-    /// Get all sources in a category
-    pub fn sources_by_category(&self, category: &str) -> Vec<&Source> {
-        self.sources.iter().filter(|s| s.category == category).collect()
-    }
 }
 
 impl DataPaths {
@@ -173,12 +162,7 @@ impl Secrets {
         dotenvy::dotenv().ok();
 
         Secrets {
-            yahoo_api_key: std::env::var("YAHOO_API_KEY").ok(),
             data_dir: std::env::var("DATA_DIR").unwrap_or_else(|_| "./data".to_string()),
-            port: std::env::var("PORT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(8080),
         }
     }
 }

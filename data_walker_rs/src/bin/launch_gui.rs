@@ -17,6 +17,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     terminate_existing_gui_instances(&gui_exe_path)?;
     build_gui_binary(crate_dir, profile_name)?;
+    run_pre_spawn_hook(&gui_exe_path)?;
     spawn_gui(&gui_exe_path)?;
 
     Ok(())
@@ -48,12 +49,16 @@ fn executable_name(base: &str) -> String {
     }
 }
 
+fn run_pre_spawn_hook(gui_exe_path: &Path) -> Result<(), Box<dyn Error>> {
+    terminate_existing_gui_instances(gui_exe_path)
+}
+
 fn terminate_existing_gui_instances(gui_exe_path: &Path) -> Result<(), Box<dyn Error>> {
     let mut system = System::new_all();
     system.refresh_all();
 
     for process in system.processes().values() {
-        if process.exe() == Some(gui_exe_path) {
+        if is_matching_gui_process(process, gui_exe_path) {
             process
                 .kill_and_wait()
                 .map_err(|error| format!("Failed to stop existing GUI process: {error:?}"))?;
@@ -61,6 +66,24 @@ fn terminate_existing_gui_instances(gui_exe_path: &Path) -> Result<(), Box<dyn E
     }
 
     Ok(())
+}
+
+fn is_matching_gui_process(process: &sysinfo::Process, gui_exe_path: &Path) -> bool {
+    if process.exe() == Some(gui_exe_path) {
+        return true;
+    }
+
+    match (process.exe(), gui_exe_path.file_name()) {
+        (Some(process_path), Some(gui_file_name)) => process_path
+            .file_name()
+            .map(|process_file_name| {
+                process_file_name
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&gui_file_name.to_string_lossy())
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
 }
 
 fn build_gui_binary(crate_dir: &Path, profile_name: &str) -> Result<(), Box<dyn Error>> {

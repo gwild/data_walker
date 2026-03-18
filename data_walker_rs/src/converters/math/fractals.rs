@@ -101,26 +101,6 @@ pub fn peano_curve(iterations: u32) -> Vec<u8> {
     lsystem_to_base12(&s, 90)
 }
 
-/// Gosper Curve (Flowsnake)
-/// Axiom: A, Rules: A → A-B--B+A++AA+B-, B → +A-BB--B-A++A+B
-pub fn gosper_curve(iterations: u32) -> Vec<u8> {
-    let mut s = String::from("A");
-
-    for _ in 0..iterations {
-        let mut next = String::with_capacity(s.len() * 8);
-        for c in s.chars() {
-            match c {
-                'A' => next.push_str("A-B--B+A++AA+B-"),
-                'B' => next.push_str("+A-BB--B-A++A+B"),
-                _ => next.push(c),
-            }
-        }
-        s = next;
-    }
-
-    lsystem_to_base12(&s, 60)
-}
-
 /// Convert L-system string to base-12 walk sequence
 fn lsystem_to_base12(s: &str, angle_degrees: u32) -> Vec<u8> {
     // How many 15° rotations per turn

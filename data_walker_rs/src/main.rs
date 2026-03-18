@@ -1,3 +1,7 @@
+#![deny(dead_code)]
+#![deny(unused_imports)]
+#![deny(unused_variables)]
+
 //! Data Walker - Rust Implementation
 //!
 //! CLI commands:
@@ -14,6 +18,7 @@ mod converters;
 mod download;
 mod gui;
 mod logging;
+mod rules;
 mod thumbnail;
 mod walk;
 

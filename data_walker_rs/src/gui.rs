@@ -14,6 +14,10 @@ use crate::walk::walk_base12;
 use crate::converters::math::MathGenerator;
 use crate::audio::{AudioEngine, AudioSettings, MixingMode, SynthMethod, SourceType};
 use crate::automation::{AutomationConfig, AutoCommand, GuiState, GuiEvent, WalkInfo};
+use crate::rules::{
+    enforce_zero_tolerance_rule_hook,
+    validate_zero_tolerance_rules,
+};
 
 /// SpaceMouse axis configuration
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -83,6 +87,8 @@ struct WalkData {
     point_positions: std::collections::HashMap<(i64, i64, i64), [f32; 3]>,
     // Optional per-point colors (for PDB structure coloring by residue)
     point_colors: Option<Vec<[f32; 3]>>,
+    // Chain break indices - don't draw bonds between point[i - 1] and point[i].
+    chain_breaks: Option<Vec<usize>>,
 }
 
 struct PendingWalkLoad {
@@ -145,7 +151,7 @@ fn build_point_visit_maps(
 
 /// Catmull-Rom spline interpolation along a walk's points
 /// Creates smooth curves that pass through all control points
-fn interpolate_walk_position(points: &[[f32; 3]], t: f32) -> Vec3 {
+fn interpolate_walk_position(points: &[[f32; 3]], position: f32) -> Vec3 {
     if points.is_empty() {
         return vec3(0.0, 0.0, 0.0);
     }
@@ -153,15 +159,15 @@ fn interpolate_walk_position(points: &[[f32; 3]], t: f32) -> Vec3 {
         return vec3(points[0][0], points[0][1], points[0][2]);
     }
     if points.len() == 2 {
-        // Fall back to linear for just 2 points
+        // Linear interpolation for a single segment
         let p0 = vec3(points[0][0], points[0][1], points[0][2]);
         let p1 = vec3(points[1][0], points[1][1], points[1][2]);
+        let t = position.clamp(0.0, 1.0);
         return p0 * (1.0 - t) + p1 * t;
     }
 
-    // t is 0.0-1.0, map to segment index space
     let num_segments = points.len() - 1;
-    let exact_idx = t * num_segments as f32;
+    let exact_idx = position.clamp(0.0, num_segments as f32);
     let segment = (exact_idx.floor() as usize).min(num_segments - 1);
     let local_t = exact_idx - segment as f32;
 
@@ -193,12 +199,12 @@ fn interpolate_walk_position(points: &[[f32; 3]], t: f32) -> Vec3 {
     result
 }
 
-/// Calculate average position along all selected walks at a given progress (0.0-1.0)
+/// Calculate average position along all selected walks at a given point position
 /// Returns (current_pos, look_ahead_pos) for direction calculation, or None if no walks
 fn calculate_average_path_position(
     walks: &BTreeMap<String, WalkData>,
     selected_ids: &std::collections::HashSet<String>,
-    progress: f32,
+    flight_position: f32,
 ) -> Option<(Vec3, Vec3)> {
     let selected_walks: Vec<_> = walks.iter()
         .filter(|(id, w)| selected_ids.contains(*id) && w.visible && !w.points.is_empty())
@@ -208,20 +214,104 @@ fn calculate_average_path_position(
         return None;
     }
 
-    // Smoothly interpolate current position and a look-ahead position
-    let look_ahead = (progress + 0.01).min(1.0);
-
     let mut current_sum = vec3(0.0, 0.0, 0.0);
-    let mut ahead_sum = vec3(0.0, 0.0, 0.0);
     let mut count = 0.0;
 
     for (_, walk) in &selected_walks {
-        current_sum += interpolate_walk_position(&walk.points, progress);
-        ahead_sum += interpolate_walk_position(&walk.points, look_ahead);
+        current_sum += interpolate_walk_position(&walk.points, flight_position);
         count += 1.0;
     }
 
-    Some((current_sum / count, ahead_sum / count))
+    let current_pos = current_sum / count;
+
+    // Some walks begin with repeated positions or pure rotations, so a tiny
+    // look-ahead can produce no movement vector. Search forward until we find
+    // a usable direction for the flight camera.
+    for look_ahead_delta in [1.0_f32, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0] {
+        let look_ahead = flight_position + look_ahead_delta;
+        let mut ahead_sum = vec3(0.0, 0.0, 0.0);
+
+        for (_, walk) in &selected_walks {
+            ahead_sum += interpolate_walk_position(&walk.points, look_ahead);
+        }
+
+        let ahead_pos = ahead_sum / count;
+        if (ahead_pos - current_pos).magnitude() > 0.001 {
+            return Some((current_pos, ahead_pos));
+        }
+    }
+
+    Some((current_pos, current_pos))
+}
+
+fn max_selected_flight_len(
+    walks: &BTreeMap<String, WalkData>,
+    selected_ids: &std::collections::HashSet<String>,
+) -> usize {
+    walks
+        .iter()
+        .filter(|(id, walk)| selected_ids.contains(*id) && walk.visible && !walk.points.is_empty())
+        .map(|(_, walk)| walk.points.len())
+        .max()
+        .unwrap_or(0)
+}
+
+fn flight_step_from_position(flight_position: f32, total_points: usize) -> usize {
+    if total_points <= 1 {
+        0
+    } else {
+        flight_position
+            .floor()
+            .clamp(0.0, total_points.saturating_sub(1) as f32) as usize
+    }
+}
+
+fn flight_duration_from_speed_hz(walk_len: usize, flight_speed: f32) -> anyhow::Result<f32> {
+    if walk_len == 0 {
+        anyhow::bail!("Zero tolerance: cannot sync audio with zero walk points");
+    }
+    if flight_speed <= 0.0 {
+        anyhow::bail!("Zero tolerance: flight_speed must be > 0");
+    }
+    Ok(walk_len as f32 / flight_speed)
+}
+
+fn format_vec3_debug(v: Vec3) -> String {
+    format!("[{:.2}, {:.2}, {:.2}]", v.x, v.y, v.z)
+}
+
+fn summarize_selected_walks(
+    walks: &BTreeMap<String, WalkData>,
+    selected_ids: &std::collections::HashSet<String>,
+) -> String {
+    let mut parts = Vec::new();
+
+    for (id, walk) in walks.iter().filter(|(id, _)| selected_ids.contains(*id)) {
+        let first = walk
+            .points
+            .first()
+            .map(|p| format!("[{:.2}, {:.2}, {:.2}]", p[0], p[1], p[2]))
+            .unwrap_or_else(|| "[]".to_string());
+        let last = walk
+            .points
+            .last()
+            .map(|p| format!("[{:.2}, {:.2}, {:.2}]", p[0], p[1], p[2]))
+            .unwrap_or_else(|| "[]".to_string());
+        parts.push(format!(
+            "{}: visible={} points={} first={} last={}",
+            id,
+            walk.visible,
+            walk.points.len(),
+            first,
+            last
+        ));
+    }
+
+    if parts.is_empty() {
+        "<none>".to_string()
+    } else {
+        parts.join(" | ")
+    }
 }
 
 fn update_shared_gui_state(
@@ -230,7 +320,7 @@ fn update_shared_gui_state(
     selected_sources: &std::collections::HashSet<String>,
     flight_mode: bool,
     flight_playing: bool,
-    flight_progress: f32,
+    flight_position: f32,
     flight_speed: f32,
     selected_base: u32,
     selected_mapping: &str,
@@ -260,7 +350,7 @@ fn update_shared_gui_state(
         loaded_walks,
         flight_mode,
         flight_playing,
-        flight_progress,
+        flight_position,
         flight_speed,
         selected_base,
         selected_mapping: selected_mapping.to_string(),
@@ -358,7 +448,7 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
     let mut flight_speed: f32 = 10.0;        // Points per second (Hz)
     let mut flight_reverse = false;          // Go backwards
     let mut flight_look_back = false;        // Look behind instead of ahead
-    let mut flight_progress: f32 = 0.0;      // 0.0 to 1.0 along path
+    let mut flight_position: f32 = 0.0;      // Point position along path
     let mut last_frame_time: f64 = 0.0;      // For delta time calculation
     let mut flight_loop = false;             // Enable looping
     let mut flight_loop_mode: u8 = 0;        // 0 = Repeat, 1 = Fwd/Rev (ping-pong)
@@ -366,6 +456,11 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
     let mut fullscreen_plot = false;          // ESC toggles panels off for pure plot
     let mut smooth_cam_pos: Option<Vec3> = None;   // Smoothed camera position
     let mut smooth_cam_target: Option<Vec3> = None; // Smoothed look target
+    let mut last_flight_debug_state = String::new();
+    let mut flight_debug_window_elapsed_secs: f32 = 0.0;
+    let mut flight_debug_frames_in_window: usize = 0;
+    let mut flight_debug_crossed_points_in_window: usize = 0;
+    let mut flight_debug_position_delta_in_window: f32 = 0.0;
 
     // Audio playback state
     let audio_engine_result = AudioEngine::new();
@@ -526,8 +621,10 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                     AutoCommand::SetFlightPlaying { playing } => {
                         flight_playing = playing;
                     }
-                    AutoCommand::SetFlightProgress { progress } => {
-                        flight_progress = progress.clamp(0.0, 1.0);
+                    AutoCommand::SetFlightPosition { position } => {
+                        let max_step = max_selected_flight_len(&walks, &selected_sources)
+                            .saturating_sub(1) as f32;
+                        flight_position = position.clamp(0.0, max_step);
                     }
                     AutoCommand::SetFlightSpeed { speed } => {
                         flight_speed = speed.clamp(0.01, 60.0);
@@ -597,6 +694,20 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                         }
                     }
                     walks.insert(result.source.id.clone(), walk_data);
+                    if flight_mode {
+                        smooth_cam_pos = None;
+                        smooth_cam_target = None;
+                        if !flight_playing {
+                            flight_position = 0.0;
+                        }
+                        debug!(
+                            "[GUI][FLIGHT] Walk loaded while flight enabled: position={:.3}, playing={}, selected={}, walks={}",
+                            flight_position,
+                            flight_playing,
+                            selected_sources.len(),
+                            summarize_selected_walks(&walks, &selected_sources)
+                        );
+                    }
                 }
                 None => {
                     warn!("[GUI] load_walk_data returned None for {}", result.source.id);
@@ -655,13 +766,23 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
             screenshot_requested = true;
         }
 
+        enforce_zero_tolerance_rule_hook(&mut audio_settings, flight_mode);
+
+        let selected_flight_len = max_selected_flight_len(&walks, &selected_sources);
+        let max_flight_step = selected_flight_len.saturating_sub(1) as f32;
+        if selected_flight_len <= 1 {
+            flight_position = 0.0;
+        } else {
+            flight_position = flight_position.clamp(0.0, max_flight_step);
+        }
+
         update_shared_gui_state(
             &shared_state,
             &walks,
             &selected_sources,
             flight_mode,
             flight_playing,
-            flight_progress,
+            flight_position,
             flight_speed,
             selected_base,
             &selected_mapping,
@@ -728,8 +849,10 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                             flight_speed = (flight_speed + sign * step).clamp(0.01, 60.0);
                         }
                         FocusedSlider::FlightProgress => {
-                            let step = if modifiers.shift { 0.001 } else { 0.01 };
-                            flight_progress = (flight_progress + sign * step).clamp(0.0, 1.0);
+                            let step = if modifiers.shift { 0.1 } else { 1.0 };
+                            let max_step = max_selected_flight_len(&walks, &selected_sources)
+                                .saturating_sub(1) as f32;
+                            flight_position = (flight_position + sign * step).clamp(0.0, max_step);
                         }
                         FocusedSlider::None => {}
                     }
@@ -837,7 +960,7 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
         if flight_mode {
             // Calculate delta time
             let delta = if last_frame_time > 0.0 {
-                (frame_input.accumulated_time - last_frame_time) as f32
+                ((frame_input.accumulated_time - last_frame_time) as f32 / 1000.0).max(0.0)
             } else {
                 0.0
             };
@@ -845,79 +968,125 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
 
             // Update progress only when playing
             if flight_playing {
-                // Get max walk length from selected walks
-                let max_len = walks.iter()
-                    .filter(|(id, w)| selected_sources.contains(*id) && w.visible && !w.points.is_empty())
-                    .map(|(_, w)| w.points.len())
-                    .max()
-                    .unwrap_or(1000) as f32;
-
-                // flight_speed is in Hz (points per second)
-                // progress_per_second = points_per_second / total_points
-                let progress_per_second = flight_speed / max_len;
-                let progress_delta = progress_per_second * delta;
+                let max_len = max_selected_flight_len(&walks, &selected_sources);
+                let max_step = max_len.saturating_sub(1) as f32;
+                let previous_position = flight_position;
+                let previous_step = flight_step_from_position(flight_position, max_len);
+                let position_delta = flight_speed * delta;
 
                 if flight_reverse {
-                    flight_progress -= progress_delta;
-                    if flight_progress <= 0.0 {
+                    flight_position -= position_delta;
+                    if flight_position <= 0.0 {
                         if flight_loop {
                             if flight_loop_mode == 1 {
                                 // Fwd/Rev: reverse direction
                                 flight_reverse = false;
-                                flight_progress = 0.0;
+                                flight_position = 0.0;
                             } else {
                                 // Repeat: jump to end
-                                flight_progress = 1.0;
+                                flight_position = max_step;
                             }
                         } else {
-                            flight_progress = 0.0;
+                            flight_position = 0.0;
                         }
                     }
                 } else {
-                    flight_progress += progress_delta;
-                    if flight_progress >= 1.0 {
+                    flight_position += position_delta;
+                    if flight_position >= max_step {
                         if flight_loop {
                             if flight_loop_mode == 1 {
                                 // Fwd/Rev: reverse direction
                                 flight_reverse = true;
-                                flight_progress = 1.0;
+                                flight_position = max_step;
                             } else {
                                 // Repeat: jump to start
-                                flight_progress = 0.0;
+                                flight_position = 0.0;
                             }
                         } else {
-                            flight_progress = 1.0;
+                            flight_position = max_step;
                         }
                     }
                 }
 
-                // Sync audio to flight progress
+                let flight_step = flight_step_from_position(flight_position, max_len);
+                let crossed_points = flight_step.abs_diff(previous_step);
+                flight_debug_frames_in_window += 1;
+                flight_debug_crossed_points_in_window += crossed_points;
+                flight_debug_position_delta_in_window += (flight_position - previous_position).abs();
+                flight_debug_window_elapsed_secs += delta;
+
+                // Sync audio to flight step
                 if audio_settings.enabled {
                     if let Some(ref mut engine) = audio_engine {
-                        engine.sync_to_progress(flight_progress, &audio_settings);
+                        engine.sync_to_step(flight_step, max_len, &audio_settings);
                     }
+                }
+
+                if flight_debug_window_elapsed_secs >= 1.0 {
+                    let avg_frame_dt = if flight_debug_frames_in_window > 0 {
+                        flight_debug_window_elapsed_secs / flight_debug_frames_in_window as f32
+                    } else {
+                        0.0
+                    };
+                    debug!(
+                        "[GUI][FLIGHT_RATE] elapsed={:.2}s requested_hz={:.3} actual_points_per_sec={:.3} position_delta_per_sec={:.3} frames={} avg_dt={:.4}s prev_pos={:.3} pos={:.3} prev_step={} step={} crossed_points={} max_len={} reverse={}",
+                        flight_debug_window_elapsed_secs,
+                        flight_speed,
+                        flight_debug_crossed_points_in_window as f32 / flight_debug_window_elapsed_secs,
+                        flight_debug_position_delta_in_window / flight_debug_window_elapsed_secs,
+                        flight_debug_frames_in_window,
+                        avg_frame_dt,
+                        previous_position,
+                        flight_position,
+                        previous_step,
+                        flight_step,
+                        flight_debug_crossed_points_in_window,
+                        max_len,
+                        flight_reverse,
+                    );
+                    flight_debug_window_elapsed_secs = 0.0;
+                    flight_debug_frames_in_window = 0;
+                    flight_debug_crossed_points_in_window = 0;
+                    flight_debug_position_delta_in_window = 0.0;
                 }
             }
 
             // Get average position along path
             if let Some((current_pos, next_pos)) = calculate_average_path_position(
-                &walks, &selected_sources, flight_progress
+                &walks, &selected_sources, flight_position
             ) {
                 // Direction of travel
                 let dir_vec = next_pos - current_pos;
                 let dir_mag = dir_vec.magnitude();
 
                 if dir_mag > 0.001 {
+                    if last_flight_debug_state != "tracking" {
+                        debug!(
+                            "[GUI][FLIGHT] tracking position={:.3} current={} next={} camera_pos={} camera_target={} walks={}",
+                            flight_position,
+                            format_vec3_debug(current_pos),
+                            format_vec3_debug(next_pos),
+                            format_vec3_debug(camera.position()),
+                            format_vec3_debug(camera.target()),
+                            summarize_selected_walks(&walks, &selected_sources)
+                        );
+                        last_flight_debug_state = "tracking".to_string();
+                    }
                     let direction = dir_vec / dir_mag;
 
                     // Camera offset: slightly behind and above the path
-                    let up = vec3(0.0, 1.0, 0.0);
-                    let right_vec = direction.cross(up);
+                    let world_up = vec3(0.0, 1.0, 0.0);
+                    let reference_up = if direction.dot(world_up).abs() > 0.95 {
+                        vec3(0.0, 0.0, 1.0)
+                    } else {
+                        world_up
+                    };
+                    let right_vec = direction.cross(reference_up);
                     let right_mag = right_vec.magnitude();
                     let cam_up = if right_mag > 0.001 {
                         (right_vec / right_mag).cross(direction).normalize()
                     } else {
-                        up
+                        reference_up
                     };
 
                     let offset_distance = 15.0;
@@ -945,9 +1114,41 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                     smooth_cam_pos = Some(cam_pos);
                     smooth_cam_target = Some(cam_target);
 
-                    camera.set_view(cam_pos, cam_target, up);
+                    camera.set_view(cam_pos, cam_target, cam_up);
+                } else {
+                    if last_flight_debug_state != "degenerate_dir" {
+                        debug!(
+                            "[GUI][FLIGHT] degenerate_dir position={:.3} current={} next={} camera_pos={} camera_target={} walks={}",
+                            flight_position,
+                            format_vec3_debug(current_pos),
+                            format_vec3_debug(next_pos),
+                            format_vec3_debug(camera.position()),
+                            format_vec3_debug(camera.target()),
+                            summarize_selected_walks(&walks, &selected_sources)
+                        );
+                        last_flight_debug_state = "degenerate_dir".to_string();
+                    }
+                    smooth_cam_pos = None;
+                    smooth_cam_target = None;
+                    camera.set_view(
+                        current_pos + vec3(0.0, 50.0, 200.0),
+                        current_pos,
+                        vec3(0.0, 1.0, 0.0),
+                    );
                 }
+            } else if last_flight_debug_state != "no_path" {
+                debug!(
+                    "[GUI][FLIGHT] no_path position={:.3} selected={} camera_pos={} camera_target={} walks={}",
+                    flight_position,
+                    selected_sources.len(),
+                    format_vec3_debug(camera.position()),
+                    format_vec3_debug(camera.target()),
+                    summarize_selected_walks(&walks, &selected_sources)
+                );
+                last_flight_debug_state = "no_path".to_string();
             }
+        } else {
+            last_flight_debug_state.clear();
         }
 
         // Track if egui wants pointer input (set after GUI update)
@@ -982,6 +1183,12 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                 let has_per_point = walk.point_colors.is_some();
 
                 for i in 0..walk.points.len() - 1 {
+                    if let Some(ref breaks) = walk.chain_breaks {
+                        if breaks.contains(&(i + 1)) {
+                            continue;
+                        }
+                    }
+
                     let p1 = vec3(walk.points[i][0], walk.points[i][1], walk.points[i][2]);
                     let p2 = vec3(walk.points[i + 1][0], walk.points[i + 1][1], walk.points[i + 1][2]);
 
@@ -1342,6 +1549,10 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                     ui.heading("Data Flight");
                     if ui.checkbox(&mut flight_mode, "Enable Flight").changed() {
                         debug!("[GUI] Checkbox changed: flight_mode = {}", flight_mode);
+                        if flight_mode {
+                            smooth_cam_pos = None;
+                            smooth_cam_target = None;
+                        }
                         // When disabling flight mode, stop playback and audio
                         if !flight_mode {
                             if flight_playing {
@@ -1385,8 +1596,10 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                         });
 
                         ui.horizontal(|ui| {
-                            ui.label("Progress:");
-                            if ui.add(egui::Slider::new(&mut flight_progress, 0.0..=1.0)).clicked() {
+                            let max_step = max_selected_flight_len(&walks, &selected_sources)
+                                .saturating_sub(1) as f32;
+                            ui.label("Position:");
+                            if ui.add(egui::Slider::new(&mut flight_position, 0.0..=max_step).suffix(" pt")).clicked() {
                                 focused_slider = FocusedSlider::FlightProgress;
                             }
                         });
@@ -1432,7 +1645,9 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
 
                         if ui.button("Reset to Start").clicked() {
                             debug!("[GUI] Button clicked: Reset to Start");
-                            flight_progress = if flight_reverse { 1.0 } else { 0.0 };
+                            let max_step = max_selected_flight_len(&walks, &selected_sources)
+                                .saturating_sub(1) as f32;
+                            flight_position = if flight_reverse { max_step } else { 0.0 };
                             flight_playing = false;
                             smooth_cam_pos = None;
                             smooth_cam_target = None;
@@ -1500,8 +1715,15 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                                 debug!("[GUI] Checkbox changed: audio_settings.force_synthesis = {}", audio_settings.force_synthesis);
                             }
 
-                            // Sync checkbox - works for both synthesis and audio files
-                            if ui.checkbox(&mut audio_settings.sync_to_flight, "Sync to Flight")
+                            // Sync checkbox - speed is the enforced SSOT while flight mode is active.
+                            if flight_mode {
+                                let mut enforced_sync = true;
+                                ui.add_enabled(
+                                    false,
+                                    egui::Checkbox::new(&mut enforced_sync, "Sync to Flight"),
+                                )
+                                .on_hover_text("Required while flight mode is active because Speed is SSOT for flight and audio");
+                            } else if ui.checkbox(&mut audio_settings.sync_to_flight, "Sync to Flight")
                                 .on_hover_text(if audio_settings.force_synthesis {
                                     "Sync generated note/drum playback to flight speed (one sound per walk point)"
                                 } else {
@@ -1552,6 +1774,22 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                                         };
                                         if ui.checkbox(&mut checked, label).changed() {
                                             debug!("[GUI] Source checkbox changed: {} -> {}", source.id, checked);
+                                            if flight_mode {
+                                                smooth_cam_pos = None;
+                                                smooth_cam_target = None;
+                                                last_flight_debug_state.clear();
+                                                if !flight_playing {
+                                                    flight_position = 0.0;
+                                                }
+                                                debug!(
+                                                    "[GUI][FLIGHT] Selection changed while flight enabled: source={} checked={} playing={} position={:.3} current_selection={:?}",
+                                                    source.id,
+                                                    checked,
+                                                    flight_playing,
+                                                    flight_position,
+                                                    selected_sources
+                                                );
+                                            }
                                             if checked {
                                                 debug!("[GUI] Selecting source: {}", source.id);
                                                 selected_sources.insert(source.id.clone());
@@ -1911,10 +2149,12 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
             }
         }
 
-        // Re-prepare audio sources if flight_speed or sync_to_flight changed
+        let speed_ssot_sync = flight_mode;
+
+        // Re-prepare audio sources if flight_speed or sync state changed
         let speed_changed = (flight_speed - prev_flight_speed).abs() > 0.001;
         let sync_changed = audio_settings.sync_to_flight != prev_sync_to_flight;
-        if ((speed_changed && audio_settings.sync_to_flight) || sync_changed) && !selected_sources.is_empty() {
+        if ((speed_changed && speed_ssot_sync) || sync_changed) && !selected_sources.is_empty() {
             debug!("[GUI] Flight speed or sync changed: speed {:.2} -> {:.2}, sync {} -> {}",
                 prev_flight_speed, flight_speed, prev_sync_to_flight, audio_settings.sync_to_flight);
             prev_flight_speed = flight_speed;
@@ -2304,7 +2544,21 @@ fn prepare_audio_for_source(
         audio_source_type
     );
 
-    let flight_duration = if walk_len > 0 && flight_speed > 0.0 {
+    if let Err(error) = validate_zero_tolerance_rules(audio_settings, flight_mode) {
+        error!("[GUI] {}", error);
+        return;
+    }
+
+    let speed_is_ssot = flight_mode;
+    let flight_duration = if speed_is_ssot {
+        match flight_duration_from_speed_hz(walk_len, flight_speed) {
+            Ok(duration) => duration,
+            Err(error) => {
+                error!("[GUI] {}", error);
+                return;
+            }
+        }
+    } else if walk_len > 0 && flight_speed > 0.0 {
         walk_len as f32 / flight_speed
     } else {
         30.0
@@ -2312,7 +2566,7 @@ fn prepare_audio_for_source(
 
     pending_audio_preps.remove(&source.id);
 
-    let result = if audio_settings.sync_to_flight {
+    let result = if speed_is_ssot || audio_settings.sync_to_flight {
         if let SourceType::AudioFile { path } = &audio_source_type {
             debug!(
                 "[GUI] Queueing background audio stretch for {} to {:.1}s",
@@ -2330,12 +2584,12 @@ fn prepare_audio_for_source(
             return;
         }
         debug!(
-            "[GUI] Syncing to flight: {:.1}s (walk: {} pts, speed: {:.1} Hz)",
-            flight_duration,
+            "[GUI] Syncing generated audio to point rate: {:.3} Hz (walk: {} pts, duration: {:.1}s)",
+            flight_speed,
             walk_len,
-            flight_speed
+            flight_duration,
         );
-        engine.prepare_source_stretched(&source.id, audio_source_type, flight_duration)
+        engine.prepare_source_synced_to_points(&source.id, audio_source_type, flight_speed)
     } else {
         engine.prepare_source(&source.id, audio_source_type)
     };
@@ -2572,8 +2826,13 @@ fn load_walk_data(
         }
 
         match converters::load_pdb_structure(&path) {
-            Ok((points, residues)) => {
-                info!("Loaded PDB structure {} with {} Cα atoms", source.id, points.len());
+            Ok((points, residues, chain_breaks)) => {
+                info!(
+                    "Loaded PDB structure {} with {} Cα atoms, {} chain breaks",
+                    source.id,
+                    points.len(),
+                    chain_breaks.len()
+                );
 
                 // Center the structure around the origin
                 let n = points.len() as f32;
@@ -2608,6 +2867,7 @@ fn load_walk_data(
                     revisit_counts,
                     point_positions,
                     point_colors: Some(point_colors),
+                    chain_breaks: if chain_breaks.is_empty() { None } else { Some(chain_breaks) },
                 });
             }
             Err(e) => {
@@ -2768,6 +3028,7 @@ fn load_walk_data(
         revisit_counts,
         point_positions,
         point_colors: None,
+        chain_breaks: None,
     })
 }
 

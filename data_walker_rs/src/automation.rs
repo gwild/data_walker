@@ -45,8 +45,8 @@ pub enum AutoCommand {
     SetFlightMode { enabled: bool },
     /// Start/stop flight playback
     SetFlightPlaying { playing: bool },
-    /// Set flight progress (0.0-1.0)
-    SetFlightProgress { progress: f32 },
+    /// Set flight position (point index)
+    SetFlightPosition { position: f32 },
     /// Set flight speed (Hz)
     SetFlightSpeed { speed: f32 },
     /// Change base (4, 6, or 12)
@@ -77,7 +77,7 @@ pub struct GuiState {
     pub loaded_walks: Vec<WalkInfo>,
     pub flight_mode: bool,
     pub flight_playing: bool,
-    pub flight_progress: f32,
+    pub flight_position: f32,
     pub flight_speed: f32,
     pub selected_base: u32,
     pub selected_mapping: String,
@@ -234,12 +234,12 @@ mod tests {
         let state = GuiState {
             selected_sources: vec!["pi".to_string()],
             flight_mode: true,
-            flight_progress: 0.5,
+            flight_position: 42.0,
             ..Default::default()
         };
         let json = serde_json::to_string(&state).unwrap();
         assert!(json.contains("pi"));
-        assert!(json.contains("0.5"));
+        assert!(json.contains("42.0"));
     }
 
     #[test]

@@ -6,6 +6,7 @@
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
 use rodio::{OutputStreamHandle, Sink, Source};
+use rodio::source::SeekError;
 use tracing::debug;
 
 use crate::converters::audio::MidiNote;
@@ -375,6 +376,26 @@ impl Source for MidiSynthSource {
         let total_samples = self.notes.len() * self.samples_per_note as usize;
         Some(Duration::from_secs_f32(total_samples as f32 / SAMPLE_RATE as f32))
     }
+
+    fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
+        if self.notes.is_empty() {
+            self.sample_index = 0;
+            self.phase = 0.0;
+            return Ok(());
+        }
+
+        let total_samples = self.notes.len() * self.samples_per_note as usize;
+        if total_samples == 0 {
+            self.sample_index = 0;
+            self.phase = 0.0;
+            return Ok(());
+        }
+
+        let target_sample = (pos.as_secs_f32() * SAMPLE_RATE as f32) as usize;
+        self.sample_index = target_sample.min(total_samples.saturating_sub(1));
+        self.phase = 0.0;
+        Ok(())
+    }
 }
 
 /// Create a sink with synthesized audio from MIDI notes (note-accurate)
@@ -414,6 +435,52 @@ pub fn create_midi_synth_sink_with_rate(
     debug!("Created synced MIDI synth sink ({:?}) for {} notes at {:.1} notes/sec (duration: {:.1}s)",
         method, notes.len(), notes_per_second, duration);
     Ok(sink)
+}
+
+/// Create a one-shot sink for a single generated note/hit.
+pub fn create_one_shot_midi_sink(
+    stream_handle: &OutputStreamHandle,
+    note: MidiNote,
+    method: SynthMethod,
+    stop_flag: Arc<AtomicBool>,
+) -> anyhow::Result<Sink> {
+    let duration_secs = match method {
+        SynthMethod::Percussion => percussion_hit_duration_secs(note),
+        SynthMethod::ChromaticNotes | SynthMethod::SineTones => 0.12,
+    }
+    .max(0.01);
+
+    let notes_per_second = 1.0 / duration_secs;
+    let source = MidiSynthSource::with_note_rate(vec![note], method, stop_flag, notes_per_second);
+
+    let sink = Sink::try_new(stream_handle)?;
+    sink.append(source);
+    sink.pause();
+
+    debug!(
+        "Created one-shot MIDI sink ({:?}) for note {} lasting {:.3}s",
+        method,
+        note.note,
+        duration_secs
+    );
+    Ok(sink)
+}
+
+fn percussion_hit_duration_secs(note: MidiNote) -> f32 {
+    match note.note % 12 {
+        0 => 0.22,
+        1 => 0.24,
+        2 => 0.18,
+        3 => 0.05,
+        4 => 0.08,
+        5 => 0.28,
+        6 => 0.20,
+        7 => 0.24,
+        8 => 0.24,
+        9 => 0.12,
+        10 => 0.18,
+        _ => 0.65,
+    }
 }
 
 /// Create a sink with synthesized audio from base-12 data (legacy, for visualization)

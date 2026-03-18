@@ -19,9 +19,6 @@ const MIN_PITCH_HZ: f32 = 20.0;
 /// Maximum frequency for pitch detection (above piano range)
 const MAX_PITCH_HZ: f32 = 4200.0;
 
-/// Minimum velocity threshold (below this is considered silence/noise)
-const MIN_VELOCITY_THRESHOLD: f32 = 0.02;
-
 /// A MIDI note with timing information
 #[derive(Clone, Copy, Debug)]
 pub struct MidiNote {
@@ -32,11 +29,6 @@ pub struct MidiNote {
 }
 
 impl MidiNote {
-    /// Get the frequency in Hz for this MIDI note
-    pub fn frequency(&self) -> f32 {
-        440.0 * 2.0_f32.powf((self.note as f32 - 69.0) / 12.0)
-    }
-
     /// Get note name (e.g., "C4", "A#5")
     pub fn name(&self) -> String {
         let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
@@ -215,37 +207,6 @@ pub fn wav_to_base(path: &Path, base: u32) -> anyhow::Result<Vec<u8>> {
         6 => audio_to_base12(&samples, sample_rate).iter().map(|&d| d % 6).collect(),
         _ => audio_to_base12(&samples, sample_rate),
     })
-}
-
-/// Convert raw audio bytes (WAV format) to base-12
-pub fn wav_bytes_to_base12(data: &[u8]) -> anyhow::Result<Vec<u8>> {
-    let cursor = std::io::Cursor::new(data);
-    let reader = hound::WavReader::new(cursor)?;
-    let spec = reader.spec();
-    let sample_rate = spec.sample_rate;
-
-    let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => {
-            reader.into_samples::<f32>().filter_map(|s| s.ok()).collect()
-        }
-        hound::SampleFormat::Int => {
-            let bits = spec.bits_per_sample;
-            let max_val = (1i32 << (bits - 1)) as f32;
-            reader
-                .into_samples::<i32>()
-                .filter_map(|s| s.ok())
-                .map(|s| s as f32 / max_val)
-                .collect()
-        }
-    };
-
-    let mono: Vec<f32> = if spec.channels == 2 {
-        samples.chunks(2).map(|c| (c[0] + c.get(1).unwrap_or(&0.0)) / 2.0).collect()
-    } else {
-        samples
-    };
-
-    Ok(audio_to_base12(&mono, sample_rate))
 }
 
 #[cfg(test)]

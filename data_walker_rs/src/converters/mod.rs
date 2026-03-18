@@ -18,15 +18,6 @@ pub mod math;
 pub use audio::MidiNote;
 
 use std::path::Path;
-use thiserror::Error;
-
-#[derive(Error, Debug)]
-pub enum ConvertError {
-    #[error("Invalid input data: {0}")]
-    InvalidInput(String),
-    #[error("Conversion failed: {0}")]
-    ConversionFailed(String),
-}
 
 /// Normalize values to 0-11 range
 pub fn normalize_to_base12(values: &[f64]) -> Vec<u8> {
@@ -392,13 +383,24 @@ fn load_mp3_midi_notes(path: &Path) -> anyhow::Result<Vec<MidiNote>> {
 // PDB Protein Structure converters
 // ============================================================================
 
-/// Parse PDB ATOM records and extract C-alpha (backbone) coordinates
-fn parse_pdb_ca_coords(content: &str) -> Vec<[f64; 3]> {
+/// Parse PDB ATOM records and extract C-alpha (backbone) coordinates.
+/// Returns the coordinates plus indices where a new chain starts.
+fn parse_pdb_ca_coords(content: &str) -> (Vec<[f64; 3]>, Vec<usize>) {
     let mut coords = Vec::new();
+    let mut chain_breaks = Vec::new();
+    let mut last_chain_id: Option<char> = None;
     for line in content.lines() {
         if (line.starts_with("ATOM") || line.starts_with("HETATM")) && line.len() >= 54 {
             if let Some(atom_name) = line.get(12..16) {
                 if atom_name.trim() == "CA" {
+                    let chain_id = line.chars().nth(21).unwrap_or(' ');
+                    if let Some(last) = last_chain_id {
+                        if chain_id != last {
+                            chain_breaks.push(coords.len());
+                        }
+                    }
+                    last_chain_id = Some(chain_id);
+
                     if let (Some(x_s), Some(y_s), Some(z_s)) =
                         (line.get(30..38), line.get(38..46), line.get(46..54))
                     {
@@ -414,22 +416,24 @@ fn parse_pdb_ca_coords(content: &str) -> Vec<[f64; 3]> {
             }
         }
     }
-    coords
+    (coords, chain_breaks)
 }
 
 /// Parse amino acid residues from PDB ATOM records (one per residue via CA atoms)
 fn parse_pdb_residues(content: &str) -> Vec<String> {
     let mut residues = Vec::new();
-    let mut last_res_seq = String::new();
+    let mut last_res_id: Option<(char, String, char)> = None;
     for line in content.lines() {
         if line.starts_with("ATOM") && line.len() >= 26 {
             if let Some(atom_name) = line.get(12..16) {
                 if atom_name.trim() == "CA" {
                     if let (Some(res_name), Some(res_seq)) = (line.get(17..20), line.get(22..26)) {
-                        let seq = res_seq.trim().to_string();
-                        if seq != last_res_seq {
+                        let chain_id = line.chars().nth(21).unwrap_or(' ');
+                        let insertion_code = line.chars().nth(26).unwrap_or(' ');
+                        let res_id = (chain_id, res_seq.trim().to_string(), insertion_code);
+                        if last_res_id.as_ref() != Some(&res_id) {
                             residues.push(res_name.trim().to_string());
-                            last_res_seq = seq;
+                            last_res_id = Some(res_id);
                         }
                     }
                 }
@@ -501,7 +505,7 @@ pub fn convert_pdb_sequence(residues: &[String]) -> Vec<u8> {
             "VAL" | "ILE" => 2,  // Branched-chain hydrophobic
             "LEU"         => 3,  // Leucine - hydrophobic
             // Nonpolar aromatic
-            "PHE"         => 4,  // Phenylalanine
+            "PHE" | "TYR" => 4,  // Phenylalanine / tyrosine
             "TRP"         => 5,  // Tryptophan - largest
             // Polar uncharged
             "SER" | "THR" => 6,  // Hydroxyl group
@@ -519,11 +523,11 @@ pub fn convert_pdb_sequence(residues: &[String]) -> Vec<u8> {
     }).collect()
 }
 
-/// Load PDB file - raw Cα coordinates for direct 3D structure rendering
-/// Returns (coords, residue_names) for the backbone trace
-pub fn load_pdb_structure(path: &Path) -> anyhow::Result<(Vec<[f32; 3]>, Vec<String>)> {
+/// Load PDB file - raw Cα coordinates for direct 3D structure rendering.
+/// Returns (coords, residue_names, chain_breaks) for the backbone trace.
+pub fn load_pdb_structure(path: &Path) -> anyhow::Result<(Vec<[f32; 3]>, Vec<String>, Vec<usize>)> {
     let content = std::fs::read_to_string(path)?;
-    let coords = parse_pdb_ca_coords(&content);
+    let (coords, chain_breaks) = parse_pdb_ca_coords(&content);
     let residues = parse_pdb_residues(&content);
 
     if coords.len() < 2 {
@@ -535,7 +539,7 @@ pub fn load_pdb_structure(path: &Path) -> anyhow::Result<(Vec<[f32; 3]>, Vec<Str
         .map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
         .collect();
 
-    Ok((points, residues))
+    Ok((points, residues, chain_breaks))
 }
 
 /// Map amino acid name to a color category (0-11) for structure coloring
@@ -574,7 +578,7 @@ pub fn residue_color(res: &str) -> [f32; 3] {
 /// Load PDB file - backbone mode: Cα direction deltas → base-12
 pub fn load_pdb_backbone_raw(path: &Path, base: u32) -> anyhow::Result<Vec<u8>> {
     let content = std::fs::read_to_string(path)?;
-    let coords = parse_pdb_ca_coords(&content);
+    let (coords, _chain_breaks) = parse_pdb_ca_coords(&content);
 
     if coords.len() < 2 {
         anyhow::bail!("No C-alpha backbone found in PDB file (need >= 2 atoms)");
@@ -649,13 +653,13 @@ mod tests {
 
     #[test]
     fn test_pdb_sequence() {
-        let residues = vec!["GLY", "ALA", "LEU", "ASP", "HIS"]
+        let residues = vec!["GLY", "ALA", "TYR", "ASP", "HIS"]
             .into_iter().map(String::from).collect::<Vec<_>>();
         let digits = convert_pdb_sequence(&residues);
         assert_eq!(digits.len(), 5);
         assert_eq!(digits[0], 0);  // GLY
         assert_eq!(digits[1], 1);  // ALA
-        assert_eq!(digits[2], 3);  // LEU
+        assert_eq!(digits[2], 4);  // TYR
         assert_eq!(digits[3], 9);  // ASP
         assert_eq!(digits[4], 11); // HIS
     }
@@ -670,9 +674,27 @@ ATOM      4  N   GLY A   2       4.000   5.000   6.000  1.00  0.00           N
 ATOM      5  CA  GLY A   2       5.000   6.000   7.000  1.00  0.00           C
 END
 ";
-        let coords = parse_pdb_ca_coords(pdb);
+        let (coords, chain_breaks) = parse_pdb_ca_coords(pdb);
         assert_eq!(coords.len(), 2);
         assert_eq!(coords[0], [2.0, 3.0, 4.0]);
         assert_eq!(coords[1], [5.0, 6.0, 7.0]);
+        assert!(chain_breaks.is_empty());
+    }
+
+    #[test]
+    fn test_parse_pdb_chain_breaks_and_residue_ids() {
+        let pdb = "\
+ATOM      1  CA  ALA A   1       1.000   2.000   3.000  1.00  0.00           C
+ATOM      2  CA  GLY A   1A      2.000   3.000   4.000  1.00  0.00           C
+ATOM      3  CA  VAL B   1      10.000  20.000  30.000  1.00  0.00           C
+ATOM      4  CA  LEU B   2      11.000  21.000  31.000  1.00  0.00           C
+END
+";
+        let (coords, chain_breaks) = parse_pdb_ca_coords(pdb);
+        let residues = parse_pdb_residues(pdb);
+
+        assert_eq!(coords.len(), 4);
+        assert_eq!(chain_breaks, vec![2]);
+        assert_eq!(residues, vec!["ALA", "GLY", "VAL", "LEU"]);
     }
 }
