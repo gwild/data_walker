@@ -57,10 +57,8 @@ impl Default for AudioSettings {
 pub enum SourceType {
     /// Audio file (WAV or MP3)
     AudioFile { path: PathBuf },
-    /// Synthesized from base-12 data (legacy, single octave)
+    /// Synthesized directly from digit data.
     Synthesized { base_digits: Vec<u8> },
-    /// Synthesized from MIDI notes (note-accurate, multi-octave)
-    MidiNotes { notes: Vec<MidiNote> },
 }
 
 /// Per-source audio state
@@ -92,6 +90,13 @@ pub struct AudioEngine {
 }
 
 impl AudioEngine {
+    fn digit_note(digit: u8) -> MidiNote {
+        MidiNote {
+            note: 60 + (digit % 12),
+            velocity: 0.85,
+        }
+    }
+
     /// Create a new audio engine
     pub fn new() -> anyhow::Result<Self> {
         let (stream, stream_handle) = OutputStream::try_default()?;
@@ -121,12 +126,6 @@ impl AudioEngine {
                 // For synthesized sources, we'll create the sink on play
                 // Duration is based on digit count at ~10 digits/second
                 let duration = base_digits.len() as f32 / 10.0;
-                (None, duration)
-            }
-            SourceType::MidiNotes { notes } => {
-                // For MIDI note sources, we'll create the sink on play
-                // Duration is based on note count at ~10 notes/second
-                let duration = notes.len() as f32 / 10.0;
                 (None, duration)
             }
         };
@@ -168,16 +167,6 @@ impl AudioEngine {
                     "Generated synth synced to flight: {:.3} notes/sec for {} digits (duration: {:.1}s)",
                     points_per_second,
                     base_digits.len(),
-                    duration
-                );
-                (duration, points_per_second)
-            }
-            SourceType::MidiNotes { notes } => {
-                let duration = notes.len() as f32 / points_per_second;
-                info!(
-                    "Generated MIDI synced to flight: {:.3} notes/sec for {} notes (duration: {:.1}s)",
-                    points_per_second,
-                    notes.len(),
                     duration
                 );
                 (duration, points_per_second)
@@ -272,8 +261,7 @@ impl AudioEngine {
                 sink.play();
             } else {
                 if settings.sync_to_flight
-                    && settings.synthesis_method == SynthMethod::Percussion
-                    && matches!(source.source_type, SourceType::MidiNotes { .. })
+                    && matches!(source.source_type, SourceType::Synthesized { .. })
                     && source.synth_rate.is_some()
                 {
                     source.last_triggered_step = None;
@@ -299,26 +287,6 @@ impl AudioEngine {
                         synthesis::create_synth_sink(
                             &self.stream_handle,
                             base_digits.clone(),
-                            settings.synthesis_method,
-                            self.stop_flag.clone(),
-                        )
-                    }
-                    (SourceType::MidiNotes { notes }, Some(rate)) => {
-                        // Synced MIDI synthesis at specified rate
-                        info!("Creating synced MIDI synth for {} at {:.1} notes/sec", source.source_id, rate);
-                        synthesis::create_midi_synth_sink_with_rate(
-                            &self.stream_handle,
-                            notes.clone(),
-                            settings.synthesis_method,
-                            self.stop_flag.clone(),
-                            rate,
-                        )
-                    }
-                    (SourceType::MidiNotes { notes }, None) => {
-                        // Default MIDI synthesis at 10 notes/sec
-                        synthesis::create_midi_synth_sink(
-                            &self.stream_handle,
-                            notes.clone(),
                             settings.synthesis_method,
                             self.stop_flag.clone(),
                         )
@@ -375,59 +343,86 @@ impl AudioEngine {
                 sink.set_volume(settings.master_volume * source.volume);
             }
 
-            if settings.sync_to_flight
-                && settings.synthesis_method == SynthMethod::Percussion
-                && source.synth_rate.is_some()
-            {
-                if let SourceType::MidiNotes { notes } = &source.source_type {
-                    if notes.is_empty() {
+            if settings.sync_to_flight && source.synth_rate.is_some() {
+                if let SourceType::Synthesized { base_digits } = &source.source_type {
+                    if base_digits.is_empty() {
                         source.last_synced_step = Some(flight_step);
                         continue;
                     }
 
-                    let target_step = flight_step.min(notes.len().saturating_sub(1));
+                    let target_step = flight_step.min(base_digits.len().saturating_sub(1));
 
                     match source.last_triggered_step {
                         None => {
-                            if let Ok(sink) = synthesis::create_one_shot_midi_sink(
+                            match synthesis::create_one_shot_midi_sink(
                                 &self.stream_handle,
-                                notes[target_step],
+                                Self::digit_note(base_digits[target_step]),
                                 settings.synthesis_method,
                                 self.stop_flag.clone(),
                             ) {
-                                sink.set_volume(settings.master_volume * source.volume);
-                                sink.play();
-                                source.active_hit_sinks.push(sink);
-                                self.debug_triggered_hits_in_window += 1;
-                            }
-                        }
-                        Some(last_step) if target_step > last_step => {
-                            for step in (last_step + 1)..=target_step {
-                                if let Ok(sink) = synthesis::create_one_shot_midi_sink(
-                                    &self.stream_handle,
-                                    notes[step],
-                                    settings.synthesis_method,
-                                    self.stop_flag.clone(),
-                                ) {
+                                Ok(sink) => {
                                     sink.set_volume(settings.master_volume * source.volume);
                                     sink.play();
                                     source.active_hit_sinks.push(sink);
                                     self.debug_triggered_hits_in_window += 1;
                                 }
+                                Err(error) => {
+                                    warn!(
+                                        "Failed to create initial step trigger for {} at step {}: {}",
+                                        source.source_id,
+                                        target_step,
+                                        error
+                                    );
+                                }
+                            }
+                        }
+                        Some(last_step) if target_step > last_step => {
+                            for step in (last_step + 1)..=target_step {
+                                match synthesis::create_one_shot_midi_sink(
+                                    &self.stream_handle,
+                                    Self::digit_note(base_digits[step]),
+                                    settings.synthesis_method,
+                                    self.stop_flag.clone(),
+                                ) {
+                                    Ok(sink) => {
+                                        sink.set_volume(settings.master_volume * source.volume);
+                                        sink.play();
+                                        source.active_hit_sinks.push(sink);
+                                        self.debug_triggered_hits_in_window += 1;
+                                    }
+                                    Err(error) => {
+                                        warn!(
+                                            "Failed to create forward step trigger for {} at step {}: {}",
+                                            source.source_id,
+                                            step,
+                                            error
+                                        );
+                                    }
+                                }
                             }
                         }
                         Some(last_step) if target_step < last_step => {
                             for step in (target_step..last_step).rev() {
-                                if let Ok(sink) = synthesis::create_one_shot_midi_sink(
+                                match synthesis::create_one_shot_midi_sink(
                                     &self.stream_handle,
-                                    notes[step],
+                                    Self::digit_note(base_digits[step]),
                                     settings.synthesis_method,
                                     self.stop_flag.clone(),
                                 ) {
-                                    sink.set_volume(settings.master_volume * source.volume);
-                                    sink.play();
-                                    source.active_hit_sinks.push(sink);
-                                    self.debug_triggered_hits_in_window += 1;
+                                    Ok(sink) => {
+                                        sink.set_volume(settings.master_volume * source.volume);
+                                        sink.play();
+                                        source.active_hit_sinks.push(sink);
+                                        self.debug_triggered_hits_in_window += 1;
+                                    }
+                                    Err(error) => {
+                                        warn!(
+                                            "Failed to create reverse step trigger for {} at step {}: {}",
+                                            source.source_id,
+                                            step,
+                                            error
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -476,7 +471,7 @@ impl AudioEngine {
         let window_elapsed = self.debug_window_started_at.elapsed().as_secs_f32();
         if window_elapsed >= 1.0 {
             debug!(
-                "[AUDIO][SYNC] elapsed={:.2}s step={} total_steps={} sync_calls={} seek_events={} drum_hits={} hits_per_sec={:.2}",
+                "[AUDIO][SYNC] elapsed={:.2}s step={} total_steps={} sync_calls={} seek_events={} triggered_sounds={} sounds_per_sec={:.2}",
                 window_elapsed,
                 flight_step,
                 total_steps,
@@ -489,81 +484,6 @@ impl AudioEngine {
             self.debug_triggered_hits_in_window = 0;
             self.debug_sync_calls_in_window = 0;
             self.debug_seek_events_in_window = 0;
-        }
-    }
-
-    /// Recreate synthesized audio sinks with a new synth method
-    /// Call this when the user changes the synth method during playback
-    pub fn recreate_synth_sinks(&mut self, settings: &AudioSettings) {
-        info!("Recreating synth sinks with method: {:?}", settings.synthesis_method);
-
-        for source in self.sources.values_mut() {
-            // Only recreate synthesized sources (not audio files)
-            match &source.source_type {
-                SourceType::Synthesized { base_digits } => {
-                    // Stop existing sink
-                    if let Some(sink) = source.sink.take() {
-                        sink.stop();
-                    }
-
-                    // Create new sink with updated method
-                    let sink_result = match source.synth_rate {
-                        Some(rate) => synthesis::create_synth_sink_with_rate(
-                            &self.stream_handle,
-                            base_digits.clone(),
-                            settings.synthesis_method,
-                            self.stop_flag.clone(),
-                            rate,
-                        ),
-                        None => synthesis::create_synth_sink(
-                            &self.stream_handle,
-                            base_digits.clone(),
-                            settings.synthesis_method,
-                            self.stop_flag.clone(),
-                        ),
-                    };
-
-                    if let Ok(sink) = sink_result {
-                        sink.set_volume(settings.master_volume * source.volume);
-                        sink.play();
-                        source.sink = Some(sink);
-                        debug!("Recreated synth sink for {} with {:?}", source.source_id, settings.synthesis_method);
-                    }
-                }
-                SourceType::MidiNotes { notes } => {
-                    // Stop existing sink
-                    if let Some(sink) = source.sink.take() {
-                        sink.stop();
-                    }
-
-                    // Create new sink with updated method
-                    let sink_result = match source.synth_rate {
-                        Some(rate) => synthesis::create_midi_synth_sink_with_rate(
-                            &self.stream_handle,
-                            notes.clone(),
-                            settings.synthesis_method,
-                            self.stop_flag.clone(),
-                            rate,
-                        ),
-                        None => synthesis::create_midi_synth_sink(
-                            &self.stream_handle,
-                            notes.clone(),
-                            settings.synthesis_method,
-                            self.stop_flag.clone(),
-                        ),
-                    };
-
-                    if let Ok(sink) = sink_result {
-                        sink.set_volume(settings.master_volume * source.volume);
-                        sink.play();
-                        source.sink = Some(sink);
-                        debug!("Recreated MIDI synth sink for {} with {:?}", source.source_id, settings.synthesis_method);
-                    }
-                }
-                SourceType::AudioFile { .. } => {
-                    // Audio files don't use synthesis method, skip
-                }
-            }
         }
     }
 }

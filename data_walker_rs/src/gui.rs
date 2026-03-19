@@ -15,6 +15,8 @@ use crate::converters::math::MathGenerator;
 use crate::audio::{AudioEngine, AudioSettings, MixingMode, SynthMethod, SourceType};
 use crate::automation::{AutomationConfig, AutoCommand, GuiState, GuiEvent, WalkInfo};
 use crate::rules::{
+    validate_digit_playback_rule,
+    validate_step_trigger_playback_rule,
     enforce_zero_tolerance_rule_hook,
     validate_zero_tolerance_rules,
 };
@@ -91,6 +93,30 @@ struct WalkData {
     chain_breaks: Option<Vec<usize>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum ColorScheme {
+    #[default]
+    Distinct,
+    Wong,
+    Tol,
+    Pastel,
+    Neon,
+    Earth,
+}
+
+impl ColorScheme {
+    fn label(self) -> &'static str {
+        match self {
+            ColorScheme::Distinct => "Distinct",
+            ColorScheme::Wong => "Wong",
+            ColorScheme::Tol => "Tol",
+            ColorScheme::Pastel => "Pastel",
+            ColorScheme::Neon => "Neon",
+            ColorScheme::Earth => "Earth",
+        }
+    }
+}
+
 struct PendingWalkLoad {
     request_id: u64,
     source_name: String,
@@ -149,8 +175,7 @@ fn build_point_visit_maps(
     (revisit_counts, point_positions)
 }
 
-/// Catmull-Rom spline interpolation along a walk's points
-/// Creates smooth curves that pass through all control points
+/// Interpolate along the segment between adjacent walk points.
 fn interpolate_walk_position(points: &[[f32; 3]], position: f32) -> Vec3 {
     if points.is_empty() {
         return vec3(0.0, 0.0, 0.0);
@@ -158,53 +183,62 @@ fn interpolate_walk_position(points: &[[f32; 3]], position: f32) -> Vec3 {
     if points.len() == 1 {
         return vec3(points[0][0], points[0][1], points[0][2]);
     }
-    if points.len() == 2 {
-        // Linear interpolation for a single segment
-        let p0 = vec3(points[0][0], points[0][1], points[0][2]);
-        let p1 = vec3(points[1][0], points[1][1], points[1][2]);
-        let t = position.clamp(0.0, 1.0);
-        return p0 * (1.0 - t) + p1 * t;
-    }
-
-    let num_segments = points.len() - 1;
-    let exact_idx = position.clamp(0.0, num_segments as f32);
-    let segment = (exact_idx.floor() as usize).min(num_segments - 1);
-    let local_t = exact_idx - segment as f32;
-
-    // Get 4 control points for Catmull-Rom (P0, P1, P2, P3)
-    // P1 and P2 are the segment endpoints, P0 and P3 are neighbors for tangent calculation
-    let i1 = segment;
-    let i2 = (segment + 1).min(points.len() - 1);
-
-    // For boundary points, extrapolate or clamp
-    let i0 = if segment == 0 { 0 } else { segment - 1 };
-    let i3 = (segment + 2).min(points.len() - 1);
-
-    let p0 = vec3(points[i0][0], points[i0][1], points[i0][2]);
-    let p1 = vec3(points[i1][0], points[i1][1], points[i1][2]);
-    let p2 = vec3(points[i2][0], points[i2][1], points[i2][2]);
-    let p3 = vec3(points[i3][0], points[i3][1], points[i3][2]);
-
-    // Catmull-Rom spline formula:
-    // P(t) = 0.5 * [(2*P1) + (-P0 + P2)*t + (2*P0 - 5*P1 + 4*P2 - P3)*t² + (-P0 + 3*P1 - 3*P2 + P3)*t³]
-    let t2 = local_t * local_t;
-    let t3 = t2 * local_t;
-
-    let result = (p1 * 2.0
-        + (p2 - p0) * local_t
-        + (p0 * 2.0 - p1 * 5.0 + p2 * 4.0 - p3) * t2
-        + (p1 * 3.0 - p0 - p2 * 3.0 + p3) * t3)
-        * 0.5;
-
-    result
+    let max_segment = points.len() - 1;
+    let exact_idx = position.clamp(0.0, max_segment as f32);
+    let start_idx = exact_idx.floor() as usize;
+    let end_idx = (start_idx + 1).min(max_segment);
+    let t = exact_idx - start_idx as f32;
+    let start = vec3(
+        points[start_idx][0],
+        points[start_idx][1],
+        points[start_idx][2],
+    );
+    let end = vec3(points[end_idx][0], points[end_idx][1], points[end_idx][2]);
+    start * (1.0 - t) + end * t
 }
 
-/// Calculate average position along all selected walks at a given point position
-/// Returns (current_pos, look_ahead_pos) for direction calculation, or None if no walks
+fn point_vec3(points: &[[f32; 3]], index: usize) -> Vec3 {
+    let clamped = index.min(points.len().saturating_sub(1));
+    vec3(
+        points[clamped][0],
+        points[clamped][1],
+        points[clamped][2],
+    )
+}
+
+fn flight_target_point(points: &[[f32; 3]], flight_position: f32, look_back: bool) -> Vec3 {
+    let current_step = flight_step_from_position(flight_position, points.len());
+    let mut candidate = current_step;
+
+    loop {
+        candidate = if look_back {
+            candidate.saturating_sub(1)
+        } else {
+            (candidate + 1).min(points.len().saturating_sub(1))
+        };
+
+        let target = point_vec3(points, candidate);
+        let current = interpolate_walk_position(points, flight_position);
+        if (target - current).magnitude() > 0.001 || candidate == current_step {
+            return target;
+        }
+
+        if look_back {
+            if candidate == 0 {
+                return current;
+            }
+        } else if candidate == points.len().saturating_sub(1) {
+            return current;
+        }
+    }
+}
+
+/// Calculate averaged flight camera and target positions from actual walk points.
 fn calculate_average_path_position(
     walks: &BTreeMap<String, WalkData>,
     selected_ids: &std::collections::HashSet<String>,
     flight_position: f32,
+    look_back: bool,
 ) -> Option<(Vec3, Vec3)> {
     let selected_walks: Vec<_> = walks.iter()
         .filter(|(id, w)| selected_ids.contains(*id) && w.visible && !w.points.is_empty())
@@ -216,32 +250,17 @@ fn calculate_average_path_position(
 
     let mut current_sum = vec3(0.0, 0.0, 0.0);
     let mut count = 0.0;
+    let mut target_sum = vec3(0.0, 0.0, 0.0);
 
     for (_, walk) in &selected_walks {
         current_sum += interpolate_walk_position(&walk.points, flight_position);
+        target_sum += flight_target_point(&walk.points, flight_position, look_back);
         count += 1.0;
     }
 
     let current_pos = current_sum / count;
-
-    // Some walks begin with repeated positions or pure rotations, so a tiny
-    // look-ahead can produce no movement vector. Search forward until we find
-    // a usable direction for the flight camera.
-    for look_ahead_delta in [1.0_f32, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0] {
-        let look_ahead = flight_position + look_ahead_delta;
-        let mut ahead_sum = vec3(0.0, 0.0, 0.0);
-
-        for (_, walk) in &selected_walks {
-            ahead_sum += interpolate_walk_position(&walk.points, look_ahead);
-        }
-
-        let ahead_pos = ahead_sum / count;
-        if (ahead_pos - current_pos).magnitude() > 0.001 {
-            return Some((current_pos, ahead_pos));
-        }
-    }
-
-    Some((current_pos, current_pos))
+    let target_pos = target_sum / count;
+    Some((current_pos, target_pos))
 }
 
 fn max_selected_flight_len(
@@ -418,6 +437,8 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
     let mut prev_mapping = selected_mapping.clone();
     let mut selected_base: u32 = 12;
     let mut prev_base: u32 = 12;
+    let mut color_scheme = ColorScheme::default();
+    let mut prev_color_scheme = color_scheme;
     let mut max_points: usize = 5000;
     let mut prev_max_points: usize = max_points;
     let mut show_grid = true;
@@ -454,8 +475,6 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
     let mut flight_loop_mode: u8 = 0;        // 0 = Repeat, 1 = Fwd/Rev (ping-pong)
     let mut show_loop_menu = false;          // Dropdown visibility
     let mut fullscreen_plot = false;          // ESC toggles panels off for pure plot
-    let mut smooth_cam_pos: Option<Vec3> = None;   // Smoothed camera position
-    let mut smooth_cam_target: Option<Vec3> = None; // Smoothed look target
     let mut last_flight_debug_state = String::new();
     let mut flight_debug_window_elapsed_secs: f32 = 0.0;
     let mut flight_debug_frames_in_window: usize = 0;
@@ -487,7 +506,7 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
     let mut first_frame = true;  // Track first frame to reset egui state
 
     // Color pool for dynamic assignment
-    let mut color_pool = ColorPool::new();
+    let mut color_pool = ColorPool::new(color_scheme);
 
     // Automation state
     let cmd_queue = crate::automation::new_command_queue();
@@ -683,7 +702,6 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                                 flight_mode,
                                 flight_playing,
                                 flight_speed,
-                                &walk_data.points,
                                 walk_len,
                                 &audio_prep_tx,
                                 &mut pending_audio_preps,
@@ -695,8 +713,6 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                     }
                     walks.insert(result.source.id.clone(), walk_data);
                     if flight_mode {
-                        smooth_cam_pos = None;
-                        smooth_cam_target = None;
                         if !flight_playing {
                             flight_position = 0.0;
                         }
@@ -838,7 +854,7 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                         }
                         FocusedSlider::PointScale => {
                             let step = if modifiers.shift { 0.01 } else { 0.05 };
-                            point_scale = (point_scale + sign * step).clamp(0.1, 1.0);
+                            point_scale = (point_scale + sign * step).clamp(0.01, 1.0);
                         }
                         FocusedSlider::LineScale => {
                             let step = if modifiers.shift { 0.01 } else { 0.05 };
@@ -1052,20 +1068,20 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
             }
 
             // Get average position along path
-            if let Some((current_pos, next_pos)) = calculate_average_path_position(
-                &walks, &selected_sources, flight_position
+            if let Some((current_pos, target_pos)) = calculate_average_path_position(
+                &walks, &selected_sources, flight_position, flight_look_back
             ) {
                 // Direction of travel
-                let dir_vec = next_pos - current_pos;
+                let dir_vec = target_pos - current_pos;
                 let dir_mag = dir_vec.magnitude();
 
                 if dir_mag > 0.001 {
                     if last_flight_debug_state != "tracking" {
                         debug!(
-                            "[GUI][FLIGHT] tracking position={:.3} current={} next={} camera_pos={} camera_target={} walks={}",
+                            "[GUI][FLIGHT] tracking position={:.3} current={} target={} camera_pos={} camera_target={} walks={}",
                             flight_position,
                             format_vec3_debug(current_pos),
-                            format_vec3_debug(next_pos),
+                            format_vec3_debug(target_pos),
                             format_vec3_debug(camera.position()),
                             format_vec3_debug(camera.target()),
                             summarize_selected_walks(&walks, &selected_sources)
@@ -1074,7 +1090,6 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                     }
                     let direction = dir_vec / dir_mag;
 
-                    // Camera offset: slightly behind and above the path
                     let world_up = vec3(0.0, 1.0, 0.0);
                     let reference_up = if direction.dot(world_up).abs() > 0.95 {
                         vec3(0.0, 0.0, 1.0)
@@ -1089,47 +1104,20 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                         reference_up
                     };
 
-                    let offset_distance = 15.0;
-                    let offset_height = 5.0;
-                    let desired_pos = current_pos - direction * offset_distance + cam_up * offset_height;
-
-                    // Look target: ahead or behind based on toggle
-                    let desired_target = if flight_look_back {
-                        current_pos - direction * 10.0
-                    } else {
-                        next_pos
-                    };
-
-                    // Exponential smoothing for buttery camera motion
-                    // Smoothing factor: higher = snappier, lower = smoother
-                    let smooth_factor = (8.0 * delta).min(1.0);
-                    let cam_pos = match smooth_cam_pos {
-                        Some(prev) => prev + (desired_pos - prev) * smooth_factor,
-                        None => desired_pos,
-                    };
-                    let cam_target = match smooth_cam_target {
-                        Some(prev) => prev + (desired_target - prev) * smooth_factor,
-                        None => desired_target,
-                    };
-                    smooth_cam_pos = Some(cam_pos);
-                    smooth_cam_target = Some(cam_target);
-
-                    camera.set_view(cam_pos, cam_target, cam_up);
+                    camera.set_view(current_pos, target_pos, cam_up);
                 } else {
                     if last_flight_debug_state != "degenerate_dir" {
                         debug!(
-                            "[GUI][FLIGHT] degenerate_dir position={:.3} current={} next={} camera_pos={} camera_target={} walks={}",
+                            "[GUI][FLIGHT] degenerate_dir position={:.3} current={} target={} camera_pos={} camera_target={} walks={}",
                             flight_position,
                             format_vec3_debug(current_pos),
-                            format_vec3_debug(next_pos),
+                            format_vec3_debug(target_pos),
                             format_vec3_debug(camera.position()),
                             format_vec3_debug(camera.target()),
                             summarize_selected_walks(&walks, &selected_sources)
                         );
                         last_flight_debug_state = "degenerate_dir".to_string();
                     }
-                    smooth_cam_pos = None;
-                    smooth_cam_target = None;
                     camera.set_view(
                         current_pos + vec3(0.0, 50.0, 200.0),
                         current_pos,
@@ -1430,6 +1418,32 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                         });
                     });
 
+                    ui.horizontal(|ui| {
+                        ui.label("Colors:");
+                        let prev_color_scheme_val = color_scheme;
+                        egui::ComboBox::from_id_salt("color_scheme")
+                            .selected_text(color_scheme.label())
+                            .show_ui(ui, |ui| {
+                                for scheme in [
+                                    ColorScheme::Distinct,
+                                    ColorScheme::Wong,
+                                    ColorScheme::Tol,
+                                    ColorScheme::Pastel,
+                                    ColorScheme::Neon,
+                                    ColorScheme::Earth,
+                                ] {
+                                    ui.selectable_value(&mut color_scheme, scheme, scheme.label());
+                                }
+                            });
+                        if color_scheme != prev_color_scheme_val {
+                            debug!(
+                                "[GUI] Color scheme changed: {} -> {}",
+                                prev_color_scheme_val.label(),
+                                color_scheme.label()
+                            );
+                        }
+                    });
+
                     if ui.add(egui::Slider::new(&mut max_points, 100..=10000).text("Max points")).clicked() {
                         focused_slider = FocusedSlider::MaxPoints;
                     }
@@ -1507,7 +1521,7 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                         }
                     });
                     if show_points {
-                        if ui.add(egui::Slider::new(&mut point_scale, 0.1..=1.0).text("Point scale")).clicked() {
+                        if ui.add(egui::Slider::new(&mut point_scale, 0.01..=1.0).text("Point scale")).clicked() {
                             focused_slider = FocusedSlider::PointScale;
                         }
                     }
@@ -1549,10 +1563,6 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                     ui.heading("Data Flight");
                     if ui.checkbox(&mut flight_mode, "Enable Flight").changed() {
                         debug!("[GUI] Checkbox changed: flight_mode = {}", flight_mode);
-                        if flight_mode {
-                            smooth_cam_pos = None;
-                            smooth_cam_target = None;
-                        }
                         // When disabling flight mode, stop playback and audio
                         if !flight_mode {
                             if flight_playing {
@@ -1649,8 +1659,6 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                                 .saturating_sub(1) as f32;
                             flight_position = if flight_reverse { max_step } else { 0.0 };
                             flight_playing = false;
-                            smooth_cam_pos = None;
-                            smooth_cam_target = None;
                             // Stop audio on reset
                             if let Some(ref mut engine) = audio_engine {
                                 debug!("[GUI] Stopping all audio on reset");
@@ -1775,8 +1783,6 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                                         if ui.checkbox(&mut checked, label).changed() {
                                             debug!("[GUI] Source checkbox changed: {} -> {}", source.id, checked);
                                             if flight_mode {
-                                                smooth_cam_pos = None;
-                                                smooth_cam_target = None;
                                                 last_flight_debug_state.clear();
                                                 if !flight_playing {
                                                     flight_position = 0.0;
@@ -2106,6 +2112,12 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
             }
         }
 
+        if color_scheme != prev_color_scheme {
+            prev_color_scheme = color_scheme;
+            color_pool.set_scheme(color_scheme);
+            apply_color_scheme_to_walks(&mut walks, &mut color_pool);
+        }
+
         // Regenerate walks if mapping, base, or max_points changed
         if selected_mapping != prev_mapping || max_points != prev_max_points || selected_base != prev_base {
             debug!("[GUI] Regenerating walks: mapping={} (was {}), base={} (was {}), max_points={} (was {})",
@@ -2137,15 +2149,28 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
             }
         }
 
-        // Recreate synth sinks if synth method changed during playback
+        // Re-prepare audio sources if synth method changed so synced percussion
+        // always goes through the point-triggered path instead of stale sinks.
         if audio_settings.synthesis_method != prev_synth_method {
             debug!("[GUI] Synth method changed: {:?} -> {:?}", prev_synth_method, audio_settings.synthesis_method);
             prev_synth_method = audio_settings.synthesis_method;
-            if flight_playing && audio_settings.enabled {
-                if let Some(ref mut engine) = audio_engine {
-                    debug!("[GUI] Recreating synth sinks for new method");
-                    engine.recreate_synth_sinks(&audio_settings);
-                }
+            if audio_settings.enabled && !selected_sources.is_empty() {
+                debug!("[GUI] Refreshing audio sources for new synth method");
+                refresh_selected_audio_sources(
+                    &selected_sources,
+                    &walks,
+                    &config,
+                    &data_paths,
+                    audio_engine.as_mut(),
+                    &audio_settings,
+                    selected_base,
+                    flight_mode,
+                    flight_playing,
+                    flight_speed,
+                    &audio_prep_tx,
+                    &mut pending_audio_preps,
+                    &mut next_audio_prep_request_id,
+                );
             }
         }
 
@@ -2388,6 +2413,14 @@ fn load_base12_digits(
     source: &crate::config::Source,
     data_paths: &DataPaths,
 ) -> anyhow::Result<Vec<u8>> {
+    load_digits_for_audio_base(source, data_paths, 12)
+}
+
+fn load_digits_for_audio_base(
+    source: &crate::config::Source,
+    data_paths: &DataPaths,
+    base: u32,
+) -> anyhow::Result<Vec<u8>> {
     use crate::converters;
 
     let max_points = 5000; // Reasonable length for audio
@@ -2395,39 +2428,44 @@ fn load_base12_digits(
     if source.converter.starts_with("math.") {
         let generator = MathGenerator::from_converter_string(&source.converter)
             .ok_or_else(|| anyhow::anyhow!("Unknown math converter '{}'", source.converter))?;
-        Ok(generator.generate(max_points))
+        let base12 = generator.generate(max_points);
+        Ok(match base {
+            4 => base12.iter().map(|&d| d % 4).collect(),
+            6 => base12.iter().map(|&d| d % 6).collect(),
+            _ => base12,
+        })
     } else {
         match source.converter.as_str() {
             "audio" => {
                 let path = data_paths
                     .audio_file(&source.id)
                     .ok_or_else(|| anyhow::anyhow!("No audio file found for {}", source.id))?;
-                converters::load_audio_raw(&path, 12)
+                converters::load_audio_raw(&path, base)
                     .map_err(|e| anyhow::anyhow!("Failed to load audio for synthesis {}: {}", source.id, e))
             }
             "dna" => {
                 let path = data_paths.dna_file(&source.url, &source.id);
-                converters::load_dna_raw(&path, 12)
+                converters::load_dna_raw(&path, base)
                     .map_err(|e| anyhow::anyhow!("Failed to load DNA for synthesis {}: {}", source.id, e))
             }
             "cosmos" => {
                 let path = data_paths.cosmos_file(&source.id);
-                converters::load_cosmos_raw(&path, 12)
+                converters::load_cosmos_raw(&path, base)
                     .map_err(|e| anyhow::anyhow!("Failed to load cosmos data for synthesis {}: {}", source.id, e))
             }
             "finance" => {
                 let path = data_paths.finance_file(&source.url, &source.id);
-                converters::load_finance_raw(&path, 12)
+                converters::load_finance_raw(&path, base)
                     .map_err(|e| anyhow::anyhow!("Failed to load finance data for synthesis {}: {}", source.id, e))
             }
             "pdb_backbone" => {
                 let path = data_paths.protein_file(&source.url, &source.id);
-                converters::load_pdb_backbone_raw(&path, 12)
+                converters::load_pdb_backbone_raw(&path, base)
                     .map_err(|e| anyhow::anyhow!("Failed to load PDB backbone for synthesis {}: {}", source.id, e))
             }
             "pdb_sequence" => {
                 let path = data_paths.protein_file(&source.url, &source.id);
-                converters::load_pdb_sequence_raw(&path, 12)
+                converters::load_pdb_sequence_raw(&path, base)
                     .map_err(|e| anyhow::anyhow!("Failed to load PDB sequence for synthesis {}: {}", source.id, e))
             }
             "pdb_structure" => Err(anyhow::anyhow!(
@@ -2512,7 +2550,6 @@ fn prepare_audio_for_source(
     flight_mode: bool,
     flight_playing: bool,
     flight_speed: f32,
-    walk_points: &[[f32; 3]],
     walk_len: usize,
     audio_prep_tx: &std::sync::mpsc::Sender<AudioPrepResult>,
     pending_audio_preps: &mut BTreeMap<String, PendingAudioPrep>,
@@ -2520,14 +2557,20 @@ fn prepare_audio_for_source(
 ) {
     debug!("[GUI] Preparing audio for source: {}", source.id);
     let audio_source_type = if audio_settings.force_synthesis {
-        let notes = walk_points_to_midi_notes(walk_points, selected_base);
+        let digits = match load_digits_for_audio_base(source, data_paths, selected_base) {
+            Ok(digits) => digits,
+            Err(error) => {
+                warn!("[GUI] Skipping generated audio prep for {}: {}", source.id, error);
+                return;
+            }
+        };
         debug!(
-            "[GUI] Using synthesized walk notes for {} ({} points, base {})",
+            "[GUI] Using synthesized digits for {} ({} digits, base {})",
             source.id,
-            notes.len(),
+            digits.len(),
             selected_base
         );
-        SourceType::MidiNotes { notes }
+        SourceType::Synthesized { base_digits: digits }
     } else {
         debug!("[GUI] Getting audio source type for {}", source.id);
         match get_audio_source_type(source, data_paths) {
@@ -2543,6 +2586,16 @@ fn prepare_audio_for_source(
         source.id,
         audio_source_type
     );
+
+    if let Err(error) = validate_digit_playback_rule(audio_settings, &audio_source_type) {
+        error!("[GUI] {}", error);
+        return;
+    }
+
+    if let Err(error) = validate_step_trigger_playback_rule(audio_settings, &audio_source_type, flight_mode) {
+        error!("[GUI] {}", error);
+        return;
+    }
 
     if let Err(error) = validate_zero_tolerance_rules(audio_settings, flight_mode) {
         error!("[GUI] {}", error);
@@ -2642,7 +2695,6 @@ fn refresh_selected_audio_sources(
             flight_mode,
             flight_playing,
             flight_speed,
-            walks.get(source_id).map(|w| w.points.as_slice()).unwrap_or(&[]),
             walk_len,
             audio_prep_tx,
             pending_audio_preps,
@@ -2691,69 +2743,6 @@ fn queue_audio_file_prep(
             debug!("[GUI] Audio prep receiver dropped");
         }
     });
-}
-
-fn walk_points_to_midi_notes(
-    points: &[[f32; 3]],
-    base: u32,
-) -> Vec<crate::converters::audio::MidiNote> {
-    use crate::converters::audio::MidiNote;
-
-    if points.is_empty() {
-        return vec![MidiNote { note: 60, velocity: 0.8 }];
-    }
-
-    let mut notes = Vec::with_capacity(points.len());
-    let mut previous_point = [0.0_f32, 0.0, 0.0];
-    let mut previous_dir: Option<u8> = None;
-
-    for &point in points {
-        let dx = point[0] - previous_point[0];
-        let dy = point[1] - previous_point[1];
-        let dz = point[2] - previous_point[2];
-
-        let dir = if base == 4 {
-            if dx.abs() >= dy.abs() {
-                if dx >= 0.0 { 0 } else { 1 }
-            } else if dy >= 0.0 {
-                2
-            } else {
-                3
-            }
-        } else {
-            let ax = dx.abs();
-            let ay = dy.abs();
-            let az = dz.abs();
-            if ax >= ay && ax >= az {
-                if dx >= 0.0 { 0 } else { 1 }
-            } else if ay >= ax && ay >= az {
-                if dy >= 0.0 { 2 } else { 3 }
-            } else if dz >= 0.0 {
-                4
-            } else {
-                5
-            }
-        };
-
-        let class = match base {
-            4 => dir % 4,
-            6 => dir % 6,
-            _ => {
-                let turned = previous_dir.map(|prev| prev != dir).unwrap_or(false);
-                dir + if turned { 6 } else { 0 }
-            }
-        };
-
-        notes.push(MidiNote {
-            note: 60 + class,
-            velocity: 0.85,
-        });
-
-        previous_dir = Some(dir);
-        previous_point = point;
-    }
-
-    notes
 }
 
 fn format_pending_audio(pending_audio_preps: &BTreeMap<String, PendingAudioPrep>) -> String {
@@ -3109,43 +3098,110 @@ fn init_spacemouse() -> Option<Arc<Mutex<SpaceMouseState>>> {
     Some(state)
 }
 
+fn apply_color_scheme_to_walks(
+    walks: &mut BTreeMap<String, WalkData>,
+    color_pool: &mut ColorPool,
+) {
+    for (source_id, walk) in walks.iter_mut() {
+        walk.color = color_pool.get_color(source_id);
+    }
+}
 
-/// Maximally distinct color palette based on Glasbey algorithm principles.
-/// Colors are pre-computed to maximize minimum perceptual distance in CIELAB space.
-/// Designed for dark backgrounds (0.1, 0.1, 0.15).
-/// First 12 colors have excellent contrast; extends to 24 for larger datasets.
-const DISTINCT_COLORS: [[f32; 3]; 24] = [
-    // Primary distinct colors (maximally separated in CIELAB)
-    [1.00, 0.30, 0.30],  // 0: Bright red
-    [0.30, 0.85, 0.40],  // 1: Green
-    [0.40, 0.60, 1.00],  // 2: Sky blue
-    [1.00, 0.85, 0.20],  // 3: Yellow
-    [0.90, 0.40, 0.90],  // 4: Magenta
-    [0.20, 0.90, 0.90],  // 5: Cyan
-    [1.00, 0.60, 0.20],  // 6: Orange
-    [0.70, 0.50, 1.00],  // 7: Purple
-    [0.60, 1.00, 0.60],  // 8: Lime
-    [1.00, 0.50, 0.60],  // 9: Salmon
-    [0.50, 0.80, 1.00],  // 10: Light blue
-    [0.95, 0.75, 0.50],  // 11: Peach
-    // Secondary colors (still good contrast)
-    [0.80, 0.20, 0.50],  // 12: Rose
-    [0.40, 0.70, 0.50],  // 13: Sea green
-    [0.70, 0.70, 0.30],  // 14: Olive
-    [0.50, 0.30, 0.70],  // 15: Deep purple
-    [0.30, 0.60, 0.60],  // 16: Teal
-    [0.90, 0.55, 0.45],  // 17: Coral
-    [0.60, 0.40, 0.30],  // 18: Brown
-    [0.75, 0.85, 0.85],  // 19: Light gray-cyan
-    [0.85, 0.65, 0.80],  // 20: Pink
-    [0.55, 0.75, 0.35],  // 21: Yellow-green
-    [0.45, 0.45, 0.85],  // 22: Slate blue
-    [0.90, 0.35, 0.60],  // 23: Hot pink
+
+const DISTINCT_COLORS: [[f32; 3]; 12] = [
+    [1.00, 0.30, 0.30],
+    [0.30, 0.85, 0.40],
+    [0.40, 0.60, 1.00],
+    [1.00, 0.85, 0.20],
+    [0.90, 0.40, 0.90],
+    [0.20, 0.90, 0.90],
+    [1.00, 0.60, 0.20],
+    [0.70, 0.50, 1.00],
+    [0.60, 1.00, 0.60],
+    [1.00, 0.50, 0.60],
+    [0.50, 0.80, 1.00],
+    [0.95, 0.75, 0.50],
+];
+
+const WONG_COLORS: [[f32; 3]; 12] = [
+    [0.90, 0.62, 0.00],
+    [0.34, 0.71, 0.91],
+    [0.00, 0.62, 0.45],
+    [0.94, 0.89, 0.26],
+    [0.00, 0.45, 0.70],
+    [0.84, 0.37, 0.00],
+    [0.80, 0.47, 0.65],
+    [0.55, 0.55, 0.55],
+    [0.44, 0.56, 0.00],
+    [0.70, 0.44, 0.86],
+    [0.20, 0.80, 0.80],
+    [1.00, 0.70, 0.30],
+];
+
+const TOL_COLORS: [[f32; 3]; 12] = [
+    [0.20, 0.13, 0.53],
+    [0.53, 0.80, 0.93],
+    [0.27, 0.67, 0.60],
+    [0.07, 0.47, 0.20],
+    [0.60, 0.60, 0.20],
+    [0.87, 0.80, 0.47],
+    [0.80, 0.40, 0.47],
+    [0.67, 0.27, 0.60],
+    [0.88, 0.52, 0.28],
+    [0.38, 0.38, 0.80],
+    [0.55, 0.72, 0.30],
+    [0.94, 0.64, 0.76],
+];
+
+const PASTEL_COLORS: [[f32; 3]; 12] = [
+    [0.97, 0.64, 0.64],
+    [0.64, 0.85, 0.72],
+    [0.67, 0.77, 0.97],
+    [0.98, 0.88, 0.55],
+    [0.86, 0.68, 0.95],
+    [0.61, 0.89, 0.91],
+    [0.99, 0.74, 0.51],
+    [0.75, 0.73, 0.98],
+    [0.74, 0.95, 0.66],
+    [0.98, 0.69, 0.78],
+    [0.72, 0.86, 0.99],
+    [0.95, 0.81, 0.70],
+];
+
+const NEON_COLORS: [[f32; 3]; 12] = [
+    [1.00, 0.18, 0.41],
+    [0.18, 1.00, 0.56],
+    [0.22, 0.73, 1.00],
+    [1.00, 0.95, 0.18],
+    [0.92, 0.25, 1.00],
+    [0.12, 1.00, 0.98],
+    [1.00, 0.55, 0.08],
+    [0.58, 0.34, 1.00],
+    [0.67, 1.00, 0.20],
+    [1.00, 0.39, 0.64],
+    [0.42, 0.90, 1.00],
+    [1.00, 0.74, 0.18],
+];
+
+const EARTH_COLORS: [[f32; 3]; 12] = [
+    [0.74, 0.37, 0.22],
+    [0.35, 0.57, 0.31],
+    [0.24, 0.45, 0.62],
+    [0.76, 0.63, 0.24],
+    [0.55, 0.40, 0.60],
+    [0.24, 0.58, 0.55],
+    [0.86, 0.54, 0.26],
+    [0.45, 0.34, 0.68],
+    [0.56, 0.68, 0.31],
+    [0.78, 0.47, 0.41],
+    [0.47, 0.66, 0.74],
+    [0.67, 0.52, 0.38],
 ];
 
 /// Color pool for dynamic assignment with maximum contrast
 #[derive(Default)]
 struct ColorPool {
+    scheme: ColorScheme,
     /// Maps source ID to assigned color index
     assignments: std::collections::HashMap<String, usize>,
     /// Tracks which color indices are in use
@@ -3153,32 +3209,52 @@ struct ColorPool {
 }
 
 impl ColorPool {
-    fn new() -> Self {
-        Self::default()
+    fn new(scheme: ColorScheme) -> Self {
+        Self {
+            scheme,
+            assignments: Default::default(),
+            in_use: Default::default(),
+        }
+    }
+
+    fn palette(&self) -> &'static [[f32; 3]; 12] {
+        match self.scheme {
+            ColorScheme::Distinct => &DISTINCT_COLORS,
+            ColorScheme::Wong => &WONG_COLORS,
+            ColorScheme::Tol => &TOL_COLORS,
+            ColorScheme::Pastel => &PASTEL_COLORS,
+            ColorScheme::Neon => &NEON_COLORS,
+            ColorScheme::Earth => &EARTH_COLORS,
+        }
+    }
+
+    fn set_scheme(&mut self, scheme: ColorScheme) {
+        self.scheme = scheme;
     }
 
     /// Get or assign a color for a source ID
     /// Returns the RGB color array
     fn get_color(&mut self, source_id: &str) -> [f32; 3] {
+        let palette = self.palette();
         // Return existing assignment
         if let Some(&idx) = self.assignments.get(source_id) {
-            return DISTINCT_COLORS[idx];
+            return palette[idx % palette.len()];
         }
 
         // Find first unused color index
         let mut idx = 0;
-        while self.in_use.contains(&idx) && idx < DISTINCT_COLORS.len() {
+        while self.in_use.contains(&idx) && idx < palette.len() {
             idx += 1;
         }
 
         // If all colors used, find color with maximum distance to currently used colors
-        if idx >= DISTINCT_COLORS.len() {
+        if idx >= palette.len() {
             idx = self.find_best_reuse_color();
         }
 
         self.assignments.insert(source_id.to_string(), idx);
         self.in_use.insert(idx);
-        DISTINCT_COLORS[idx]
+        palette[idx % palette.len()]
     }
 
     /// Release a color when a walk is removed
@@ -3193,8 +3269,8 @@ impl ColorPool {
     fn find_best_reuse_color(&self) -> usize {
         // Collect currently used colors
         let used_colors: Vec<[f32; 3]> = self.in_use.iter()
-            .filter(|&&i| i < DISTINCT_COLORS.len())
-            .map(|&i| DISTINCT_COLORS[i])
+            .filter(|&&i| i < self.palette().len())
+            .map(|&i| self.palette()[i])
             .collect();
 
         if used_colors.is_empty() {
@@ -3205,7 +3281,7 @@ impl ColorPool {
         let mut best_idx = 0;
         let mut best_min_dist = 0.0f32;
 
-        for (idx, color) in DISTINCT_COLORS.iter().enumerate() {
+        for (idx, color) in self.palette().iter().enumerate() {
             let min_dist = used_colors.iter()
                 .map(|used| {
                     let dr = color[0] - used[0];
