@@ -66,7 +66,7 @@ struct AudioSource {
     source_id: String,
     source_type: SourceType,
     sink: Option<Sink>,
-    active_hit_sinks: Vec<Sink>,
+    active_hit_sink: Option<Sink>,
     duration_secs: f32,
     volume: f32,
     synth_rate: Option<f32>,  // Notes per second for synced synthesis (None = default 10/sec)
@@ -134,7 +134,7 @@ impl AudioEngine {
             source_id: source_id.to_string(),
             source_type,
             sink,
-            active_hit_sinks: Vec::new(),
+            active_hit_sink: None,
             duration_secs: duration,
             volume: 1.0,
             synth_rate: None,
@@ -180,7 +180,7 @@ impl AudioEngine {
             source_id: source_id.to_string(),
             source_type,
             sink: None,
-            active_hit_sinks: Vec::new(),
+            active_hit_sink: None,
             duration_secs: duration,
             volume: 1.0,
             synth_rate: Some(synth_rate),
@@ -217,7 +217,7 @@ impl AudioEngine {
             source_id: source_id.to_string(),
             source_type: SourceType::AudioFile { path },
             sink: Some(sink),
-            active_hit_sinks: Vec::new(),
+            active_hit_sink: None,
             duration_secs: duration,
             volume: 1.0,
             synth_rate: None,
@@ -239,7 +239,7 @@ impl AudioEngine {
             if let Some(sink) = source.sink.take() {
                 sink.stop();
             }
-            for sink in source.active_hit_sinks.drain(..) {
+            if let Some(sink) = source.active_hit_sink.take() {
                 sink.stop();
             }
             debug!("Removed audio source: {}", source_id);
@@ -250,7 +250,7 @@ impl AudioEngine {
     pub fn play(&mut self, settings: &AudioSettings) {
         info!("AudioEngine::play() called with {} sources", self.sources.len());
         for source in self.sources.values_mut() {
-            for sink in &source.active_hit_sinks {
+            if let Some(ref sink) = source.active_hit_sink {
                 sink.set_volume(settings.master_volume * source.volume);
                 sink.play();
             }
@@ -307,7 +307,7 @@ impl AudioEngine {
     pub fn pause(&self) {
         info!("AudioEngine::pause() called");
         for source in self.sources.values() {
-            for sink in &source.active_hit_sinks {
+            if let Some(ref sink) = source.active_hit_sink {
                 sink.pause();
             }
             if let Some(ref sink) = source.sink {
@@ -317,14 +317,14 @@ impl AudioEngine {
         }
     }
 
-    /// Stop all playback
-    pub fn stop_all(&mut self) {
+    /// Stop playback but keep sources prepared for resume.
+    pub fn stop_playback(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
         for source in self.sources.values_mut() {
             if let Some(sink) = source.sink.take() {
                 sink.stop();
             }
-            for sink in source.active_hit_sinks.drain(..) {
+            if let Some(sink) = source.active_hit_sink.take() {
                 sink.stop();
             }
             source.last_triggered_step = None;
@@ -333,100 +333,72 @@ impl AudioEngine {
         self.stop_flag.store(false, Ordering::SeqCst);
     }
 
+    /// Stop all playback AND remove all sources.
+    /// No stale data remains in the engine after this call.
+    pub fn stop_and_clear(&mut self) {
+        self.stop_flag.store(true, Ordering::SeqCst);
+        for (_, mut source) in self.sources.drain() {
+            if let Some(sink) = source.sink.take() {
+                sink.stop();
+            }
+            if let Some(sink) = source.active_hit_sink.take() {
+                sink.stop();
+            }
+        }
+        self.stop_flag.store(false, Ordering::SeqCst);
+        info!("Stopped and removed all audio sources");
+    }
+
     /// Sync playback to the current flight step.
+    ///
+    /// For synthesized sources: one crossed point = one digit = one sound.
+    /// Previous sound is stopped before the new one plays. No overlap.
     pub fn sync_to_step(&mut self, flight_step: usize, total_steps: usize, settings: &AudioSettings) {
         self.debug_sync_calls_in_window += 1;
 
         for source in self.sources.values_mut() {
-            source.active_hit_sinks.retain(|sink| !sink.empty());
-            for sink in &source.active_hit_sinks {
-                sink.set_volume(settings.master_volume * source.volume);
-            }
-
-            if settings.sync_to_flight && source.synth_rate.is_some() {
+            if settings.sync_to_flight {
                 if let SourceType::Synthesized { base_digits } = &source.source_type {
                     if base_digits.is_empty() {
-                        source.last_synced_step = Some(flight_step);
                         continue;
                     }
 
                     let target_step = flight_step.min(base_digits.len().saturating_sub(1));
 
-                    match source.last_triggered_step {
-                        None => {
-                            match synthesis::create_one_shot_midi_sink(
-                                &self.stream_handle,
-                                Self::digit_note(base_digits[target_step]),
-                                settings.synthesis_method,
-                                self.stop_flag.clone(),
-                            ) {
-                                Ok(sink) => {
-                                    sink.set_volume(settings.master_volume * source.volume);
-                                    sink.play();
-                                    source.active_hit_sinks.push(sink);
-                                    self.debug_triggered_hits_in_window += 1;
-                                }
-                                Err(error) => {
-                                    warn!(
-                                        "Failed to create initial step trigger for {} at step {}: {}",
-                                        source.source_id,
-                                        target_step,
-                                        error
-                                    );
-                                }
-                            }
+                    if source.last_triggered_step == Some(target_step) {
+                        continue;
+                    }
+
+                    // Stop previous sound — exclusive: only one sound at a time
+                    if let Some(old_sink) = source.active_hit_sink.take() {
+                        old_sink.stop();
+                    }
+
+                    let digit = base_digits[target_step];
+                    match synthesis::create_one_shot_midi_sink(
+                        &self.stream_handle,
+                        Self::digit_note(digit),
+                        settings.synthesis_method,
+                        self.stop_flag.clone(),
+                    ) {
+                        Ok(sink) => {
+                            sink.set_volume(settings.master_volume * source.volume);
+                            sink.play();
+                            source.active_hit_sink = Some(sink);
+                            self.debug_triggered_hits_in_window += 1;
+                            debug!(
+                                "[AUDIO] step={} digit={} drum/note={}",
+                                target_step,
+                                digit,
+                                digit % 12,
+                            );
                         }
-                        Some(last_step) if target_step > last_step => {
-                            for step in (last_step + 1)..=target_step {
-                                match synthesis::create_one_shot_midi_sink(
-                                    &self.stream_handle,
-                                    Self::digit_note(base_digits[step]),
-                                    settings.synthesis_method,
-                                    self.stop_flag.clone(),
-                                ) {
-                                    Ok(sink) => {
-                                        sink.set_volume(settings.master_volume * source.volume);
-                                        sink.play();
-                                        source.active_hit_sinks.push(sink);
-                                        self.debug_triggered_hits_in_window += 1;
-                                    }
-                                    Err(error) => {
-                                        warn!(
-                                            "Failed to create forward step trigger for {} at step {}: {}",
-                                            source.source_id,
-                                            step,
-                                            error
-                                        );
-                                    }
-                                }
-                            }
+                        Err(error) => {
+                            warn!(
+                                "Failed one-shot for {} step={} digit={}: {}",
+                                source.source_id, target_step, digit, error
+                            );
                         }
-                        Some(last_step) if target_step < last_step => {
-                            for step in (target_step..last_step).rev() {
-                                match synthesis::create_one_shot_midi_sink(
-                                    &self.stream_handle,
-                                    Self::digit_note(base_digits[step]),
-                                    settings.synthesis_method,
-                                    self.stop_flag.clone(),
-                                ) {
-                                    Ok(sink) => {
-                                        sink.set_volume(settings.master_volume * source.volume);
-                                        sink.play();
-                                        source.active_hit_sinks.push(sink);
-                                        self.debug_triggered_hits_in_window += 1;
-                                    }
-                                    Err(error) => {
-                                        warn!(
-                                            "Failed to create reverse step trigger for {} at step {}: {}",
-                                            source.source_id,
-                                            step,
-                                            error
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Some(_) => {}
                     }
 
                     source.last_triggered_step = Some(target_step);
@@ -435,6 +407,7 @@ impl AudioEngine {
                 }
             }
 
+            // File audio: seek to position
             if let Some(ref sink) = source.sink {
                 sink.set_volume(settings.master_volume * source.volume);
                 let should_seek = match source.last_synced_step {
@@ -455,10 +428,8 @@ impl AudioEngine {
                         Err(error) => {
                             warn!(
                                 "Seek failed for {} at step {} ({:.2}s): {}",
-                                source.source_id,
-                                flight_step,
-                                target_position.as_secs_f32(),
-                                error
+                                source.source_id, flight_step,
+                                target_position.as_secs_f32(), error
                             );
                         }
                     }
@@ -471,12 +442,10 @@ impl AudioEngine {
         let window_elapsed = self.debug_window_started_at.elapsed().as_secs_f32();
         if window_elapsed >= 1.0 {
             debug!(
-                "[AUDIO][SYNC] elapsed={:.2}s step={} total_steps={} sync_calls={} seek_events={} triggered_sounds={} sounds_per_sec={:.2}",
+                "[AUDIO][SYNC] elapsed={:.2}s step={}/{} triggered={} sounds/sec={:.2}",
                 window_elapsed,
                 flight_step,
                 total_steps,
-                self.debug_sync_calls_in_window,
-                self.debug_seek_events_in_window,
                 self.debug_triggered_hits_in_window,
                 self.debug_triggered_hits_in_window as f32 / window_elapsed,
             );

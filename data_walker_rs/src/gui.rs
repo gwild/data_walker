@@ -1331,7 +1331,7 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                 // X direction line
                 let transform_x = Mat4::from_translation(vec3(0.0, 0.0, i))
                     * Mat4::from_angle_z(degrees(90.0))
-                    * Mat4::from_nonuniform_scale(0.2, grid_size, 0.2);
+                    * Mat4::from_nonuniform_scale(0.05, grid_size, 0.05);
                 instances.transformations.push(transform_x);
                 if let Some(ref mut colors) = instances.colors {
                     colors.push(grid_color);
@@ -1339,7 +1339,7 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
 
                 // Z direction line
                 let transform_z = Mat4::from_translation(vec3(i, 0.0, 0.0))
-                    * Mat4::from_nonuniform_scale(0.2, grid_size, 0.2)
+                    * Mat4::from_nonuniform_scale(0.05, grid_size, 0.05)
                     * Mat4::from_angle_x(degrees(90.0));
                 instances.transformations.push(transform_z);
                 if let Some(ref mut colors) = instances.colors {
@@ -1456,8 +1456,8 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                             color_pool.clear();
                             // Stop and clear all audio sources
                             if let Some(ref mut engine) = audio_engine {
-                                debug!("[GUI] Stopping all audio sources");
-                                engine.stop_all();
+                                debug!("[GUI] Clearing all audio sources");
+                                engine.stop_and_clear();
                             }
                         }
                         if ui.button("Center View").clicked() {
@@ -1569,7 +1569,7 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                                 debug!("[GUI] Stopping playback because flight_mode disabled");
                                 flight_playing = false;
                                 if let Some(ref mut engine) = audio_engine {
-                                    engine.stop_all();
+                                    engine.stop_playback();
                                 }
                             }
                         }
@@ -1661,8 +1661,8 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                             flight_playing = false;
                             // Stop audio on reset
                             if let Some(ref mut engine) = audio_engine {
-                                debug!("[GUI] Stopping all audio on reset");
-                                engine.stop_all();
+                                debug!("[GUI] Stopping audio playback on reset");
+                                engine.stop_playback();
                             }
                         }
 
@@ -1865,7 +1865,7 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
                         );
                     } else if let Some(ref mut engine) = audio_engine {
                         pending_audio_preps.clear();
-                        engine.stop_all();
+                        engine.stop_and_clear();
                     }
                     prev_audio_enabled = audio_settings.enabled;
                 }
@@ -2215,7 +2215,7 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
         // Render axes
         if show_axes {
             let axis_len = axis_extent;
-            let axis_radius = 0.4;
+            let axis_radius = 0.1;
             let axes_data: [(Vec3, Srgba); 3] = [
                 (vec3(1.0, 0.0, 0.0), Srgba::new(220, 50, 50, 255)),   // X = red
                 (vec3(0.0, 1.0, 0.0), Srgba::new(50, 220, 50, 255)),   // Y = green
@@ -2250,8 +2250,8 @@ pub fn run_viewer(config: Config, auto_config: AutomationConfig, data_dir: PathB
 
         // Render axis tick marks
         if show_axes && axis_ticks > 0 {
-            let tick_size = 1.5;
-            let tick_radius = 0.3;
+            let tick_size = 0.8;
+            let tick_radius = 0.08;
             let spacing = axis_ticks as f32;
             let axis_len = axis_extent;
             let tick_color = Srgba::new(180, 180, 180, 255);

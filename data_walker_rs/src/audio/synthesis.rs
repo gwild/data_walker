@@ -34,6 +34,7 @@ pub struct MidiSynthSource {
     phase: f32,
     stop_flag: Arc<AtomicBool>,
     samples_per_note: u32,
+    looping: bool,
 }
 
 impl MidiSynthSource {
@@ -49,6 +50,7 @@ impl MidiSynthSource {
             phase: 0.0,
             stop_flag,
             samples_per_note: DEFAULT_SAMPLES_PER_NOTE,
+            looping: true,
         }
     }
 
@@ -71,7 +73,13 @@ impl MidiSynthSource {
             phase: 0.0,
             stop_flag,
             samples_per_note,
+            looping: true,
         }
+    }
+
+    fn one_shot(mut self) -> Self {
+        self.looping = false;
+        self
     }
 
     /// Get the current MIDI note based on sample position
@@ -340,10 +348,11 @@ impl Iterator for MidiSynthSource {
             return None;
         }
 
-        // Check if we've reached the end
         let total_samples = self.notes.len() * self.samples_per_note as usize;
         if self.sample_index >= total_samples {
-            // Loop back to start
+            if !self.looping {
+                return None;
+            }
             self.sample_index = 0;
             self.phase = 0.0;
         }
@@ -451,7 +460,7 @@ pub fn create_one_shot_midi_sink(
     .max(0.01);
 
     let notes_per_second = 1.0 / duration_secs;
-    let source = MidiSynthSource::with_note_rate(vec![note], method, stop_flag, notes_per_second);
+    let source = MidiSynthSource::with_note_rate(vec![note], method, stop_flag, notes_per_second).one_shot();
 
     let sink = Sink::try_new(stream_handle)?;
     sink.append(source);
