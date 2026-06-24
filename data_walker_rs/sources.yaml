@@ -903,7 +903,7 @@ sources:
     subcategory: Nature
     converter: audio
     mapping: Optimal
-    url: "https://freesound.org/s/846924"
+    url: "https://archive.org/download/babbling-brook-waterfall/1%20hour%20babbling%20brook%20waterfall%20320.mp3"
 
   - id: coyote
     name: Coyote
@@ -914,28 +914,28 @@ sources:
     url: "https://freesound.org/s/86623"
 
   - id: coyote_2
-    name: Coyote 2
+    name: Coyote Chorus
     category: animals
     subcategory: Mammals
     converter: audio
     mapping: Optimal
-    url: "https://freesound.org/s/86622"
+    url: "https://archive.org/download/CoyotesAndDogsHowlingOnThePrairieDesFemmes/Memo2.mp3"
 
   - id: coyote_3
-    name: Coyote 3
+    name: Coyote Howl (Alt)
     category: animals
     subcategory: Mammals
     converter: audio
     mapping: Optimal
-    url: "https://freesound.org/s/86621"
+    url: "https://archive.org/download/coyotehowlsoundringtonesforandroidscaryringtones/Coyote%20Howl%20Sound%20Ringtones%20for%20Android%20Scary%20Ringtones.mp3"
 
   - id: owls_coyote
-    name: Owls & Coyote
+    name: Night Owl Ambient
     category: animals
-    subcategory: Mammals
+    subcategory: Birds
     converter: audio
     mapping: Optimal
-    url: "https://freesound.org/s/582346"
+    url: "https://archive.org/download/freecompress-night-owl-ambient-sound-effect/freecompress-Night%20Owl%20Ambient%20Sound%20Effect.mp3"
 
   - id: coyote_howl
     name: Coyote Howl
@@ -943,15 +943,15 @@ sources:
     subcategory: Mammals
     converter: audio
     mapping: Optimal
-    url: "https://freesound.org/s/558725"
+    url: "https://archive.org/download/animals-and-birds-sound-effects/17%20Coyote%20Howl.mp3"
 
   - id: wolf_creek
-    name: Wolf (Cooper Creek)
+    name: Red Wolf Howling
     category: animals
     subcategory: Mammals
     converter: audio
     mapping: Optimal
-    url: "https://freesound.org/s/500646"
+    url: "https://archive.org/download/RedWolfHowling/red_wolf_howling.mp3"
 
   - id: wolf_howl
     name: Wolf Howl
@@ -959,31 +959,31 @@ sources:
     subcategory: Mammals
     converter: audio
     mapping: Optimal
-    url: "https://freesound.org/s/81904"
+    url: "https://archive.org/download/animals-and-birds-sound-effects/16%20Wolf%20Howl.mp3"
 
   - id: wolf_howl_2
-    name: Wolf Howl 2
+    name: Wolf Howl (Distant)
     category: animals
     subcategory: Mammals
     converter: audio
     mapping: Optimal
-    url: "https://freesound.org/s/370360"
+    url: "https://archive.org/download/animalsounds1/12wolveshowlfar.mp3"
 
   - id: wolf_howl_3
-    name: Wolf Howl 3
+    name: Wolf Howl (Alt)
     category: animals
     subcategory: Mammals
     converter: audio
     mapping: Optimal
-    url: "https://freesound.org/s/267179"
+    url: "https://archive.org/download/HowlingSound/Wolf%20howl%20sound%20effect.mp3"
 
   - id: werewolf_howl
-    name: Werewolf Howl
+    name: Wolves Howling (Alt)
     category: animals
     subcategory: Mammals
     converter: audio
     mapping: Optimal
-    url: "https://freesound.org/s/784596"
+    url: "https://archive.org/download/HowlingSound/WOLVES%20HOWLING%20SOUND%20EFFECT%20in%20Best%20Quality.mp3"
 
   # ============================================================================
   # Proteins - Bacteriophage Bas63 (Felixounavirus) cryo-EM structures

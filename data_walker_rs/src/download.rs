@@ -171,6 +171,11 @@ pub async fn download_audio(id: &str, url: &str, output_dir: &PathBuf) -> Result
         return download_raw_mp3(id, mp3_url, output_dir).await;
     }
 
+    // Direct MP3 sources can be downloaded without a special-case ID mapping.
+    if url.to_ascii_lowercase().ends_with(".mp3") {
+        return download_raw_mp3(id, url, output_dir).await;
+    }
+
     // Freesound sources - download via API
     if url.contains("freesound.org/s/") {
         if let Some(sound_id_str) = url.trim_end_matches('/').rsplit('/').next() {
