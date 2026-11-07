@@ -353,7 +353,7 @@ impl PcpriConfig {
         if self.branching_factor == 0 {
             return Err("branching_factor must be > 0".to_string());
         }
-        if self.alpha <= 0.0 || self.alpha > 1.0 {
+        if !self.alpha.is_finite() || self.alpha <= 0.0 || self.alpha > 1.0 {
             return Err("alpha must be in (0, 1]".to_string());
         }
         if self.fft_size == 0 {
@@ -745,5 +745,40 @@ mod tests {
             digits.iter().any(|&d| d != 0),
             "state digits after warm-up should not be all zero"
         );
+    }
+
+    #[test]
+    fn test_validate_rejects_non_finite_alpha() {
+        // Regression: NaN comparisons are always false, so a bare
+        // `alpha <= 0.0 || alpha > 1.0` check accepted NaN, and
+        // PcpriGenerator::new() then panicked in Conductor::new().
+        for alpha in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let config = PcpriConfig {
+                alpha,
+                ..PcpriConfig::default()
+            };
+            assert!(
+                config.validate().is_err(),
+                "alpha={alpha} must be rejected by validate()"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_alpha_bounds() {
+        for alpha in [0.0, -0.5, 1.5] {
+            let config = PcpriConfig {
+                alpha,
+                ..PcpriConfig::default()
+            };
+            assert!(config.validate().is_err(), "alpha={alpha} must be rejected");
+        }
+        for alpha in [1.0, 0.1] {
+            let config = PcpriConfig {
+                alpha,
+                ..PcpriConfig::default()
+            };
+            assert!(config.validate().is_ok(), "alpha={alpha} must be accepted");
+        }
     }
 }
