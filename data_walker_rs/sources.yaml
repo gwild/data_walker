@@ -15,6 +15,7 @@ converters:
   audio: "Spectrogram dominant frequency normalized to 0-11"
   dna: "ACGT base-4 streaming to base-12"
   math: "Direct base-12 digit expansion"
+  pcpri: "PCPRI generator signals (conductor, feedback word, state bits) to base-12 - ported from gwild/pcpri, computed locally"
   finance: "Price delta normalized to 0-11"
   cosmos: "Strain amplitude normalized to 0-11"
   pdb_backbone: "Protein C-alpha backbone direction deltas to base-12"
@@ -28,6 +29,7 @@ categories:
   environment: Environment
   finance: Finance
   math: Math
+  pcpri: PCPRI
   proteins: Proteins
 
 sources:
@@ -1070,3 +1072,39 @@ sources:
     converter: pdb_structure
     mapping: Identity
     url: "https://files.rcsb.org/download/9MT5.pdb"
+
+  # ============================================
+  # PCPRI - Phase-Coherent Pseudorandom Recursive Input
+  # Generator ported from https://github.com/gwild/pcpri (see
+  # src/converters/math/pcpri.rs for provenance and fidelity notes).
+  # Computed locally like the math sources; no downloads, no stored data.
+  # Default PcpriConfig: n=256, branching_factor=3, alpha=0.1,
+  # fft_size=256, hop_size=128, coherency_window=10, top_m=8.
+  # ============================================
+
+  - id: pcpri_conductor
+    name: "PCPRI Conductor (c)"
+    category: pcpri
+    subcategory: Generator Signals
+    converter: math.pcpri.conductor
+    mapping: Optimal
+    url: "https://github.com/gwild/pcpri"
+    description: "Conductor value per generator step, mapped from [-1, 1] to base-12. This is the signal PCPRI's phase analyzer runs on."
+
+  - id: pcpri_feedback
+    name: "PCPRI Feedback Word (z)"
+    category: pcpri
+    subcategory: Generator Signals
+    converter: math.pcpri.feedback
+    mapping: Optimal
+    url: "https://github.com/gwild/pcpri"
+    description: "Feedback word per generator step as base-12 digits (least-significant first), after the fft_size warm-up steps are discarded."
+
+  - id: pcpri_state
+    name: "PCPRI State Bits"
+    category: pcpri
+    subcategory: Generator Signals
+    converter: math.pcpri.state
+    mapping: Optimal
+    url: "https://github.com/gwild/pcpri"
+    description: "Packed 256-bit state per generator step as an exact base-12 expansion (3 digits per byte), after the fft_size warm-up steps are discarded."

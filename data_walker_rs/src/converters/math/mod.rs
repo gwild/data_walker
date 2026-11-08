@@ -5,10 +5,12 @@
 //! - Fractals: Dragon curve, Koch snowflake, etc.
 //! - Mandelbrot/Julia orbits
 //! - Sequences: Fibonacci word, Thue-Morse, logistic map
+//! - PCPRI: phase-coherent recursive generator ported from gwild/pcpri
 
 pub mod constants;
 pub mod fractals;
 pub mod mandelbrot;
+pub mod pcpri;
 pub mod sequences;
 
 /// All available math generators
@@ -36,6 +38,11 @@ pub enum MathGenerator {
     FibonacciWord,
     ThueMorse,
     LogisticMap { r: f64, x0: f64 },
+
+    // PCPRI (ported generator from gwild/pcpri - see pcpri.rs)
+    PcpriConductor,
+    PcpriFeedback,
+    PcpriState,
 }
 
 impl MathGenerator {
@@ -76,6 +83,10 @@ impl MathGenerator {
             MathGenerator::LogisticMap { r, x0 } => {
                 sequences::logistic_map(*r, *x0, n_digits)
             }
+
+            MathGenerator::PcpriConductor => pcpri::conductor_base12(n_digits),
+            MathGenerator::PcpriFeedback => pcpri::feedback_base12(n_digits),
+            MathGenerator::PcpriState => pcpri::state_base12(n_digits),
         }
     }
 
@@ -114,6 +125,11 @@ impl MathGenerator {
             (Some(&"sequence"), Some(&"logistic_period3")) => {
                 Some(MathGenerator::LogisticMap { r: 3.8284, x0: 0.5 })
             }
+
+            // PCPRI streams (default PcpriConfig from gwild/pcpri)
+            (Some(&"pcpri"), Some(&"conductor")) => Some(MathGenerator::PcpriConductor),
+            (Some(&"pcpri"), Some(&"feedback")) => Some(MathGenerator::PcpriFeedback),
+            (Some(&"pcpri"), Some(&"state")) => Some(MathGenerator::PcpriState),
 
             // Mandelbrot named points (interesting locations on the boundary)
             (Some(&"mandelbrot"), Some(&"cardioid")) => {
